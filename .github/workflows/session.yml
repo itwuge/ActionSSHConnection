@@ -20,7 +20,8 @@ name: 调试会话
 # 必需仓库变量（均为非秘密路由信息）：
 #   UPTERM_RELAY_KNOWN_HOST   中继主机 known_hosts 行（公钥，防中间人）
 #   WEB_TERMINAL_BASE_URL     网页终端站点根地址（如 https://wuge.fun，不含 /t/ 与任何会话参数）
-#   WEBAUTHN_CREDENTIAL_ID    公钥凭据标识（WebAuthn credential id，公开标识）
+#   WEBAUTHN_CREDENTIAL_ID    公钥凭据标识（WebAuthn credential id，公开标识）；可选，
+#                             空白时路由字段输出 unset，SSH 通道不受影响，待浏览器注册后再补
 # 可选仓库变量：
 #   UPTERM_DIRECT_ENDPOINT    直连候选对端 host[:port]；不配即按「无可用对端地址」判直连失败
 
@@ -39,8 +40,8 @@ permissions:
   contents: read
 
 env:
-  RELAY_HOST: relay.wuge.fun
-  RELAY_PORT: "22"
+  RELAY_HOST: ssh.wuge.fun
+  RELAY_PORT: "2222"
   SSH_USER: itwuge
   SESSION_NAME: actssh
   JOB_TIMEOUT_MINUTES: "45"
@@ -94,7 +95,6 @@ jobs:
           missing=""
           [ -n "${KNOWN_HOST:-}" ] || missing="$missing UPTERM_RELAY_KNOWN_HOST"
           [ -n "${WEB_TERMINAL_BASE_URL:-}" ] || missing="$missing WEB_TERMINAL_BASE_URL"
-          [ -n "${WEBAUTHN_CREDENTIAL_ID:-}" ] || missing="$missing WEBAUTHN_CREDENTIAL_ID"
           if [ -n "$missing" ]; then
             echo "失败[阶段 precheck]：缺少仓库变量$missing" >&2
             exit 1
@@ -309,7 +309,7 @@ jobs:
             echo "pubkey_fingerprint=$FINGERPRINTS"
             echo "expires_at=$EXPIRES_AT"
             echo "web_url=${WEB_TERMINAL_BASE_URL%/}/t/${SESSION_ID}"
-            echo "pubkey_credential_id=$WEBAUTHN_CREDENTIAL_ID"
+            echo "pubkey_credential_id=${WEBAUTHN_CREDENTIAL_ID:-unset}"
             echo "path_mode=$PATH_MODE"
           } > "$fields"
 
