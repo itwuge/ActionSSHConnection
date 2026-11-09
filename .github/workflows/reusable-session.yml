@@ -118,8 +118,9 @@ jobs:
   session:
     name: debug-session
     runs-on: ubuntu-latest
-    # 会话上限之外再留 10 分钟给安装与清理
-    timeout-minutes: ${{ fromJSON(inputs.session-minutes) + 10 }}
+    # 固定 55 分钟：会话上限之外留 10 分钟给安装与清理。
+    # 该字段不接受算术表达式，因此 session-minutes 请勿超过 45；更大上限请改用 Composite 自行设置 job 超时。
+    timeout-minutes: 55
     outputs:
       session-id: ${{ steps.session.outputs.session-id }}
       ssh-user: ${{ steps.session.outputs.ssh-user }}
