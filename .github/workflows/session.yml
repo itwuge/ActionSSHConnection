@@ -1,0 +1,204 @@
+name: 调试会话
+
+# 依据：.team/specs/项目设计书-20261109-v3.md（v3）
+# 本文件属入口层（G01），不含部署逻辑。
+#
+# 两条触发入口共用同一会话创建逻辑（同一 job、同一组步骤），不各写一份：
+#   1) workflow_dispatch：布尔输入 start_session，默认 false
+#   2) repository_dispatch：event_type 固定 start-session，client_payload.keyword 固定 start-session
+#
+# 日志字段（9 项，均不得掩码、均不得取自 secrets）：
+#   relay_host / port / session_id / ssh_user / pubkey_fingerprint / expires_at /
+#   web_url / pubkey_credential_id / path_mode
+#
+# 必需仓库变量（均为非秘密路由信息）：
+#   UPTERM_RELAY_KNOWN_HOST   中转主机 known_hosts 行（公钥，防中间人）
+#   WEB_TERMINAL_BASE_URL     网页终端静态页地址（不含会话参数）
+#   WEBAUTHN_CREDENTIAL_ID    公钥凭据标识（WebAuthn credential id，公开标识）
+# 可选仓库变量：
+#   UPTERM_DIRECT_ENDPOINT    直连候选对端 host[:port]；不配即按「无可用对端地址」判直连失败
+#
+# 明确不做：不对连接块加 ::add-mask::；不开启 full-access / allow-exec / allow-forwarding。
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_session:
+        description: "建立调试会话"
+        type: boolean
+        required: false
+        default: false
+  repository_dispatch:
+    types: [start-session]
+
+permissions:
+  contents: read
+
+env:
+  RELAY_HOST: relay.wuge.fun
+  RELAY_PORT: "22"
+  SSH_USER: itwuge
+  JOB_TIMEOUT_MINUTES: "45"
+  WEB_TERMINAL_BASE_URL: ${{ vars.WEB_TERMINAL_BASE_URL }}
+  WEBAUTHN_CREDENTIAL_ID: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
+  UPTERM_DIRECT_ENDPOINT: ${{ vars.UPTERM_DIRECT_ENDPOINT }}
+
+jobs:
+  session:
+    name: debug-session
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.start_session == true) ||
+      github.event_name == 'repository_dispatch'
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: 校验入口与前置配置
+        id: precheck
+        timeout-minutes: 2
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_SENDER: ${{ github.event.sender.login }}
+          DISPATCH_KEYWORD: ${{ github.event.client_payload.keyword || '' }}
+          KNOWN_HOST: ${{ vars.UPTERM_RELAY_KNOWN_HOST }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            if [ "${DISPATCH_KEYWORD:-}" != "start-session" ]; then
+              echo "拒绝：client_payload.keyword 必须为 start-session，实际为 ${DISPATCH_KEYWORD:-空}" >&2
+              exit 1
+            fi
+            if [ "$DISPATCH_SENDER" != "$SSH_USER" ]; then
+              echo "拒绝：repository_dispatch 发起者不是 $SSH_USER" >&2
+              exit 1
+            fi
+          fi
+
+          missing=""
+          [ -n "${KNOWN_HOST:-}" ] || missing="$missing UPTERM_RELAY_KNOWN_HOST"
+          [ -n "${WEB_TERMINAL_BASE_URL:-}" ] || missing="$missing WEB_TERMINAL_BASE_URL"
+          [ -n "${WEBAUTHN_CREDENTIAL_ID:-}" ] || missing="$missing WEBAUTHN_CREDENTIAL_ID"
+          if [ -n "$missing" ]; then
+            echo "缺少仓库变量：$missing" >&2
+            exit 1
+          fi
+
+          # 到期时间按作业超时上限推算，误差为前置步骤耗时（数秒）
+          expires_at="$(date -u -d "@$(( $(date +%s) + JOB_TIMEOUT_MINUTES * 60 ))" '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "expires_at=$expires_at" >> "$GITHUB_OUTPUT"
+
+      - name: 判定连接路径
+        id: path
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+
+          # 阶段一：打洞。托管 runner 无入站端口，通常无可用对端地址，按判失败条件①直接回落中继。
+          # 配置了候选地址时只做 5 秒 TCP 可达性探针；数据面是否真的直连 [待真机确认]。
+          mode=relay
+          if [ -n "${UPTERM_DIRECT_ENDPOINT:-}" ]; then
+            host="${UPTERM_DIRECT_ENDPOINT%%:*}"
+            port="22"
+            case "$UPTERM_DIRECT_ENDPOINT" in *:*) port="${UPTERM_DIRECT_ENDPOINT##*:}" ;; esac
+            if timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+              mode=direct
+            fi
+          fi
+
+          if [ "$mode" = "direct" ]; then
+            echo "直连已建立（直连）"
+            echo "::warning::直连判定为 TCP 可达性探针，数据面直连未验证"
+          else
+            echo "直连未建立，已切换到中继转发"
+          fi
+          echo "path_mode=$mode" >> "$GITHUB_OUTPUT"
+
+      - name: 建立会话
+        id: upterm
+        uses: owenthereal/action-upterm@6c2d60e09009f59cb4c45c88767c78701f14d121 # v2.8.1
+        timeout-minutes: 5
+        with:
+          # 以 detached 模式启动，便于取得会话标识并在会话进行中输出 9 项字段；
+          # 作业内其余步骤结束后由本动作 post 步骤等待访客接入（10 分钟无人接入即结束）。
+          detached: true
+          upterm-server: ssh://relay.wuge.fun:22
+          # 上游参数保留；v3 认定准入由 runner 侧承担，runner 侧尚未实现，实际仍受该参数约束。
+          limit-access-to-users: itwuge
+          wait-timeout-minutes: 10
+          upterm-version: v0.41.1
+          known-hosts: ${{ vars.UPTERM_RELAY_KNOWN_HOST }}
+
+      - name: 准备共享终端
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          # 网页终端需要一个与 SSH 会话同一路由、可被桥接进程接入的终端。
+          # 这里提供可 attach 的终端进程；桥接如何接入同一 socket [待真机确认]。
+          name="actssh"
+          if command -v tmux >/dev/null 2>&1; then
+            tmux new-session -d -s "$name" 2>/dev/null || true
+            echo "共享终端就绪：tmux 会话 $name（网页桥接待 P07/P08 接入）"
+          else
+            echo "::warning::未找到 tmux，共享终端未就绪；网页入口 [待真机确认]"
+          fi
+
+      - name: 输出路由字段
+        id: route
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPIRES_AT: ${{ steps.precheck.outputs.expires_at }}
+          PATH_MODE: ${{ steps.path.outputs.path_mode }}
+          SSH_COMMAND: ${{ steps.upterm.outputs.ssh-command }}
+        run: |
+          set -euo pipefail
+
+          # 会话标识取自上游输出；上游当前形式为 ssh <会话标识>:<ticket>@<主机>，
+          # 只取冒号前部分，ticket 属上游凭据，不写入任何字段。
+          session_id="$(printf '%s' "$SSH_COMMAND" | sed -E 's/^ssh +([^@]+)@.*$/\1/' | cut -d: -f1)"
+          if [ -z "$session_id" ] || [ "$session_id" = "$SSH_COMMAND" ]; then
+            echo "无法从上游输出解析会话标识" >&2
+            exit 1
+          fi
+
+          fingerprints=""
+          key_count=0
+          while IFS= read -r key; do
+            [ -n "$key" ] || continue
+            fp="$(printf '%s\n' "$key" | ssh-keygen -lf /dev/stdin 2>/dev/null | awk '{print $2}')"
+            [ -n "$fp" ] || continue
+            key_count=$((key_count + 1))
+            fingerprints="${fingerprints:+$fingerprints,}$fp"
+          done < <(gh api "users/$SSH_USER/keys" --paginate --jq '.[].key')
+
+          if [ "$key_count" -eq 0 ]; then
+            echo "GitHub 用户 $SSH_USER 未登记 SSH 公钥，无法限定访客" >&2
+            exit 1
+          fi
+
+          fields="$(mktemp)"
+          {
+            echo "relay_host=$RELAY_HOST"
+            echo "port=$RELAY_PORT"
+            echo "session_id=$session_id"
+            echo "ssh_user=$SSH_USER"
+            echo "pubkey_fingerprint=$fingerprints"
+            echo "expires_at=$EXPIRES_AT"
+            echo "web_url=${WEB_TERMINAL_BASE_URL}#session_id=${session_id}"
+            echo "pubkey_credential_id=$WEBAUTHN_CREDENTIAL_ID"
+            echo "path_mode=$PATH_MODE"
+          } > "$fields"
+
+          cat "$fields"
+          {
+            echo '```text'
+            cat "$fields"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f "$fields"
