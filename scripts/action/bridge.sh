@@ -89,26 +89,34 @@ if [ -z "${credential_id:-}" ]; then
   admission="$admission --allow-registration"
 fi
 
-# 后台反连，不阻塞随后的会话等待；标准输出与 JSONL 日志只落文件
-nohup "$venv/bin/python" "$scripts_dir/start_web_bridge.py" \
+# 后台反连，不阻塞随后的会话等待；标准输出与 JSONL 日志只落文件。
+# 必须脱离当前进程树：GitHub Actions 在步骤结束时清理本步骤派生的孤儿进程，
+# 仅 nohup 不足以保活，会让反连在桥接就绪后几十秒内被终止（表现为浏览器 UNKNOWN_SESSION）。
+# setsid --fork 后由子进程自己写 pid，避免 $! 指向 fork 前的中间进程。
+setsid --fork bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$workdir/bridge.pid" \
+  "$venv/bin/python" "$scripts_dir/start_web_bridge.py" \
   "$session_id" "$bridge_base" "$admission" \
   --run-id "${GITHUB_RUN_ID:-}" \
-  > "$workdir/bridge.out" 2> "$workdir/bridge.err" &
-bridge_pid=$!
-echo "$bridge_pid" > "$workdir/bridge.pid"
+  > "$workdir/bridge.out" 2> "$workdir/bridge.err"
+for _ in $(seq 1 30); do
+  [ -s "$workdir/bridge.pid" ] && break
+  sleep 0.1
+done
+bridge_pid="$(cat "$workdir/bridge.pid" 2>/dev/null || true)"
 
 bridge_host="${bridge_base#*://}"
 bridge_host="${bridge_host%%/*}"
+if [ -z "$bridge_pid" ]; then
+  unavailable bridge-connect "桥接进程未能启动（未写入 pid）"
+fi
 for _ in $(seq 1 20); do
   if ! kill -0 "$bridge_pid" 2>/dev/null; then
-    set +e
-    wait "$bridge_pid"
-    rc=$?
-    set -e
+    # 进程已脱离本 shell，无法 wait；结论以桥接自己那一行 JSON 为准
+    ok="$(jq -r '.ok // false' "$workdir/bridge.out" 2>/dev/null || echo false)"
     stage="$(jq -r '.data.stage // empty' "$workdir/bridge.out" 2>/dev/null || true)"
     error_code="$(jq -r '.error_code // empty' "$workdir/bridge.out" 2>/dev/null || true)"
     message="$(jq -r '.message // empty' "$workdir/bridge.out" 2>/dev/null || true)"
-    if [ "$rc" -eq 0 ]; then
+    if [ "$ok" = "true" ]; then
       echo "网页通道已结束（桥接进程正常退出，阶段 ${stage:-unknown}）"
       exit 0
     fi
@@ -117,7 +125,7 @@ for _ in $(seq 1 20); do
       admission-start|admission-exit) stage_name=bridge-admission ;;
       *) stage_name=bridge-connect ;;
     esac
-    unavailable "$stage_name" "桥接进程退出码 ${rc}，阶段 ${stage:-unknown}，error_code ${error_code:-none}，${message:-无输出}"
+    unavailable "$stage_name" "桥接进程已退出，阶段 ${stage:-unknown}，error_code ${error_code:-none}，${message:-无输出}"
   fi
   if grep -q '"event":"bridge.connected"' "$workdir/bridge.err" 2>/dev/null &&
      grep -q '"event":"admission.started"' "$workdir/bridge.err" 2>/dev/null; then

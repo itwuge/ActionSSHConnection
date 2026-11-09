@@ -123,27 +123,28 @@ sudo ./install.sh --domain wuge.fun --email 7111479@qq.com --cert-mode acme \
 | `bridge/requirements-web-bridge.txt` | 桥接依赖锁（`websockets==10.4`） |
 | `README.md` | 本文件 |
 
-## 3. 中转与打洞的关系
+## 3. 中转与直连的关系
 
-会话建立分两阶段，**先打洞、失败回落中继**：
+会话**先建立中继面**，直连是可选的第二入口（不是「先打洞、失败回落」，旧表述已作废）：
 
-- 阶段一：两端尝试直连。整体超时上限候选 5 秒，具体值待实测；超时即判失败，不反复重试。
-- 阶段二：打洞失败后立即切到中继转发。`session_id` 不重建，用户侧入口地址不变。
-- 日志用 `path_mode` 标记实际路径：`direct` 或 `relay`。
-- 打洞成功时，中继不参与数据面，只保留会话登记与到期管理；打洞失败时，中继负责双向转发字节流。
-- 网页通道一期固定走中继，不实现浏览器打洞。
+- 中继面：`upterm host` 主动反连 `ssh://<域名>:<relay-port>`，拿到 `session_id` 与中继登录名。这一步与直连无关，保证任何情况下都有可用的 SSH 入口。
+- 直连面（仅 `direct-mode=tailscale` 时）：runner 自行安装 Tailscale，用调用方 Secret 传入的临时 auth key 加入 tailnet，在 `100.x:<direct-ssh-port>` 上起只绑该地址的 sshd；任一步失败即回落中继，`session_id` 不重建。默认 `direct-mode=none`，不装 Tailscale。
+- 日志用 `path_mode` 标记实际路径：`direct` 或 `relay`；直连另有 `path_verified`（`direct` / `derp` / `unknown`）。
+- `path_mode=relay` 时中继负责双向转发字节流；`path_mode=direct` 时 SSH 数据面不经过中继，但中继路由与会话到期管理仍保留。
+- 网页通道固定走中继桥接，不实现浏览器打洞。
 
-限制：GitHub **托管** runner 没有入站端口，纯 P2P 直连通常不成立。托管 runner 上的预期结果就是走中继；`path_mode=direct` 只作为优化项，不作为能力承诺。
+限制：GitHub **托管** runner 没有入站端口，纯 P2P 直连通常不成立。`path_mode=direct` 只表示 tailnet 路径可用，**不等于纯 P2P**；只有 `path_verified=direct` 才是点对点，`derp` 表示数据经 Tailscale DERP 中继转发。
 
 中继不解析协议、不识别终端内容、不保存会话。进程重启即清空全部内存映射，重启期间会话断开属预期行为。
 
 ## 4. 连接顺序
 
-1. 显式触发工作流后，runner 侧进程按「先打洞、后中继」建立会话。
-2. 打洞在超时内未完成，立即回落到中继；中继记录 `session_id → runner 反向连接` 的内存映射。
-3. 运行日志输出九项可读路由信息：中转地址、端口、会话标识、SSH 用户名、公钥指纹、到期时间、网页地址、公钥凭据标识、当前路径。
-4. 需求方从 SSH 入口或网页入口进入同一个 runner 终端。
-5. 会话结束、runner 进程退出或中继重启后，两个入口同时失效，原信息重连被拒。
+1. 显式触发工作流后，runner 侧进程先反连中继，取得 `session_id`。
+2. 中继记录 `session_id → runner 反向连接` 的内存映射。
+3. 若 `direct-mode=tailscale`，随后建立直连面；失败则保持 `path_mode=relay`，不重建会话、不改入口地址。
+4. 运行日志输出九项可读路由信息：中转地址、端口、会话标识、SSH 用户名、公钥指纹、到期时间、网页地址、公钥凭据标识、当前路径。
+5. 需求方从 SSH 入口或网页入口进入同一个 runner 终端。
+6. 会话结束、runner 进程退出或中继重启后，两个入口同时失效，原信息重连被拒。
 
 日志只允许出现上述路由信息。私钥、口令、一次性 token、GitHub token 不产生、不打印、不写入制品或仓库。不要对路由信息调用 GitHub 的掩码标记，否则整行会被替换成不可读的占位符；正确做法是从源头不产生凭据，而不是事后掩码。
 
@@ -151,14 +152,16 @@ sudo ./install.sh --domain wuge.fun --email 7111479@qq.com --cert-mode acme \
 
 - Ubuntu 20.04 及以上，systemd 245 及以上，bash 5.x，root 执行。
 - 中转机可出网访问 GitHub Releases。
-- 中继监听端口空闲。默认设计是 relay 占用 22、系统 sshd 迁到 22022（见 6.1）；若不允许动 22（例如既有生产机），改用 `--ssh-addr 0.0.0.0:2222`，此时 2222 必须空闲且云安全组放行（见 6.1.1）。
+- 中继监听端口空闲。`--relay-port` 默认 `2222`，系统 sshd 保持在 `22` 不动（生产即此形态，见 6.1.1）；只有目标机允许中继占用 22 时才需要迁移 sshd（见 6.1）。
 - 云安全组先放行管理面来源，再改主机防火墙；主机防火墙只做兜底。
 - WS 入口需要 TLS 终止层：`uptermd` 只监听明文 WS（默认环回 `127.0.0.1:8443`），公网 `wss://` 由反向代理终止 TLS 后转发到该端口。反向代理选型与证书管理不在本目录脚本内，属真机实施项。
 - 反向代理与 uptermd 同机部署时，WS 上游固定监听 `127.0.0.1:8443`，不对外暴露。本方案的 nginx 由脚本安装在宿主上（独立实例、独立 conf 与 pid），不使用容器；若机器上已有容器占用 80/443，预检直接报端口冲突，不做接管。
 
 ## 6. 部署步骤
 
-### 6.1 迁移系统 sshd 到 22022
+### 6.1 可选：迁移系统 sshd 到 22022
+
+默认不需要这一步：`--relay-port` 默认 2222，中继与系统 sshd 共存（见 6.1.1）。只有要求中继占用 22 时才按本节迁移。
 
 1. 修改 `/etc/ssh/sshd_config` 的 `Port`，保留或新增管理面端口。
 2. 执行 `sshd -t` 校验配置，再重启 sshd。
@@ -291,7 +294,7 @@ sudo relay/rotate-relay-key.sh --apply
 6. ~~重启后 `/run/uptermd` 确实为空、`/var/lib/uptermd` 无新增会话文件。~~ 2026-11-09 实测通过：重启后 `/run/uptermd` 为空，`/var/lib/uptermd` 仅有 `server_key` 与 `server_key.pub`。
 7. ~~`systemctl show` 返回的 `MemoryMax`、`CPUQuotaPerSecUSec`、`TasksMax` 字面值与本脚本判定一致。~~ 2026-11-09 实测：实际字面值为 `1073741824`、`1.500000s`、`512`；脚本原判定只认 `1500000`/`1.5s`，已改为统一换算微秒后比较。
 8. nftables 速率规则的默认阈值在真实流量下是否合适，是否误伤正常重连。
-9. 打洞优先策略在自建 runner 或同 NAT 环境下是否可成功；托管 runner 只验中继分支。
+9. ~~打洞优先策略在自建 runner 或同 NAT 环境下是否可成功；托管 runner 只验中继分支。~~ 该策略已取消：当前实现为中继先建立、直连可选（`direct-mode`，默认 `none`），直连失败回落中继；直连面的 8 项取证见 `.team/records/设计更正-直连路径-20261109.md`。
 10. 两个入口同时进入同一会话时，TUI 的实际可用性。
 
 补充实测条件：Ubuntu 22.04.5 的 `journalctl --disk-usage` 在部署前为 416.1M，写入 `SystemMaxUse=200M` 并重启 journald 后不会立即压到上限，需按第 9 节执行一次 `journalctl --vacuum-size`；本机压到 144.0M 后健康检查通过。同日做了同机端到端会话（upterm host + ssh 访客）：建会话、访客执行命令、回收均成功；访客在共享 shell 内 `exit` 会结束宿主命令并立即回收会话（2026-11-09 生产机复测：`session wait` 0.040s 返回，指标 0.053s 归零；走 exec 通道执行单条命令不影响会话，需显式 stop）。全程 `/run/uptermd` 与 `/var/lib/uptermd` 无新增文件，监听端口不变，停后 `sessions_active_count` 归零。另：中继只接受 publickey 认证，runner 未设闸门时访客也必须提供任意一把私钥，无密钥连接被拒（exit 255，`Permission denied`）。2026-11-09 阿里云成都 ECS（Ubuntu 20.04.6，2 vCPU/2 GiB/40 GiB）以 `--ssh-addr 0.0.0.0:2222` 部署，系统 sshd 保持 22 未改，22 上的连接未中断。闸门与时延实测：中继白名单只拦宿主注册，清单外宿主 exit 1（`Permission denied`），清单内 exit 0；中继白名单外的访客仍可登录，runner 侧清单外访客 exit 255（`Permission denied`）。访客 `exit` 后会话立即结束：从访客 ssh 返回计，`upterm session wait` 0.160s 返回（exit 0），10ms 粒度下活动会话指标 0.045s 归零；原连接串立即重连失败（exit 255，`Permission denied`）。
@@ -300,7 +303,7 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
 
 ## 12. 网页桥接（中继侧无状态配对 + runner 第二条反连 WS）
 
-背景见 `.team/records/设计更正-网页桥接落点-20261109.md`。本轮只落本地代码与部署资产，未在真机部署，第 12.8 节全部待确认。
+背景见 `.team/records/设计更正-网页桥接落点-20261109.md`。2026-11-10 已在本项目生产机（`47.109.32.249`，宿主 nginx）部署：桥接监听 `127.0.0.1:8081`，`/t/` 返回 200，`/ws/` 与 `/runner/` 完成 Upgrade（101），上游均为 `127.0.0.1`。WebAuthn 真实验签仍未在真实认证器上取证，见 12.7。
 
 ### 12.1 模块划分
 
@@ -360,7 +363,7 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
    ```
 4. nginx 片段由安装器生成，不手工复制：
    ```bash
-   sudo ./relay/install.sh --relay-only --apply   # 或完整形态，见第 5 节
+   sudo ./relay/install.sh --domain <域名> --apply   # 完整形态；--relay-only 不会安装 nginx 与桥接
    # 生成位置: /etc/actssh/nginx/conf.d/ (dedicated) 或 /etc/nginx/conf.d/ (--nginx-mode host)
    ```
 5. 在 runner 侧并行启动桥接客户端（不改 SSH 反连）：
@@ -373,7 +376,7 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
 
 ### 12.4 工作流接入点与失败阶段名
 
-接入点：runner 建好 tmux 会话并打印九项路由信息之后、等待会话结束之前，把 `start_web_bridge` 作为与 SSH 反连**并行**的后台进程启动；两入口共用同一 `session_id` 与同一 tmux 会话。本轮不改 `.github/workflows/session.yml`，接入由后续 P08 落地。
+接入点：runner 建好 tmux 会话并打印九项路由信息之后、等待会话结束之前，把 `start_web_bridge` 作为与 SSH 反连**并行**的后台进程启动；两入口共用同一 `session_id` 与同一 tmux 会话。`.github/workflows/session.yml` 已接入：桥接在「暂存路由字段」之后、`等待会话结束` 之前启动，失败不中断作业。
 
 失败阶段名（`data.stage` 与日志 event 一致）：
 
@@ -407,23 +410,23 @@ python3 -m venv .venv-bridge
 ### 12.6 回滚
 
 1. `sudo systemctl disable --now actssh-web-bridge.service`。
-2. 从 443 server 块删除 include 行（或删除 `web-bridge-location.conf`），`sudo nginx -t -c /etc/actssh/nginx/nginx.conf && sudo systemctl reload actssh-nginx.service`。
+2. 从 443 server 块删除 include 行（或删除 `web-bridge-location.inc`），然后按部署形态重载 nginx：`dedicated` 为 `sudo nginx -t -c /etc/actssh/nginx/nginx.conf && sudo systemctl reload actssh-nginx.service`；`host` 为 `sudo nginx -t && sudo systemctl reload nginx`。
 3. 保留 `scripts/web_admission.py` 与前端代码；桥接不落盘，无需清理用户数据。
 4. 回滚后 SSH 入口仍按第 7 节判据可用；网页入口不可用属预期，不得写成已具备。
 
-### 12.7 本机未验证事项（真机必须逐项确认）
+### 12.7 真机逐项确认情况（2026-11-10 更新）
 
-| 序号 | 待确认项 | 判定方式 |
-|---|---|---|
-| 1 | 宿主 nginx 实例能对 `/ws/` 与 `/runner/` 完成 Upgrade 并长时间保持 | 浏览器与 runner 各连一次，观察 101、空闲 30 分钟不断流 |
-| 2 | runner 出站 `wss://wuge.fun/runner/<session_id>` 可达且不被 Actions 网络策略阻断 | runner 上跑最小客户端连一次并回显 |
-| 3 | Ubuntu 20.04 的 Python 3.8 可安装 `websockets==10.4` | `pip install` 记录版本号与离线包校验 |
-| 4 | 桥接在 2 vCPU / 2 GiB 下资源可接受 | 两路终端字节流压测，记录 RSS、CPU、连接数 |
-| 5 | 会话结束后旧 `session_id` 被拒，新会话不串入旧标识 | 结束会话后重连；再起新会话用旧标识重试 |
-| 6 | 桥接重启后无配对、无文件、无审计痕迹 | 重启前后 `ss`、文件清单与 `active_routes` 对比 |
-| 7 | 同会话第二个 runner 注册被拒、不静默顶替 | 两路 runner 客户端同时注册，观察 1008 `ROUTE_CONFLICT` |
-| 8 | 单元沙箱与真机内核兼容 | 重点看 `ProtectSystem=strict`、`SystemCallFilter=@system-service`、`IPAddressDeny=any` 是否导致启动失败；桥接只连环回时 `IPAddressAllow=localhost` 足够 |
-| 9 | WebAuthn 的 RP ID / origin 与 `https://wuge.fun` 一致 | 真实域名下完成一次注册与一次断言 |
+| 序号 | 待确认项 | 判定方式 | 状态 |
+|---|---|---|---|
+| 1 | 宿主 nginx 实例能对 `/ws/` 与 `/runner/` 完成 Upgrade 并长时间保持 | 浏览器与 runner 各连一次，观察 101、空闲 30 分钟不断流 | 已验证 Upgrade 101（生产）；30 分钟长连接未专项计时 |
+| 2 | runner 出站 `wss://wuge.fun/runner/<session_id>` 可达且不被 Actions 网络策略阻断 | runner 上跑最小客户端连一次并回显 | 见根 `README.md`「验证状态」 |
+| 3 | Ubuntu 20.04 的 Python 3.8 可安装 `websockets==10.4` | `pip install` 记录版本号与离线包校验 | 见根 `README.md`「验证状态」 |
+| 4 | 桥接在 2 vCPU / 2 GiB 下资源可接受 | 两路终端字节流压测，记录 RSS、CPU、连接数 | 未验证 |
+| 5 | 会话结束后旧 `session_id` 被拒，新会话不串入旧标识 | 结束会话后重连；再起新会话用旧标识重试 | 见根 `README.md`「验证状态」 |
+| 6 | 桥接重启后无配对、无文件、无审计痕迹 | 重启前后 `ss`、文件清单与 `active_routes` 对比 | 单元级已验证，真机未压 |
+| 7 | 同会话第二个 runner 注册被拒、不静默顶替 | 两路 runner 客户端同时注册，观察 1008 `ROUTE_CONFLICT` | 单元级已验证，真机未压 |
+| 8 | 单元沙箱与真机内核兼容 | 重点看 `ProtectSystem=strict`、`SystemCallFilter=@system-service`、`IPAddressDeny=any` 是否导致启动失败；桥接只连环回时 `IPAddressAllow=localhost` 足够 | 生产单元已 active |
+| 9 | WebAuthn 的 RP ID / origin 与 `https://wuge.fun` 一致 | 真实域名下完成一次注册与一次断言 | 虚拟认证器验证未完成，真实设备未验 |
 
 ### 12.8 空清单自举注册（已知残余风险）
 
