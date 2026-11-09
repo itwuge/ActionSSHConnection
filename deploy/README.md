@@ -707,3 +707,59 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://ssh.example.com/
 - 不要删容器镜像作为「回滚准备」；
 - 不要在本节流程里顺手改 ZeroTier 配置；
 - 不要把本节的 `172.17.0.1` / 容器共存写法带到新机器。
+
+## 18. 未验证项与待实现
+
+### 18.1 公网 ACME 真机签发（未验证）
+
+第 13.11 节的实测走的是 `--cert-mode self-signed`，**「干净机器 + 真实域名 + 公网 HTTP-01 签发」这一组合尚未在真机验证**。当前执行环境已确认具备与不具备的条件如下。
+
+已确认具备：
+
+- 验收机（Ubuntu 22.04.5）已装 `certbot 1.21.0`，出网可达 Let's Encrypt：`https://acme-v02.api.letsencrypt.org/directory` 返回 200；
+- 本地 webroot 校验路径可用：`http://127.0.0.1/.well-known/acme-challenge/<token>` 能取到文件（自检项 `acme:webroot` 通过）。
+
+不具备（阻塞项，缺一不可）：
+
+1. **无公网入站**：验收 VM 为 NAT 网络（VM `192.168.37.132` → 宿主 `192.168.31.80` → 共享出口 NAT `115.150.84.112`），公网无法访问其 80 端口，也没有可配置的端口映射；生产机 `47.109.32.249` 按约定不得用于实验。
+2. **无域名控制权**：没有可添加 A 记录的测试子域。`lab.actssh.test` 与 `acme-lab.example.com` 在公网均为 NXDOMAIN。
+
+真实失败证据（2026-11-09，Ubuntu 22.04.5，`certbot certonly --dry-run`，LE staging）：
+
+```text
+Simulating a certificate request for lab.actssh.test
+An unexpected error occurred:
+The server will not issue certificates for the identifier :: Invalid identifiers requested ::
+Cannot issue for "lab.actssh.test": Domain name does not end with a valid public suffix (TLD)
+```
+
+结论：不是脚本或 nginx/certbot 配置问题，而是环境缺公网入口与可签发的域名。**需要用户提供**以下任一组合：
+
+- 一台临时云主机（干净 Ubuntu 20.04/22.04 x86_64，公网 IPv4，安全组放行 80/443），以及一个指向该 IP 的 A 记录（用户自己的测试子域）；或
+- 现有宿主机的 80 端口入站映射，以及该子域 A 记录的控制权（能改 DNS）。
+
+具备条件后按下列顺序验证，并记录每步结果与耗时：
+
+```bash
+dig +short A <子域>                                  # 必须返回验证机的公网 IP
+sudo ./deploy/bootstrap.sh --domain <子域> --email <邮箱> \
+  --acme-staging --admin-cidr <管理网段> --apply      # 先用 staging 打一次，避免消耗正式配额
+sudo ./deploy/bootstrap.sh --domain <子域> --email <邮箱> \
+  --admin-cidr <管理网段> --apply                     # 再跑正式签发
+sudo certbot renew --dry-run                          # 续期演练
+sudo ./deploy/bootstrap/selfcheck.sh --domain <子域>  # 期望 cert:expiry 剩余约 90 天且非 self-signed
+```
+
+验收判据：`/etc/actssh/tls/` 下证书由 Let's Encrypt 签发（`openssl x509 -issuer` 含 `Let's Encrypt`）、`selfcheck.sh` 全项 `[OK]`、`certbot renew --dry-run` 成功、续期 hook 与 cron 兜底均存在。未取得上述证据前，不得把「公网 ACME 已跑通」写成已验证。
+
+### 18.2 待实现：SSH 鉴权失败限速
+
+**现状**：访客用错误密钥连接中继 SSH（默认 `2222`）时，认证在中继的 SSH 层失败，请求不会转发到 runner，因此 runner 侧日志与计数看不到失败次数，无法据此做封禁或告警；`uptermd` 本身也不暴露按来源的鉴权失败计数。
+
+**建议方案**（择一，实施前先做压测与误封评估）：
+
+1. 中继前置流式代理（推荐）：在 `2222` 前加 HAProxy/nginx `stream`，用 `stick-table`/`limit_conn` 按来源限制新建连接速率与并发，失败即拒绝，不改 uptermd；
+2. 主机层限速：`nftables` 用 `meter` + `limit` 或 `iptables hashlimit` 对新入站 SSH 连接按源 IP 限速（可与现有防火墙脚本合并，需提供白名单与回滚）；
+3. 指标侧旁路：从中继连接指标做差值与来源聚合，超阈值时由守护脚本下发临时封禁（实现成本最高，且拿不到失败原因）。
+
+**状态**：待实现，本轮不落地。落地时需同步更新第 13.4 节端口表（新增前置代理端口）与 `uninstall.sh` 的清理清单。
