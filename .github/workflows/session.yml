@@ -19,7 +19,7 @@ name: 调试会话
 #
 # 必需仓库变量（均为非秘密路由信息）：
 #   UPTERM_RELAY_KNOWN_HOST   中继主机 known_hosts 行（公钥，防中间人）
-#   WEB_TERMINAL_BASE_URL     网页终端静态页地址（不含会话参数）
+#   WEB_TERMINAL_BASE_URL     网页终端站点根地址（如 https://wuge.fun，不含 /t/ 与任何会话参数）
 #   WEBAUTHN_CREDENTIAL_ID    公钥凭据标识（WebAuthn credential id，公开标识）
 # 可选仓库变量：
 #   UPTERM_DIRECT_ENDPOINT    直连候选对端 host[:port]；不配即按「无可用对端地址」判直连失败
@@ -308,7 +308,7 @@ jobs:
             echo "ssh_user=$SSH_LOGIN_USER"
             echo "pubkey_fingerprint=$FINGERPRINTS"
             echo "expires_at=$EXPIRES_AT"
-            echo "web_url=${WEB_TERMINAL_BASE_URL}#session_id=${SESSION_ID}"
+            echo "web_url=${WEB_TERMINAL_BASE_URL%/}/t/${SESSION_ID}"
             echo "pubkey_credential_id=$WEBAUTHN_CREDENTIAL_ID"
             echo "path_mode=$PATH_MODE"
           } > "$fields"
