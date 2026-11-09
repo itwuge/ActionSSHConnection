@@ -1,0 +1,24 @@
+name: tmp-direct-fallback
+
+# 临时验证：direct-mode=tailscale 但不给 auth key，应回落 relay 且 session_id 不变。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          ssh: true
+          direct-mode: tailscale
+          direct-ssh-port: "2222"
+          session-minutes: "5"
+          idle-minutes: "1"
+          route-artifact-name: route-fields
