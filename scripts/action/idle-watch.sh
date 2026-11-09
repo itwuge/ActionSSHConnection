@@ -22,15 +22,17 @@ idle_seconds=$((idle_minutes * 60))
 
 # 在连人数 = SSH 访客（upterm 日志里的 Client joined/left）+ 网页访客（准入进程写的存在标记）。
 # SSH 访客共享托管 tmux 客户端的同一 PTY，无法从 tmux 客户端数看出，只能看 upterm 的进出事件。
+#
+# 日志行尾可能带终端控制序列（实测有 ESC[K），不能整行交给 jq 解析，否则会静默丢行、
+# 把在连人数恒算成 0，导致有人连着也被判空闲。这里只做固定字符串匹配。
 ssh_guests() {
   [ -s "$upterm_log" ] || { echo 0; return; }
+  local sid_pattern="\"session\":\"$session_id\""
   local joined left
-  joined="$(jq -R --arg sid "$session_id" \
-    'fromjson? | select(.session == $sid and .msg == "Client joined") | 1' \
-    "$upterm_log" 2>/dev/null | wc -l)"
-  left="$(jq -R --arg sid "$session_id" \
-    'fromjson? | select(.session == $sid and .msg == "Client left") | 1' \
-    "$upterm_log" 2>/dev/null | wc -l)"
+  joined="$(grep -F "$sid_pattern" "$upterm_log" 2>/dev/null | grep -cF '"Client joined"')"
+  left="$(grep -F "$sid_pattern" "$upterm_log" 2>/dev/null | grep -cF '"Client left"')"
+  case "$joined" in ''|*[!0-9]*) joined=0 ;; esac
+  case "$left" in ''|*[!0-9]*) left=0 ;; esac
   local diff=$((joined - left))
   [ "$diff" -gt 0 ] || diff=0
   echo "$diff"
@@ -57,6 +59,7 @@ while [ -d "$workdir" ] && [ ! -f "$workdir/lifecycle.stop" ]; do
     idle=$((now - last_active))
     if [ "$idle" -ge "$idle_seconds" ]; then
       echo "会话空闲超时：已 $((idle / 60)) 分钟无人在连（上限 ${idle_minutes} 分钟），结束会话"
+      echo "空闲判定：SSH 在连 ${ssh_count}、网页在连 ${web_count}"
       echo "::warning::空闲超时结束会话（${idle_minutes} 分钟无人连接）"
       upterm session stop "$session_name" >/dev/null 2>&1 || true
       exit 0
