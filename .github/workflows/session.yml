@@ -406,8 +406,10 @@ jobs:
           if ! python3 -m venv "$venv" >/dev/null 2>&1; then
             unavailable bridge-connect "无法创建 Python 虚拟环境"
           fi
-          if ! "$venv/bin/pip" install --quiet --disable-pip-version-check -r scripts/requirements-web-bridge.txt; then
-            unavailable bridge-connect "网页桥接依赖安装失败（websockets==10.4）"
+          if ! "$venv/bin/pip" install --quiet --disable-pip-version-check \
+              -r scripts/requirements-web-bridge.txt \
+              -r scripts/requirements-web-admission.txt; then
+            unavailable bridge-connect "网页桥接或准入依赖安装失败（websockets/fido2）"
           fi
 
           # 准入命令走同一虚拟环境；凭据标识为空时开放注册引导，由浏览器首次注册生成
