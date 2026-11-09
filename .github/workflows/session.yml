@@ -321,7 +321,15 @@ jobs:
             cat "$fields"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          rm -f "$fields"
+          # 字段文件保留到收尾统一删除，期间另存为制品供 CI 侧读取（只含这 9 行）
+
+      - name: 暂存路由字段
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: route-fields
+          path: ${{ github.workspace }}/../actssh-tmp/fields
+          if-no-files-found: error
+          retention-days: 1
 
       - name: 等待会话结束
         timeout-minutes: 35
