@@ -1,0 +1,259 @@
+/* 文件: styles.css
+ * 所属目录: web/src/
+ * 文件用途: 网页终端的布局与主题样式, 覆盖表单, 状态区, 终端容器与断线浮层.
+ * 架构定位: 前端层样式, 与 index.html 的固定结构一一对应, 不参与逻辑.
+ * 核心功能: 深色终端主题; 自适应布局; 状态标签; 浮层与移动端换行.
+ * 职责边界: 不含脚本行为, 不引入外部字体与远程资源, 避免发布时产生第三方请求.
+ * 运行环境: 现代浏览器, 依赖 CSS 变量与 flex 布局.
+ * 依赖关系: 被 main.ts 引入并打包为 dist/app.css.
+ */
+
+:root {
+  color-scheme: dark;
+  --bg: #070b11;
+  --panel: #101823;
+  --panel-edge: #1e2b3c;
+  --text: #d7e0ea;
+  --muted: #8b9bb0;
+  --accent: #54d6a0;
+  --accent-soft: rgba(84, 214, 160, 0.14);
+  --warn: #e6c07b;
+  --danger: #f07178;
+  --radius: 10px;
+  --mono: "JetBrains Mono", "Cascadia Mono", "Consolas", "Noto Sans Mono CJK SC", monospace;
+  --sans: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--panel-edge);
+  background: var(--panel);
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.app-header .subtitle {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.app-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px 20px 20px;
+  min-height: 0;
+}
+
+.control-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 220px;
+  flex: 1 1 240px;
+}
+
+.field label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.field input {
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--panel-edge);
+  border-radius: 8px;
+  background: #0b121b;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.field input:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+button {
+  height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--panel-edge);
+  border-radius: 8px;
+  background: #16202c;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button.primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: #062016;
+  font-weight: 600;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.form-message {
+  flex-basis: 100%;
+  margin: 0;
+  min-height: 18px;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  margin: 0;
+  padding: 10px 14px;
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-size: 12px;
+}
+
+.status-bar dt {
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.status-bar dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.warning-line {
+  margin: 0;
+  padding: 10px 14px;
+  border: 1px solid rgba(230, 192, 123, 0.5);
+  border-radius: var(--radius);
+  background: rgba(230, 192, 123, 0.1);
+  color: var(--warn);
+  font-size: 12px;
+}
+
+.terminal-shell {
+  position: relative;
+  flex: 1;
+  min-height: 320px;
+  padding: 10px;
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--radius);
+  background: #0b1017;
+  overflow: hidden;
+}
+
+.terminal {
+  width: 100%;
+  height: 100%;
+}
+
+.notice {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 24px;
+  background: rgba(7, 11, 17, 0.88);
+  backdrop-filter: blur(2px);
+  text-align: center;
+}
+
+.notice[hidden] {
+  display: none;
+}
+
+.notice p {
+  margin: 0;
+  max-width: 560px;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.notice button {
+  min-width: 120px;
+}
+
+.app-footer {
+  padding: 0 20px 16px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+@media (max-width: 640px) {
+  .app-main {
+    padding: 12px;
+  }
+
+  .field {
+    min-width: 100%;
+  }
+
+  .status-bar {
+    gap: 14px;
+  }
+}

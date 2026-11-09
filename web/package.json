@@ -1,0 +1,27 @@
+{
+  "name": "action-ssh-connection-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ActionSSHConnection 网页终端前端: xterm 终端渲染与 WebAuthn 设备内签名",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "esbuild src/main.ts --bundle --format=iife --target=es2022 --sourcemap --outfile=dist/app.js",
+    "build:prod": "esbuild src/main.ts --bundle --format=iife --target=es2022 --minify --outfile=dist/app.js",
+    "check": "npm run typecheck && npm run build",
+    "serve": "node tools/serve.mjs",
+    "mock-relay": "node tools/mock-relay.mjs"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.0",
+    "ws": "^8.18.0"
+  }
+}

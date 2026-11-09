@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>ActionSSHConnection 网页终端</title>
+    <link rel="stylesheet" href="./dist/app.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <h1>ActionSSHConnection 网页终端</h1>
+      <p class="subtitle">网页通道一期: 固定走中继, 准入由 runner 侧验签</p>
+    </header>
+
+    <main class="app-main">
+      <form id="connect-form" class="control-panel" autocomplete="off">
+        <div class="field">
+          <label for="relay-origin">中转地址</label>
+          <input
+            id="relay-origin"
+            name="relay"
+            type="text"
+            inputmode="url"
+            placeholder="wss://relay.wuge.fun"
+            spellcheck="false"
+          />
+        </div>
+        <div class="field">
+          <label for="session-id">会话标识</label>
+          <input
+            id="session-id"
+            name="session"
+            type="text"
+            placeholder="从会话日志的 session_id 字段取得"
+            spellcheck="false"
+          />
+        </div>
+        <div class="actions">
+          <button id="connect-button" class="primary" type="submit">连接</button>
+          <button id="disconnect-button" type="button">断开</button>
+          <button id="register-button" type="button">注册本设备通行密钥</button>
+        </div>
+        <p id="form-message" class="form-message" role="alert"></p>
+      </form>
+
+      <dl class="status-bar">
+        <div>
+          <dt>连接状态</dt>
+          <dd id="status-connection">未连接</dd>
+        </div>
+        <div>
+          <dt>当前路径</dt>
+          <dd id="status-path">未连接</dd>
+        </div>
+        <div>
+          <dt>准入状态</dt>
+          <dd id="status-admission">未开始</dd>
+        </div>
+      </dl>
+
+      <p id="warning-line" class="warning-line" hidden></p>
+
+      <section class="terminal-shell" aria-label="终端">
+        <div id="terminal" class="terminal"></div>
+        <div id="notice" class="notice" hidden>
+          <p id="notice-text"></p>
+          <button id="notice-action" type="button">重新连接</button>
+        </div>
+      </section>
+
+      <footer class="app-footer">
+        本页只持有会话标识与中转地址, 不保存、不生成、不回显任何可复用凭据; 通行密钥私钥始终留在本设备.
+        网页通道不尝试浏览器打洞, 当前路径固定为中继转发.
+      </footer>
+    </main>
+
+    <script src="./dist/app.js"></script>
+  </body>
+</html>
