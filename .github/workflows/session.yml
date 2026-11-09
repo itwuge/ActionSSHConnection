@@ -205,6 +205,9 @@ jobs:
 
           # v0.41.1 已核实：--detach 在没有可询问的终端时必须配 --accept；
           # --detach 成功时退出码为 0，失败为 1；-o json 只把 JSON 打到 stdout。
+          # 必须显式给出长驻托管命令（v0.41.1 源码：run COMMAND, or $SHELL without one）：
+          # 缺省 $SHELL 在无访客的 detached PTY 下立即退出，会话会在启动数秒后自行结束。
+          # 托管命令用 tmux，使 SSH 与网页访客进入同一终端进程；访客在会话内 exit 即 tmux 退出、会话结束。
           if ! upterm host \
               --accept \
               --detach \
@@ -215,7 +218,9 @@ jobs:
               --join-timeout "$JOIN_TIMEOUT" \
               --no-sftp \
               --pty-size 80x24 \
-              -o json > "$WORKDIR/session.json" 2> "$WORKDIR/session.err"; then
+              -o json \
+              -- tmux new-session -A -s "$SESSION_NAME" \
+              > "$WORKDIR/session.json" 2> "$WORKDIR/session.err"; then
             rm -f "$WORKDIR/session.json" "$WORKDIR/session.err"
             echo "失败[阶段 start-session]：客户端异常退出，原因见运行报告，具体输出不外显" >&2
             exit 1
@@ -271,18 +276,20 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: 准备共享终端
-        timeout-minutes: 2
+        timeout-minutes: 1
         run: |
           set -euo pipefail
-          # 网页终端需要一个与 SSH 会话同一路由、可被桥接进程接入的终端。
-          # 这里提供可 attach 的终端进程；桥接如何接入同一 socket [待真机确认]。
-          name="actssh"
-          if command -v tmux >/dev/null 2>&1; then
-            tmux new-session -d -s "$name" 2>/dev/null || true
-            echo "共享终端就绪：tmux 会话 $name（网页桥接待 P07/P08 接入）"
-          else
-            echo "::warning::未找到 tmux，共享终端未就绪；网页入口 [待真机确认]"
-          fi
+          # 共享终端由「启动会话」的 upterm host 直接托管（host 命令即 tmux 客户端），
+          # SSH 与网页访客进入的是同一个 tmux 会话；这里只确认它已起来，不再另起会话。
+          for _ in $(seq 1 10); do
+            if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+              echo "共享终端就绪：tmux 会话 $SESSION_NAME（由 upterm host 托管）"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "失败[阶段 shared-terminal]：未发现 tmux 会话 $SESSION_NAME" >&2
+          exit 1
 
       - name: 输出路由字段
         id: route
