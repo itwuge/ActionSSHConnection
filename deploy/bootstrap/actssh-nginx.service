@@ -1,0 +1,67 @@
+# =========** 文件头 =========**
+# 文件        : actssh-nginx.service
+# 所属目录    : deploy/bootstrap/
+# 文件用途    : 以独立 systemd 单元运行 bootstrap 自装的 nginx 实例, 与发行版 nginx 的站点约定完全隔离
+# 架构定位    : TLS 终止层进程托管; 上游是 /etc/actssh/nginx/nginx.conf, 下游是 nginx 主进程
+# 核心功能    : 只加载独立配置目录, 独立运行目录与日志目录, 施加内存与 CPU 与任务数上限, 崩溃自动重启
+# 职责边界    : 不生成配置, 不申请证书, 不接管发行版 nginx 的 sites-enabled; 不监听 unit 中未声明的端口
+# 运行环境    : Ubuntu 20.04 与 22.04, systemd 245 及以上, nginx 1.18 及以上
+# 依赖关系    : 依赖 /etc/actssh/nginx/nginx.conf 与 /var/log/actssh/nginx; 由 deploy/bootstrap/nginx-cert.sh 安装
+#
+# 回滚
+#   systemctl disable --now actssh-nginx.service
+#   删除本单元与 /etc/actssh/nginx 后执行 systemctl daemon-reload
+
+[Unit]
+Description=ActSSH dedicated nginx (isolated config tree)
+Documentation=file:///etc/actssh/nginx/nginx.conf
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/run/actssh-nginx/nginx.pid
+
+# 配置目录固定为 /etc/actssh/nginx, 不读取 /etc/nginx/sites-enabled, 避免与宿主机既有站点互相覆盖
+ExecStartPre=/usr/sbin/nginx -t -c /etc/actssh/nginx/nginx.conf
+ExecStart=/usr/sbin/nginx -c /etc/actssh/nginx/nginx.conf
+ExecReload=/usr/sbin/nginx -c /etc/actssh/nginx/nginx.conf -s reload
+ExecStop=/usr/sbin/nginx -c /etc/actssh/nginx/nginx.conf -s quit
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+
+# 资源上限: 仅做 TLS 终止与 WS 反代, 按 2 vCPU / 2 GiB 机器留出余量
+MemoryMax=256M
+CPUQuota=50%
+TasksMax=128
+LimitNOFILE=8192
+
+# 最小权限: 只保护系统目录, /var 下的日志与证书校验可写由 nginx 自身需要决定
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+UMask=0022
+
+RuntimeDirectory=actssh-nginx
+RuntimeDirectoryMode=0755
+WorkingDirectory=/run/actssh-nginx
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=actssh-nginx
+
+[Install]
+WantedBy=multi-user.target

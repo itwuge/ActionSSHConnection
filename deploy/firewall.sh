@@ -13,6 +13,9 @@
 #               FW_BACKEND           auto 或 ufw 或 nftables, 默认 auto
 #               FW_RELAY_PORT        uptermd SSH 对外端口, 默认 22
 #               FW_WS_PORT           WS 对外端口, 默认 443; 由 TLS 终止层监听并转发到环回 WS
+#               FW_HTTP_PORT         HTTP 对外端口, 默认空; 仅在给出时放行, 用于 ACME 校验与跳转
+#               FW_NO_WEB            置 1 时只处理 SSH 与指标, 不放开 HTTP 与 WS 入口
+#               FW_NO_RELAY          置 1 时不放开 uptermd SSH 入口, 用于只开网页入口的形态
 #               FW_ADMIN_PORT        管理面 SSH 端口, 默认 22022
 #               FW_METRICS_PORT      指标端口, 默认 9100
 #               FW_RELAY_RATE        SSH 新连接速率, 默认 20/second
@@ -46,6 +49,9 @@ set -Eeuo pipefail
 BACKEND="${FW_BACKEND:-auto}"
 RELAY_PORT="${FW_RELAY_PORT:-22}"
 WS_PORT="${FW_WS_PORT:-443}"
+HTTP_PORT="${FW_HTTP_PORT:-}"
+NO_WEB="${FW_NO_WEB:-0}"
+NO_RELAY="${FW_NO_RELAY:-0}"
 ADMIN_PORT="${FW_ADMIN_PORT:-22022}"
 METRICS_PORT="${FW_METRICS_PORT:-9100}"
 RELAY_RATE="${FW_RELAY_RATE:-20/second}"
@@ -83,6 +89,9 @@ show_usage() {
   --backend <auto|ufw|nftables> 指定后端
   --relay-port <port>           uptermd SSH 对外端口, 默认 22
   --ws-port <port>              WS 对外端口, 默认 443
+  --http-port <port>            HTTP 对外端口, 给出时才放行; 用于 ACME 校验与跳转
+  --no-web                      不放开 HTTP 与 WS 入口, 适用于只装中继的形态
+  --no-relay                    不放开 uptermd SSH 入口, 适用于关闭直连的形态
   --admin-port <port>           管理面 SSH 端口, 默认 22022
   --admin-cidr <cidr>           允许访问管理面的来源网段, 可重复
   --allow-admin-anywhere        管理面不限来源, 仅限临时排障
@@ -171,6 +180,9 @@ _parse_args() {
             --backend) BACKEND="${2:?缺少 --backend 取值}"; shift 2 ;;
             --relay-port) RELAY_PORT="${2:?缺少 --relay-port 取值}"; shift 2 ;;
             --ws-port) WS_PORT="${2:?缺少 --ws-port 取值}"; shift 2 ;;
+            --http-port) HTTP_PORT="${2:?缺少 --http-port 取值}"; shift 2 ;;
+            --no-web) NO_WEB=1; shift ;;
+            --no-relay) NO_RELAY=1; shift ;;
             --admin-port) ADMIN_PORT="${2:?缺少 --admin-port 取值}"; shift 2 ;;
             --admin-cidr) ADMIN_CIDRS+=("${2:?缺少 --admin-cidr 取值}"); shift 2 ;;
             --allow-admin-anywhere) ALLOW_ADMIN_ANYWHERE=1; shift ;;
@@ -184,14 +196,34 @@ _parse_args() {
             *) printf '[ERROR] 未知参数: %s\n' "$1" >&2; exit 2 ;;
         esac
     done
-    if [[ "$RELAY_PORT" == "$ADMIN_PORT" ]]; then
+    # 仅对本次真正放行的入口做冲突校验, 关闭的入口不参与
+    if (( NO_RELAY == 0 )) && [[ "$RELAY_PORT" == "$ADMIN_PORT" ]]; then
         _die 2 "firewall.args.conflict" "SSH 入口端口与管理面端口相同, 需分开: port=${RELAY_PORT}"
     fi
-    if [[ "$WS_PORT" == "$ADMIN_PORT" || "$WS_PORT" == "$RELAY_PORT" ]]; then
-        _die 2 "firewall.args.conflict" "WS 入口端口不能与管理面或 SSH 入口相同: port=${WS_PORT}"
+    if (( NO_WEB == 0 )); then
+        if [[ "$WS_PORT" == "$ADMIN_PORT" ]]; then
+            _die 2 "firewall.args.conflict" "WS 入口端口不能与管理面相同: port=${WS_PORT}"
+        fi
+        if (( NO_RELAY == 0 )) && [[ "$WS_PORT" == "$RELAY_PORT" ]]; then
+            _die 2 "firewall.args.conflict" "WS 入口端口不能与 SSH 入口相同: port=${WS_PORT}"
+        fi
+        if [[ -n "$HTTP_PORT" ]]; then
+            if [[ "$HTTP_PORT" == "$ADMIN_PORT" || "$HTTP_PORT" == "$WS_PORT" ]]; then
+                _die 2 "firewall.args.conflict" "HTTP 端口不能与管理面或 WS 入口相同: port=${HTTP_PORT}"
+            fi
+            if (( NO_RELAY == 0 )) && [[ "$HTTP_PORT" == "$RELAY_PORT" ]]; then
+                _die 2 "firewall.args.conflict" "HTTP 端口不能与 SSH 入口相同: port=${HTTP_PORT}"
+            fi
+        fi
     fi
-    if [[ "$METRICS_PORT" == "$RELAY_PORT" || "$METRICS_PORT" == "$WS_PORT" ]]; then
-        _die 2 "firewall.args.conflict" "指标端口不能与入口端口相同: port=${METRICS_PORT}"
+    if [[ "$METRICS_PORT" == "$ADMIN_PORT" ]]; then
+        _die 2 "firewall.args.conflict" "指标端口不能与管理面端口相同: port=${METRICS_PORT}"
+    fi
+    if (( NO_RELAY == 0 )) && [[ "$METRICS_PORT" == "$RELAY_PORT" ]]; then
+        _die 2 "firewall.args.conflict" "指标端口不能与 SSH 入口相同: port=${METRICS_PORT}"
+    fi
+    if (( NO_WEB == 0 )) && [[ "$METRICS_PORT" == "$WS_PORT" ]]; then
+        _die 2 "firewall.args.conflict" "指标端口不能与 WS 入口相同: port=${METRICS_PORT}"
     fi
     LOG_FILE="${LOG_DIR}/${RUN_ID}.jsonl"
 }
@@ -301,8 +333,19 @@ _apply_ufw() {
     else
         rule="allow"
     fi
-    _ufw_cmd "$rule" "$RELAY_PORT/tcp" comment 'uptermd ssh entry'
-    _ufw_cmd "$rule" "$WS_PORT/tcp" comment 'uptermd ws entry'
+    if (( NO_RELAY == 0 )); then
+        _ufw_cmd "$rule" "$RELAY_PORT/tcp" comment 'uptermd ssh entry'
+    else
+        _say "跳过: 直连关闭, 不放行 SSH 入口 ${RELAY_PORT}"
+    fi
+    if (( NO_WEB == 0 )); then
+        _ufw_cmd "$rule" "$WS_PORT/tcp" comment 'uptermd ws entry'
+        if [[ -n "$HTTP_PORT" ]]; then
+            _ufw_cmd allow "${HTTP_PORT}/tcp" comment 'actssh http acme/redirect'
+        fi
+    else
+        _say "跳过: 未安装网页入口, 不放行 HTTP 与 WS"
+    fi
     _ufw_cmd deny "$METRICS_PORT/tcp" comment 'uptermd metrics loopback only'
     if (( APPLY == 1 )); then
         # --force 避免交互式确认, 否则脚本会挂在提示上
@@ -335,15 +378,22 @@ _render_nft() {
         printf '    iif lo accept\n'
         printf '    ct state established,related accept\n'
         printf '    ct state invalid drop\n'
-        # 新连接按全局速率上限放行, 超限直接丢弃; 阈值需按真机流量标定
-        printf '    tcp dport %s ct state new limit rate %s burst %s packets accept\n' \
-            "$RELAY_PORT" "$RELAY_RATE" "$RELAY_BURST"
-        printf '    tcp dport %s ct state new drop\n' "$RELAY_PORT"
-        printf '    tcp dport %s accept\n' "$RELAY_PORT"
-        printf '    tcp dport %s ct state new limit rate %s burst %s packets accept\n' \
-            "$WS_PORT" "$WS_RATE" "$WS_BURST"
-        printf '    tcp dport %s ct state new drop\n' "$WS_PORT"
-        printf '    tcp dport %s accept\n' "$WS_PORT"
+        if (( NO_RELAY == 0 )); then
+            # 新连接按全局速率上限放行, 超限直接丢弃; 阈值需按真机流量标定
+            printf '    tcp dport %s ct state new limit rate %s burst %s packets accept\n' \
+                "$RELAY_PORT" "$RELAY_RATE" "$RELAY_BURST"
+            printf '    tcp dport %s ct state new drop\n' "$RELAY_PORT"
+            printf '    tcp dport %s accept\n' "$RELAY_PORT"
+        fi
+        if (( NO_WEB == 0 )); then
+            printf '    tcp dport %s ct state new limit rate %s burst %s packets accept\n' \
+                "$WS_PORT" "$WS_RATE" "$WS_BURST"
+            printf '    tcp dport %s ct state new drop\n' "$WS_PORT"
+            printf '    tcp dport %s accept\n' "$WS_PORT"
+            if [[ -n "$HTTP_PORT" ]]; then
+                printf '    tcp dport %s accept\n' "$HTTP_PORT"
+            fi
+        fi
         if [[ -n "$cidr_list" ]]; then
             printf '    ip saddr { %s } tcp dport %s accept\n' "$cidr_list" "$ADMIN_PORT"
             printf '    tcp dport %s drop\n' "$ADMIN_PORT"
@@ -404,22 +454,30 @@ _verify() {
     if (( APPLY == 0 )); then
         return 0
     fi
-    if [[ "$BACKEND" == "ufw" ]]; then
-        for port in "$RELAY_PORT" "$WS_PORT"; do
+    local -a expect=()
+    if (( NO_RELAY == 0 )); then
+        expect+=("$RELAY_PORT")
+    fi
+    if (( NO_WEB == 0 )); then
+        expect+=("$WS_PORT")
+        if [[ -n "$HTTP_PORT" ]]; then
+            expect+=("$HTTP_PORT")
+        fi
+    fi
+    for port in "${expect[@]}"; do
+        if [[ "$BACKEND" == "ufw" ]]; then
             if ! ufw status verbose | grep -q "${port}"; then
                 _die 5 "firewall.verify.entry" "核对失败: ufw 未显示入口端口放行 port=${port}"
             fi
-        done
-    else
-        for port in "$RELAY_PORT" "$WS_PORT"; do
+        else
             if ! nft list table inet "$NFT_TABLE" | grep -q "dport ${port}"; then
                 _die 5 "firewall.verify.entry" "核对失败: nftables 未显示入口端口规则 port=${port}"
             fi
-        done
-    fi
-    _say "核对通过: SSH ${RELAY_PORT} 与 WS ${WS_PORT} 已放行并限速, 管理面端口 ${ADMIN_PORT} 受来源限制, 指标端口 ${METRICS_PORT} 仅环回"
+        fi
+    done
+    _say "核对通过: 启用入口=[${expect[*]:-无}], 管理面端口 ${ADMIN_PORT} 受来源限制, 指标端口 ${METRICS_PORT} 仅环回"
     _log INFO "firewall.verify.ok" "规则核对通过" \
-        "{\"relay_port\":${RELAY_PORT},\"ws_port\":${WS_PORT}}"
+        "{\"relay_enabled\":$(( NO_RELAY == 0 ? 1 : 0 )),\"web_enabled\":$(( NO_WEB == 0 ? 1 : 0 ))}"
 }
 
 # =========** 清理 =========**

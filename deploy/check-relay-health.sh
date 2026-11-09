@@ -68,8 +68,6 @@ LOG_FILE=""
 HOST=""
 WARNED=0
 CLEANED=0
-CHECK_DATA=""
-CHECK_CONFIRM=""
 
 # =========** 参数校验 =========**
 show_usage() {
