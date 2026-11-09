@@ -38,6 +38,11 @@ DEFAULT_CONNECT_TIMEOUT = 10.0
 DEFAULT_PING_INTERVAL = 20.0
 DEFAULT_PING_TIMEOUT = 20.0
 
+# 与 scripts/web_admission.py 的帧格式一致: 魔数 1 + 版本 1 + 类型 1 + 保留 1 + 负载长度 4
+FRAME_MAGIC = 0xA1
+FRAME_VERSION = 1
+FRAME_HEADER_BYTES = 8
+
 # 失败阶段名: 与日志 event 和 JSON data.stage 使用同一套值, 便于按阶段检索.
 STAGE_PRECHECK = "precheck"
 STAGE_CONNECT = "connect"
@@ -144,14 +149,37 @@ async def _pump_ws_to_child(websocket: object, child: "subprocess.Popen", counte
 
 
 async def _pump_child_to_ws(child: "subprocess.Popen", websocket: object, counters: Counters) -> None:
-    """准入子进程 stdout -> WS; 按块搬运, 不缓存整段会话."""
+    """准入子进程 stdout -> WS; 按帧切分, 保证一条 WS 消息恰好一帧.
+
+    浏览器侧按「一条消息一帧」严格解码; 管道读取会合并或截断帧, 因此这里必须重组,
+    不能把任意大小的读块直接当消息发送.
+    """
     loop = asyncio.get_running_loop()
+    buffer = b""
     while True:
         chunk = await loop.run_in_executor(None, child.stdout.read, 65536)  # type: ignore[union-attr]
         if not chunk:
             return
-        counters.bytes_to_bridge += len(chunk)
-        await websocket.send(chunk)
+        buffer += chunk
+        while len(buffer) >= FRAME_HEADER_BYTES:
+            if buffer[0] != FRAME_MAGIC or buffer[1] != FRAME_VERSION:
+                # 准入输出不符合帧格式: 原样发出并停止切分, 让浏览器侧按协议错误提示
+                counters.bytes_to_bridge += len(buffer)
+                await websocket.send(buffer)
+                buffer = b""
+                break
+            length = int.from_bytes(buffer[4:FRAME_HEADER_BYTES], "big")
+            if length > DEFAULT_MAX_FRAME_BYTES:
+                counters.bytes_to_bridge += len(buffer)
+                await websocket.send(buffer)
+                buffer = b""
+                break
+            total = FRAME_HEADER_BYTES + length
+            if len(buffer) < total:
+                break
+            counters.bytes_to_bridge += total
+            await websocket.send(buffer[:total])
+            buffer = buffer[total:]
 
 
 async def _terminate_child(child: "subprocess.Popen") -> Optional[int]:

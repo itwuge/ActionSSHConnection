@@ -1667,7 +1667,10 @@ def run_stdio(session: AdmissionSession, logger: JsonLogger) -> int:
     stdout = sys.stdout.buffer
     selector = selectors.DefaultSelector()
     selector.register(stdin_fd, selectors.EVENT_READ, "input")
+    # 终端的 fd 会随浏览器重新进入而更换: 重新准入会释放旧终端、另起 tmux attach,
+    # 因此这里必须按终端对象重新登记, 否则新终端的输出永远读不到（刷新后黑屏）。
     terminal_fd: int | None = None
+    tracked_terminal: object = None
     shutdown = _ShutdownFlag()
     _install_signal_handlers(shutdown, logger)
 
@@ -1691,16 +1694,24 @@ def run_stdio(session: AdmissionSession, logger: JsonLogger) -> int:
                     return 0
 
             terminal = session.terminal
-            if terminal is not None and terminal_fd is None and terminal.fileno() >= 0:
-                terminal_fd = terminal.fileno()
-                selector.register(terminal_fd, selectors.EVENT_READ, "terminal")
-                logger.log(
-                    "DEBUG",
-                    "admission.terminal.bridged",
-                    "终端输出已接入选择器",
-                    session_id=session.session_id,
-                    stage="terminal",
-                )
+            if terminal is not tracked_terminal:
+                if terminal_fd is not None:
+                    try:
+                        selector.unregister(terminal_fd)
+                    except (KeyError, ValueError):
+                        pass
+                    terminal_fd = None
+                if terminal is not None and terminal.fileno() >= 0:
+                    terminal_fd = terminal.fileno()
+                    selector.register(terminal_fd, selectors.EVENT_READ, "terminal")
+                    logger.log(
+                        "DEBUG",
+                        "admission.terminal.bridged",
+                        "终端输出已接入选择器",
+                        session_id=session.session_id,
+                        stage="terminal",
+                    )
+                tracked_terminal = terminal
 
             for key, _events in selector.select(timeout=0.5):
                 if key.data == "input":
