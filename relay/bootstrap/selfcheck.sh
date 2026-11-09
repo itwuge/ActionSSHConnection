@@ -48,7 +48,7 @@ RUNNER_PATH="${ACTSSH_RUNNER_PATH:-/runner/}"
 WS_BACKEND_PORT="${ACTSSH_WS_BACKEND_PORT:-8443}"
 METRICS_PORT="${ACTSSH_METRICS_PORT:-9100}"
 CERT_FILE="${ACTSSH_CERT_FILE:-}"
-ACME_ROOT="${ACTSSH_ACME_ROOT:-/var/www/actssh-acme}"
+ACME_ROOT="${ACTSSH_ACME_ROOT:-/var/www/actssh/acme}"
 NGINX_CONF="${ACTSSH_NGINX_CONF_DIR:-/etc/actssh/nginx}/nginx.conf"
 HEALTH_SCRIPT="${ACTSSH_HEALTH_SCRIPT:-${RELAY_DIR}/check-relay-health.sh}"
 NGINX_BIN="${ACTSSH_NGINX_BIN:-/usr/sbin/nginx}"
@@ -171,10 +171,14 @@ _check_units() {
     # 用途: 校验三个单元均为 active
     # 参数: 无
     # 返回: 无; 退出码: 0
-    local unit state
+    local unit state nginx_unit=actssh-nginx.service
     local -a units=(uptermd.service)
+    # 宿主接管模式复用发行版 nginx.service, 没有独立实例单元
+    if [[ "$NGINX_CONF" == "/etc/nginx/nginx.conf" ]]; then
+        nginx_unit=nginx.service
+    fi
     if [[ "$RELAY_ONLY" == "0" ]]; then
-        units=(actssh-nginx.service uptermd.service actssh-web-bridge.service)
+        units=("$nginx_unit" uptermd.service actssh-web-bridge.service)
     fi
     for unit in "${units[@]}"; do
         state="$(systemctl is-active "$unit" 2>/dev/null || true)"
@@ -219,11 +223,16 @@ _check_nginx() {
     # 参数: 无
     # 返回: 无; 退出码: 0
     local out
+    local -a nargs=(-t)
     if [[ ! -x "$NGINX_BIN" ]]; then
         _bad "nginx:config" "缺少 nginx: ${NGINX_BIN}"
         return 0
     fi
-    if out="$("$NGINX_BIN" -t -c "$NGINX_CONF" 2>&1)"; then
+    # 宿主默认配置必须用默认前缀: 加 -p 会改变 load_module 相对路径, 把发行版模块误判为缺失
+    if [[ "$NGINX_CONF" != "/etc/nginx/nginx.conf" ]]; then
+        nargs+=(-p "$(dirname "$NGINX_CONF")/" -c "$NGINX_CONF")
+    fi
+    if out="$("$NGINX_BIN" "${nargs[@]}" 2>&1)"; then
         _ok "nginx:config" "syntax ok"
     else
         _bad "nginx:config" "$(printf '%s' "$out" | tail -n 1)"

@@ -23,10 +23,10 @@ Type=forking
 PIDFile=/run/actssh-nginx/nginx.pid
 
 # 配置目录固定为 /etc/actssh/nginx, 不读取 /etc/nginx/sites-enabled, 避免与宿主机既有站点互相覆盖
-ExecStartPre=/usr/sbin/nginx -t -c /etc/actssh/nginx/nginx.conf
-ExecStart=/usr/sbin/nginx -c /etc/actssh/nginx/nginx.conf
-ExecReload=/usr/sbin/nginx -c /etc/actssh/nginx/nginx.conf -s reload
-ExecStop=/usr/sbin/nginx -c /etc/actssh/nginx/nginx.conf -s quit
+ExecStartPre=/usr/sbin/nginx -p /etc/actssh/nginx/ -t -c /etc/actssh/nginx/nginx.conf
+ExecStart=/usr/sbin/nginx -p /etc/actssh/nginx/ -c /etc/actssh/nginx/nginx.conf
+ExecReload=/usr/sbin/nginx -p /etc/actssh/nginx/ -c /etc/actssh/nginx/nginx.conf -s reload
+ExecStop=/usr/sbin/nginx -p /etc/actssh/nginx/ -c /etc/actssh/nginx/nginx.conf -s quit
 
 Restart=on-failure
 RestartSec=5s

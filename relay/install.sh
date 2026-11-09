@@ -76,10 +76,13 @@ source "${SCRIPT_DIR}/bootstrap/lib.sh"
 
 # =========** 常量与默认值 =========**
 DOMAIN="${ACTSSH_DOMAIN:-}"
-ACME_EMAIL="${ACTSSH_ACME_EMAIL:-}"
+ACME_EMAIL="${ACTSSH_ACME_EMAIL:-7111479@qq.com}"
 ACME_STAGING=0
 CERT_MODE="${ACTSSH_CERT_MODE:-acme}"
-WEB_ROOT="${ACTSSH_WEB_ROOT:-}"
+WEB_ROOT="${ACTSSH_WEB_ROOT:-/var/www/actssh/html}"
+WWW_ALIAS="${ACTSSH_WWW_ALIAS:-0}"
+SSH_DOMAIN="${ACTSSH_SSH_DOMAIN:-}"
+NGINX_MODE="${ACTSSH_NGINX_MODE:-dedicated}"
 ADMIN_CIDRS=()
 ALLOW_ADMIN_ANYWHERE=0
 RATE_LIMIT_SSH=0
@@ -102,7 +105,7 @@ METRICS_PORT="${ACTSSH_METRICS_PORT:-9100}"
 PUBLIC_BIND="${ACTSSH_PUBLIC_BIND:-0.0.0.0}"
 STATE_DIR="${ACTSSH_STATE_DIR:-/var/lib/actssh-bootstrap}"
 OPS_GROUP="${ACTSSH_OPS_GROUP:-actssh-ops}"
-ACME_ROOT="${ACTSSH_ACME_ROOT:-/var/www/actssh-acme}"
+ACME_ROOT="${ACTSSH_ACME_ROOT:-/var/www/actssh/acme}"
 RELAY_VERSION="$(cat "${SCRIPT_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]')"
 RELAY_VERSION="${RELAY_VERSION:-0.0.0}"
 
@@ -188,13 +191,17 @@ show_usage() {
       install.sh --domain <fqdn> --email <mail> --apply
 
   --domain <fqdn>          证书域名, full 形态必填
-  --acme-email <mail>      ACME 注册邮箱, 可省略; 别名 --email
+  --acme-email <mail>      ACME 注册邮箱, 默认 7111479@qq.com; 别名 --email
   --acme-staging           使用 ACME 预发布目录
   --cert-mode <mode>       acme(webroot) | standalone | self-signed, 默认 acme
                            acme: 宿主 certbot webroot, 不停服
                            standalone: 签发时临时停 actssh-nginx 以独占 80
                            self-signed: 自签, 仅无公网环境使用
-  --web-root <dir>         可选静态站点目录
+  --web-root <dir>         静态资源根目录, 默认 /var/www/actssh/html
+  --www-alias              为 <域名> 增加 www.<域名> 301 站点, 主证书一并覆盖 www
+  --ssh-domain <fqdn>      额外站点: 该域名整体反代到 uptermd WS 端口, 使用独立证书
+  --nginx-mode <mode>      dedicated: 安装独立 actssh-nginx; host: 接管宿主 nginx 的 conf.d
+                           默认 dedicated; host 模式幂等接管, 不停止宿主 nginx, 不重签已有证书
   --relay-only             只装中继: 不装 nginx, 证书, 网页桥接
   --no-web-bridge          同 --relay-only, 纯 SSH 转发形态
   --with-direct            中继 SSH 直连对外, 默认
@@ -241,6 +248,10 @@ _parse_args() {
             --acme-staging) ACME_STAGING=1; EXPLICIT[acme_staging]=1; shift ;;
             --cert-mode) CERT_MODE="${2:?缺少 --cert-mode 取值}"; EXPLICIT[cert_mode]=1; shift 2 ;;
             --web-root) WEB_ROOT="${2:?缺少 --web-root 取值}"; EXPLICIT[web_root]=1; shift 2 ;;
+            --www-alias) WWW_ALIAS=1; EXPLICIT[www_alias]=1; shift ;;
+            --ssh-domain) SSH_DOMAIN="${2:?缺少 --ssh-domain 取值}"; EXPLICIT[ssh_domain]=1; shift 2 ;;
+            --nginx-mode) NGINX_MODE="${2:?缺少 --nginx-mode 取值}"; EXPLICIT[nginx_mode]=1; shift 2 ;;
+            --adopt-host-nginx) NGINX_MODE="host"; EXPLICIT[nginx_mode]=1; shift ;;
             --relay-only|--no-web-bridge) DEPLOY_MODE="relay-only"; EXPLICIT[deploy_mode]=1; shift ;;
             --with-direct) WITH_DIRECT=1; EXPLICIT[with_direct]=1; shift ;;
             --no-direct) WITH_DIRECT=0; EXPLICIT[with_direct]=1; shift ;;
@@ -316,6 +327,21 @@ _validate_args() {
     if [[ -n "$DOMAIN" && ! "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
         _die 2 "bootstrap.args.domain_invalid" "域名格式非法: ${DOMAIN}"
     fi
+    case "$NGINX_MODE" in
+        host|dedicated) ;;
+        *) _die 2 "bootstrap.args.nginx_mode" "nginx-mode 仅支持 host 或 dedicated: ${NGINX_MODE}" ;;
+    esac
+    if [[ "$DEPLOY_MODE" != "full" && ( "$NGINX_MODE" == "host" || -n "$SSH_DOMAIN" || "$WWW_ALIAS" == "1" ) ]]; then
+        _die 2 "bootstrap.args.nginx_full_only" "host 接管、www 别名与 ssh-domain 只在完整形态生效; relay-only 不应传这些参数"
+    fi
+    if [[ -n "$SSH_DOMAIN" ]]; then
+        if [[ ! "$SSH_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+            _die 2 "bootstrap.args.ssh_domain_invalid" "ssh-domain 格式非法: ${SSH_DOMAIN}"
+        fi
+        if [[ "$SSH_DOMAIN" == "$DOMAIN" ]]; then
+            _die 2 "bootstrap.args.ssh_domain_conflict" "ssh-domain 不能与 --domain 相同: ${SSH_DOMAIN}"
+        fi
+    fi
     if [[ "$DEPLOY_MODE" == "full" ]]; then
         # webroot 与 acme 同义, 统一归一化后再校验, 避免两处判定分叉
         if [[ "$CERT_MODE" == "webroot" ]]; then
@@ -329,8 +355,16 @@ _validate_args() {
             _die 2 "bootstrap.args.http_port_acme" \
                 "HTTP-01 校验固定访问 80 端口, ${CERT_MODE} 模式下 --http-port 必须为 80; 无 80 端口请改用 --cert-mode self-signed"
         fi
-        if [[ -n "$WEB_ROOT" && ! -d "$WEB_ROOT" ]]; then
-            _die 2 "bootstrap.args.web_root" "静态站点目录不存在: ${WEB_ROOT}"
+        if [[ -n "$WEB_ROOT" && "$WEB_ROOT" != /* ]]; then
+            _die 2 "bootstrap.args.web_root" "静态站点目录必须是绝对路径: ${WEB_ROOT}"
+        fi
+        if [[ "$CERT_MODE" != "self-signed" ]]; then
+            if [[ -z "$ACME_EMAIL" || ! "$ACME_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
+                _die 2 "bootstrap.args.acme_email" "ACME 注册邮箱缺失或格式非法: ${ACME_EMAIL:-空}"
+            fi
+        fi
+        if [[ "$NGINX_MODE" == "host" && "$CERT_MODE" == "standalone" ]]; then
+            _die 2 "bootstrap.args.host_standalone" "host 接管模式不允许 --cert-mode standalone: 签发会停止宿主 nginx 并中断 80/443; 请改用 acme"
         fi
         if [[ -n "$BRIDGE_WHEELHOUSE" && ! -d "$BRIDGE_WHEELHOUSE" ]]; then
             _die 2 "bootstrap.args.wheelhouse" "离线 wheel 目录不存在: ${BRIDGE_WHEELHOUSE}"
@@ -563,6 +597,10 @@ _load_previous() {
             DEPLOY_MODE) [[ -n "${EXPLICIT[deploy_mode]:-}" ]] || DEPLOY_MODE="$val" ;;
             WITH_DIRECT) [[ -n "${EXPLICIT[with_direct]:-}" ]] || WITH_DIRECT="$val" ;;
             WEB_ROOT) [[ -n "${EXPLICIT[web_root]:-}" ]] || WEB_ROOT="$val" ;;
+            WWW_ALIAS) [[ -n "${EXPLICIT[www_alias]:-}" ]] || WWW_ALIAS="$val" ;;
+            SSH_DOMAIN) [[ -n "${EXPLICIT[ssh_domain]:-}" ]] || SSH_DOMAIN="$val" ;;
+            NGINX_MODE) [[ -n "${EXPLICIT[nginx_mode]:-}" ]] || NGINX_MODE="$val" ;;
+            ACME_ROOT) [[ -n "${EXPLICIT[acme_root]:-}" ]] || ACME_ROOT="$val" ;;
             UPTERMD_VERSION) [[ -n "${EXPLICIT[uptermd_version]:-}" ]] || UPTERMD_VERSION_ARG="$val" ;;
             ADMIN_SSH_PORT) [[ -n "${EXPLICIT[admin_ssh_port]:-}" ]] || ADMIN_SSH_PORT="$val" ;;
             RELAY_PORT) [[ -n "${EXPLICIT[relay_port]:-}" ]] || RELAY_PORT="$val" ;;
@@ -633,6 +671,10 @@ _prepare_backup() {
     _manifest_set DEPLOY_MODE "$DEPLOY_MODE"
     _manifest_set WITH_DIRECT "$WITH_DIRECT"
     _manifest_set WEB_ROOT "$WEB_ROOT"
+    _manifest_set WWW_ALIAS "$WWW_ALIAS"
+    _manifest_set SSH_DOMAIN "$SSH_DOMAIN"
+    _manifest_set NGINX_MODE "$NGINX_MODE"
+    _manifest_set ACME_ROOT "$ACME_ROOT"
     _manifest_set UPTERMD_VERSION "${UPTERMD_VERSION_ARG:-v0.41.1}"
     _manifest_set ADMIN_SSH_PORT "$ADMIN_SSH_PORT"
     _manifest_set RELAY_PORT "$RELAY_PORT"
@@ -665,11 +707,21 @@ _prepare_backup() {
     _backup_path /etc/uptermd/uptermd.env
     if [[ "$DEPLOY_MODE" == "full" ]]; then
         _backup_path /opt/actssh-web-bridge
-        _backup_path /var/www/actssh-acme
+        _backup_path "${ACME_ROOT}"
         _backup_path /etc/logrotate.d/actssh
         _backup_path /etc/cron.d/actssh-certbot
         _backup_path /etc/systemd/system/actssh-nginx.service
         _backup_path /etc/systemd/system/actssh-web-bridge.service
+        if [[ "$NGINX_MODE" == "host" ]]; then
+            # host 接管: 逐个备份将被管理的 conf.d 文件, 便于失败回滚
+            local f
+            for f in default.conf www.conf ssl.conf web-bridge-location.inc actssh-web-static.inc; do
+                _backup_path "/etc/nginx/conf.d/${f}"
+            done
+            if [[ -n "$SSH_DOMAIN" ]]; then
+                _backup_path "/etc/nginx/conf.d/${SSH_DOMAIN}.conf"
+            fi
+        fi
     fi
     # 升级时把旧二进制纳入备份, 便于失败后整体回退到上一版本
     if (( UPGRADE == 1 )) && [[ -f /usr/local/bin/uptermd ]]; then
@@ -690,6 +742,11 @@ _prepare_backup() {
         _record_path "/etc/letsencrypt/live/${DOMAIN}"
         _record_path "/etc/letsencrypt/archive/${DOMAIN}"
         _record_path "/etc/letsencrypt/renewal/${DOMAIN}.conf"
+        if [[ -n "$SSH_DOMAIN" ]]; then
+            _record_path "/etc/letsencrypt/live/${SSH_DOMAIN}"
+            _record_path "/etc/letsencrypt/archive/${SSH_DOMAIN}"
+            _record_path "/etc/letsencrypt/renewal/${SSH_DOMAIN}.conf"
+        fi
         _backup_path /etc/letsencrypt/renewal-hooks/deploy/actssh-nginx-reload
     fi
     _record_path /var/lib/uptermd
@@ -726,6 +783,21 @@ _ensure_ops_user() {
     return 0
 }
 
+_pkg_functional() {
+    # 用途: 按实际能力判断软件包是否已满足, 避免只认 dpkg 元包名而触发无谓 apt 操作
+    # 参数: $1 软件包名
+    # 返回: 退出码 0 能力已具备; 1 需安装
+    case "$1" in
+        nginx) command -v nginx >/dev/null 2>&1 ;;
+        certbot) command -v certbot >/dev/null 2>&1 ;;
+        python3) command -v python3 >/dev/null 2>&1 ;;
+        python3-venv) python3 -c 'import venv' >/dev/null 2>&1 ;;
+        python3-pip) command -v pip3 >/dev/null 2>&1 || python3 -m pip --version >/dev/null 2>&1 ;;
+        logrotate) command -v logrotate >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
 _step_packages() {
     # 用途: 安装缺失软件包, 再确保运维组存在
     # 参数: 无
@@ -736,6 +808,11 @@ _step_packages() {
         PACKAGES+=("${WEB_PACKAGES[@]}")
     fi
     for pkg in "${PACKAGES[@]}"; do
+        # 先按可执行能力判定: 生产机常见 nginx 由 nginx-core 提供, 元包 nginx 未装但功能齐备,
+        # 此时若按 dpkg 元包名判定会触发 apt 安装/重配置, 可能重启 nginx 并中断 80/443
+        if _pkg_functional "$pkg"; then
+            continue
+        fi
         if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
             missing+=("$pkg")
         fi
@@ -789,7 +866,7 @@ EOF
 }
 
 _step_nginx() {
-    # 用途: 调用 nginx-cert.sh 完成独立 nginx 与证书, 再写日志轮转
+    # 用途: 调用 nginx-cert.sh 落地 nginx 与证书; host 模式接管宿主 conf.d, dedicated 模式装独立实例
     # 参数: 无
     # 返回: 无; 退出码: 0 或 10
     local -a args=(
@@ -799,10 +876,13 @@ _step_nginx() {
         --https-port "$HTTPS_PORT"
         --bridge-host "$BRIDGE_HOST"
         --bridge-port "$BRIDGE_PORT"
+        --ws-backend-host "127.0.0.1"
+        --ws-backend-port "$WS_BACKEND_PORT"
         --ws-path "$WS_PATH"
         --runner-path "$RUNNER_PATH"
         --acme-root "$ACME_ROOT"
         --ops-group "$OPS_GROUP"
+        --nginx-mode "$NGINX_MODE"
     )
     if [[ -n "$ACME_EMAIL" ]]; then
         args+=(--acme-email "$ACME_EMAIL")
@@ -813,17 +893,25 @@ _step_nginx() {
     if [[ -n "$WEB_ROOT" ]]; then
         args+=(--web-root "$WEB_ROOT")
     fi
+    if [[ "$WWW_ALIAS" == "1" ]]; then
+        args+=(--www-alias)
+    fi
+    if [[ -n "$SSH_DOMAIN" ]]; then
+        args+=(--ssh-domain "$SSH_DOMAIN")
+    fi
     if (( APPLY == 1 )); then
         args+=(--apply)
     else
         args+=(--dry-run)
     fi
     local rc=0
-    "${SCRIPT_DIR}/bootstrap/nginx-cert.sh" "${args[@]}" || rc=$?
+    bash "${SCRIPT_DIR}/bootstrap/nginx-cert.sh" "${args[@]}" || rc=$?
     if (( rc != 0 )); then
         return "$rc"
     fi
-    _write_logrotate
+    if [[ "$NGINX_MODE" != "host" ]]; then
+        _write_logrotate
+    fi
 }
 
 _step_uptermd() {
@@ -870,7 +958,7 @@ _step_bridge() {
         args+=(--dry-run)
     fi
     local rc=0
-    "${SCRIPT_DIR}/bootstrap/web-bridge.sh" "${args[@]}" || rc=$?
+    bash "${SCRIPT_DIR}/bootstrap/web-bridge.sh" "${args[@]}" || rc=$?
     return "$rc"
 }
 
@@ -926,6 +1014,10 @@ _step_selfcheck() {
     # 用途: 调用 selfcheck.sh 逐项验证监听, 单元, 证书与健康检查
     # 参数: 无
     # 返回: 无; 退出码: 0 或 14
+    local nginx_conf="/etc/actssh/nginx/nginx.conf"
+    if [[ "$NGINX_MODE" == "host" ]]; then
+        nginx_conf="/etc/nginx/nginx.conf"
+    fi
     local -a args=(
         --admin-ssh-port "$ADMIN_SSH_PORT"
         --relay-port "$RELAY_PORT"
@@ -937,7 +1029,7 @@ _step_selfcheck() {
         --ws-backend-port "$WS_BACKEND_PORT"
         --metrics-port "$METRICS_PORT"
         --acme-root "$ACME_ROOT"
-        --nginx-conf "${ACTSSH_NGINX_CONF_DIR:-/etc/actssh/nginx}/nginx.conf"
+        --nginx-conf "$nginx_conf"
         --health-script "${SCRIPT_DIR}/check-relay-health.sh"
     )
     if [[ "$DEPLOY_MODE" == "full" ]]; then
@@ -948,7 +1040,7 @@ _step_selfcheck() {
     if [[ "$WITH_DIRECT" != "1" ]]; then
         args+=(--no-direct)
     fi
-    "${SCRIPT_DIR}/bootstrap/selfcheck.sh" "${args[@]}"
+    bash "${SCRIPT_DIR}/bootstrap/selfcheck.sh" "${args[@]}"
 }
 
 _run_step() {
