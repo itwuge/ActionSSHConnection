@@ -149,6 +149,17 @@ fi
 rm -f -- "$keyfile"
 keyfile=""
 
+# 加入 tailnet 成功即写状态：后续 sshd 任一步失败时，cleanup.sh 仍能按它 down/logout，不留节点
+cat > "$workdir/direct.state" <<EOF
+mode=tailscale
+ip=
+port=$port
+login_user=
+sshd_config=
+ts_socket=$ts_socket
+manual_daemon=$manual_daemon
+EOF
+
 ip=""
 for _ in $(seq 1 10); do
   ip="$(ts ip -4 2>/dev/null | head -n1 | tr -d '[:space:]')"

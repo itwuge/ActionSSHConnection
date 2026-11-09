@@ -12,7 +12,8 @@ workdir="${ACTSSH_WORKDIR:-}"
 session_name="${ACTSSH_SESSION_NAME:-actssh}"
 
 # 直连路径收尾：先按最终状态把 path_verified 与固定提示语打进日志，再拆 sshd、Tailscale 与临时状态
-if [ -n "$workdir" ] && [ -f "$workdir/direct.state" ]; then
+# 只有直连面真正起来过（写过 path_verified）才打印，避免回落中继时误报“直连待验证”
+if [ -n "$workdir" ] && [ -f "$workdir/direct.state" ] && [ -f "$workdir/path_verified" ]; then
   final_verified="$(cat "$workdir/path_verified" 2>/dev/null || true)"
   case "${final_verified:-unknown}" in
     direct)
