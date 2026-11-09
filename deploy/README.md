@@ -31,6 +31,7 @@
 | `firewall.sh` | ufw / nftables 双后端：SSH 与 WS 入口限速、管理面来源限制、指标端口仅环回 |
 | `rotate-relay-key.sh` | 反连注册标识轮换（服务身份密钥），输出 known_hosts 公钥行，支持回滚 |
 | `check-relay-health.sh` | 只读健康检查，输出单行 JSON，判据为监听齐备、路由为空、无会话文件、资源上限生效；journald 容量仅提示 |
+| `nginx/ssh.wuge.fun.conf` | 网页终端子域入口的 nginx 站点片段，仅落仓库不自动部署；文件头写明部署与回滚步骤 |
 | `README.md` | 本文件 |
 
 ## 3. 中转与打洞的关系
