@@ -1,29 +1,21 @@
 name: 调试会话
 
 # 依据：.team/specs/项目设计书-20261109-v3.md（v3）
-# 本文件属入口层（G01），不含部署逻辑。
+# 本文件只是入口层薄封装：全部会话逻辑在同仓库根目录的 action.yml（Composite Action），
+# 步骤脚本在 scripts/action/ 下，与 examples/ 和可复用工作流共用同一份实现，不重复维护。
 #
-# 两条触发入口共用同一会话创建逻辑（同一 job、同一组步骤），不各写一份：
+# 两条触发入口共用同一 job：
 #   1) workflow_dispatch：布尔输入 start_session，默认 false
 #   2) repository_dispatch：event_type 固定 start-session，client_payload.keyword 固定 start-session
 #
-# 客户端：自建步骤调用 upterm 客户端（不走任何封装 action）。
-# 命令行与 JSON 字段均按 v0.41.1 源码核实（核实日期 2026-11-09）：
-#   - upterm host --accept --detach -o json（-o 仅在 --detach 下可用，取值只能是 json）
-#   - JSON 键名：sessionId / sshCommand / status（成功时为 ready）
-#   - upterm session info NAME|ID [-o json]、upterm session wait NAME|ID、upterm session stop NAME|ID
-#   - 退出码：session info/stop 无此会话为 4；session wait 0=停止或无人接入超时、125=结局不可知
-# 客户端原始输出（JSON/连接串）只写入文件，stdout/stderr 一律重定向丢弃；
-# 日志与摘要只按白名单输出 9 项；v0.41.1 连接串不含 ticket，
-# session_id 取 SSH 登录名冒号前片段，冒号后的节点编码不写入 session_id。
-#
 # 必需仓库变量（均为非秘密路由信息）：
-#   UPTERM_RELAY_KNOWN_HOST   中继主机 known_hosts 行（公钥，防中间人）
-#   WEB_TERMINAL_BASE_URL     网页终端站点根地址（如 https://wuge.fun，不含 /t/ 与任何会话参数）
-#   WEBAUTHN_CREDENTIAL_ID    公钥凭据标识（WebAuthn credential id，公开标识）；可选，
-#                             空白时路由字段输出 unset，SSH 通道不受影响，待浏览器注册后再补
+#   UPTERM_RELAY_KNOWN_HOST       中继主机 known_hosts 行（公钥，防中间人）
+#   WEB_TERMINAL_BASE_URL         网页终端站点根地址（如 https://wuge.fun，不含 /t/ 与任何会话参数）
+#   WEBAUTHN_ALLOWED_CREDENTIALS  网页准入允许清单（单行 JSON 数组）；[] 表示开放一次自举注册
+#   WEB_BRIDGE_BASE_URL           runner 反连桥接基地址（如 wss://wuge.fun，自动补 /runner）
 # 可选仓库变量：
-#   UPTERM_DIRECT_ENDPOINT    直连候选对端 host[:port]；不配即按「无可用对端地址」判直连失败
+#   WEBAUTHN_CREDENTIAL_ID        公钥凭据标识；空白时路由字段输出 unset，SSH 通道不受影响
+#   UPTERM_DIRECT_ENDPOINT        直连候选对端 host[:port]；不配即按「无可用对端地址」判直连失败
 
 on:
   workflow_dispatch:
@@ -39,474 +31,38 @@ on:
 permissions:
   contents: read
 
-env:
-  RELAY_HOST: ssh.wuge.fun
-  RELAY_PORT: "2222"
-  SSH_USER: itwuge
-  SESSION_NAME: actssh
-  JOB_TIMEOUT_MINUTES: "45"
-  JOIN_TIMEOUT: 10m
-  UPTERM_VERSION: v0.41.1
-  UPTERM_ASSET: upterm_linux_amd64.tar.gz
-  UPTERM_SHA256: 3007d4ce09e9f70a390e1b52e5a0b591fc9fa473196ca76d8f72b5f1cd723b31
-  # 工作流级 env 不允许引用 runner 上下文（校验报 Unrecognized named-value: 'runner'），
-  # 用 github.workspace 下的子目录（制品路径不接受 '..'），收尾整目录删除
-  WORKDIR: ${{ github.workspace }}/actssh-tmp
-  WEB_TERMINAL_BASE_URL: ${{ vars.WEB_TERMINAL_BASE_URL }}
-  WEBAUTHN_CREDENTIAL_ID: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
-  UPTERM_DIRECT_ENDPOINT: ${{ vars.UPTERM_DIRECT_ENDPOINT }}
-
 jobs:
   session:
     name: debug-session
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 比会话上限（session-minutes=45）多留 10 分钟，保证等待、收尾都有机会执行
+    timeout-minutes: 55
     if: >-
       (github.event_name == 'workflow_dispatch' && inputs.start_session == true) ||
       github.event_name == 'repository_dispatch'
     steps:
+      # 调用本仓库根目录的 Action，所以必须先检出；远程调用方不需要这一步
       - name: 检出仓库
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 5
         with:
           persist-credentials: false
 
-      - name: 校验入口与前置配置
-        id: precheck
-        timeout-minutes: 2
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          DISPATCH_SENDER: ${{ github.event.sender.login }}
-          DISPATCH_KEYWORD: ${{ github.event.client_payload.keyword || '' }}
-          KNOWN_HOST: ${{ vars.UPTERM_RELAY_KNOWN_HOST }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
-            if [ "${DISPATCH_KEYWORD:-}" != "start-session" ]; then
-              echo "失败[阶段 precheck]：client_payload.keyword 必须为 start-session" >&2
-              exit 1
-            fi
-            if [ "$DISPATCH_SENDER" != "$SSH_USER" ]; then
-              echo "失败[阶段 precheck]：repository_dispatch 发起者不是 $SSH_USER" >&2
-              exit 1
-            fi
-          fi
-
-          missing=""
-          [ -n "${KNOWN_HOST:-}" ] || missing="$missing UPTERM_RELAY_KNOWN_HOST"
-          [ -n "${WEB_TERMINAL_BASE_URL:-}" ] || missing="$missing WEB_TERMINAL_BASE_URL"
-          if [ -n "$missing" ]; then
-            echo "失败[阶段 precheck]：缺少仓库变量$missing" >&2
-            exit 1
-          fi
-
-          command -v jq >/dev/null 2>&1 || {
-            echo "失败[阶段 precheck]：运行器缺少 jq，无法解析客户端 JSON" >&2
-            exit 1
-          }
-
-          install -m 700 -d "$WORKDIR"
-
-          # 中继主机公钥只用于防中间人，不作为授权依据
-          printf '%s\n' "$KNOWN_HOST" > "$WORKDIR/known_hosts"
-
-          # runner 侧访客公钥闸门：只放行该 GitHub 用户登记的公钥
-          gh api "users/$SSH_USER/keys" --paginate --jq '.[].key' > "$WORKDIR/authorized_keys" || {
-            echo "失败[阶段 fetch-keys]：取不到 $SSH_USER 的公钥" >&2
-            exit 1
-          }
-          if [ ! -s "$WORKDIR/authorized_keys" ]; then
-            echo "失败[阶段 fetch-keys]：$SSH_USER 未登记 SSH 公钥" >&2
-            exit 1
-          fi
-
-          fingerprints=""
-          while IFS= read -r key; do
-            [ -n "$key" ] || continue
-            fp="$(printf '%s\n' "$key" | ssh-keygen -lf /dev/stdin 2>/dev/null | awk '{print $2}')"
-            [ -n "$fp" ] || continue
-            fingerprints="${fingerprints:+$fingerprints,}$fp"
-          done < "$WORKDIR/authorized_keys"
-          if [ -z "$fingerprints" ]; then
-            echo "失败[阶段 fetch-keys]：公钥指纹计算失败" >&2
-            exit 1
-          fi
-
-          # 到期时间按作业超时上限推算，误差为前置步骤耗时（数秒）
-          expires_at="$(date -u -d "@$(( $(date +%s) + JOB_TIMEOUT_MINUTES * 60 ))" '+%Y-%m-%dT%H:%M:%SZ')"
-
-          {
-            echo "fingerprints=$fingerprints"
-            echo "expires_at=$expires_at"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: 判定连接路径
-        id: path
-        timeout-minutes: 1
-        run: |
-          set -euo pipefail
-
-          # 阶段一：打洞。托管 runner 无入站端口，通常无可用对端地址，按判失败条件①直接回落中继。
-          # 配置了候选地址时只做 5 秒 TCP 可达性探针；数据面是否真的直连 [待真机确认]。
-          mode=relay
-          if [ -n "${UPTERM_DIRECT_ENDPOINT:-}" ]; then
-            host="${UPTERM_DIRECT_ENDPOINT%%:*}"
-            port="22"
-            case "$UPTERM_DIRECT_ENDPOINT" in *:*) port="${UPTERM_DIRECT_ENDPOINT##*:}" ;; esac
-            if timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
-              mode=direct
-            fi
-          fi
-
-          if [ "$mode" = "direct" ]; then
-            echo "直连已建立（直连）"
-            echo "::warning::直连判定为 TCP 可达性探针，数据面直连未验证"
-          else
-            echo "直连未建立，已切换到中继转发"
-          fi
-          echo "path_mode=$mode" >> "$GITHUB_OUTPUT"
-
-      - name: 安装 upterm 客户端
-        timeout-minutes: 5
-        run: |
-          set -euo pipefail
-
-          url="https://github.com/owenthereal/upterm/releases/download/${UPTERM_VERSION}/${UPTERM_ASSET}"
-          if ! curl -fsSL --retry 2 --max-time 120 -o "$WORKDIR/upterm.tar.gz" "$url"; then
-            echo "失败[阶段 install-client]：下载 $UPTERM_ASSET 失败" >&2
-            exit 1
-          fi
-
-          actual="$(sha256sum "$WORKDIR/upterm.tar.gz" | awk '{print $1}')"
-          if [ "$actual" != "$UPTERM_SHA256" ]; then
-            echo "失败[阶段 install-client]：校验和不匹配（$UPTERM_VERSION）" >&2
-            exit 1
-          fi
-
-          mkdir -p "$WORKDIR/bin"
-          tar -xzf "$WORKDIR/upterm.tar.gz" -C "$WORKDIR/bin" upterm || {
-            echo "失败[阶段 install-client]：解包失败" >&2
-            exit 1
-          }
-          chmod 700 "$WORKDIR/bin/upterm"
-          "$WORKDIR/bin/upterm" version >/dev/null 2>&1 || {
-            echo "失败[阶段 install-client]：客户端无法执行" >&2
-            exit 1
-          }
-          echo "$WORKDIR/bin" >> "$GITHUB_PATH"
-
-      - name: 启动会话
-        id: start
-        timeout-minutes: 3
-        run: |
-          set -euo pipefail
-
-          # v0.41.1 已核实：--detach 在没有可询问的终端时必须配 --accept；
-          # --detach 成功时退出码为 0，失败为 1；-o json 只把 JSON 打到 stdout。
-          # 必须显式给出长驻托管命令（v0.41.1 源码：run COMMAND, or $SHELL without one）：
-          # 缺省 $SHELL 在无访客的 detached PTY 下立即退出，会话会在启动数秒后自行结束。
-          # 托管命令用 tmux，使 SSH 与网页访客进入同一终端进程；访客在会话内 exit 即 tmux 退出、会话结束。
-          if ! upterm host \
-              --accept \
-              --detach \
-              --name "$SESSION_NAME" \
-              --server "ssh://${RELAY_HOST}:${RELAY_PORT}" \
-              --known-hosts "$WORKDIR/known_hosts" \
-              --authorized-keys "$WORKDIR/authorized_keys" \
-              --join-timeout "$JOIN_TIMEOUT" \
-              --no-sftp \
-              --pty-size 80x24 \
-              -o json \
-              -- tmux new-session -A -s "$SESSION_NAME" \
-              > "$WORKDIR/session.json" 2> "$WORKDIR/session.err"; then
-            rm -f "$WORKDIR/session.json" "$WORKDIR/session.err"
-            echo "失败[阶段 start-session]：客户端异常退出，原因见运行报告，具体输出不外显" >&2
-            exit 1
-          fi
-
-          # 键名以 v0.41.1 源码为准；解析完立即删除原始 JSON，不留在运行器上
-          session_id_json="$(jq -r '.sessionId // empty' "$WORKDIR/session.json" 2>/dev/null || true)"
-          ssh_command="$(jq -r '.sshCommand // empty' "$WORKDIR/session.json" 2>/dev/null || true)"
-          status="$(jq -r '.status // empty' "$WORKDIR/session.json" 2>/dev/null || true)"
-          rm -f "$WORKDIR/session.json" "$WORKDIR/session.err"
-
-          if [ -z "${ssh_command:-}" ]; then
-            echo "失败[阶段 linking]：未取得可接入的连接串，会话未完成注册" >&2
-            exit 1
-          fi
-          if [ "${status:-}" != "ready" ]; then
-            echo "失败[阶段 linking]：会话状态为 ${status:-不可读}，未达到 ready" >&2
-            exit 1
-          fi
-
-          # 只取用户位，不保留整条命令；ssh:// 中继下形式为 ssh <登录名>@<主机> [-p <端口>]
-          if [[ "$ssh_command" =~ ^ssh\ ([A-Za-z0-9._:-]+)@ ]]; then
-            ssh_user="${BASH_REMATCH[1]}"
-          else
-            echo "失败[阶段 parse-connection]：无法从连接串取出 SSH 登录名" >&2
-            exit 1
-          fi
-          if [ -z "${session_id_json:-}" ]; then
-            echo "失败[阶段 parse-connection]：JSON 中缺少 sessionId" >&2
-            exit 1
-          fi
-
-          # session_id 只取冒号前片段；冒号后是 embedded 路由的节点编码，不作会话标识
-          session_id="${ssh_user%%:*}"
-          if [ -z "$session_id" ]; then
-            echo "失败[阶段 parse-connection]：无法解析会话标识" >&2
-            exit 1
-          fi
-          case "$session_id" in
-            *[!A-Za-z0-9._-]*)
-              echo "失败[阶段 parse-connection]：会话标识含非法字符" >&2
-              exit 1
-              ;;
-          esac
-          if [ "$session_id" != "$session_id_json" ]; then
-            echo "失败[阶段 parse-connection]：连接串登录名与 JSON sessionId 不一致" >&2
-            exit 1
-          fi
-
-          {
-            echo "session_id=$session_id"
-            echo "ssh_user=$ssh_user"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: 准备共享终端
-        timeout-minutes: 1
-        run: |
-          set -euo pipefail
-          # 共享终端由「启动会话」的 upterm host 直接托管（host 命令即 tmux 客户端），
-          # SSH 与网页访客进入的是同一个 tmux 会话；这里只确认它已起来，不再另起会话。
-          for _ in $(seq 1 10); do
-            if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-              echo "共享终端就绪：tmux 会话 $SESSION_NAME（由 upterm host 托管）"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "失败[阶段 shared-terminal]：未发现 tmux 会话 $SESSION_NAME" >&2
-          exit 1
-
-      - name: 输出路由字段
-        id: route
-        timeout-minutes: 2
-        env:
-          SESSION_ID: ${{ steps.start.outputs.session_id }}
-          SSH_LOGIN_USER: ${{ steps.start.outputs.ssh_user }}
-          EXPIRES_AT: ${{ steps.precheck.outputs.expires_at }}
-          FINGERPRINTS: ${{ steps.precheck.outputs.fingerprints }}
-          PATH_MODE: ${{ steps.path.outputs.path_mode }}
-        run: |
-          set -euo pipefail
-
-          # 解析已在「启动会话」完成；本节只做白名单输出，不再接触连接串
-          if [ -z "${SESSION_ID:-}" ] || [ -z "${SSH_LOGIN_USER:-}" ]; then
-            echo "失败[阶段 parse-connection]：会话标识或 SSH 登录名为空" >&2
-            exit 1
-          fi
-
-          fields="$WORKDIR/fields"
-          {
-            echo "relay_host=$RELAY_HOST"
-            echo "port=$RELAY_PORT"
-            echo "session_id=$SESSION_ID"
-            echo "ssh_user=$SSH_LOGIN_USER"
-            echo "pubkey_fingerprint=$FINGERPRINTS"
-            echo "expires_at=$EXPIRES_AT"
-            echo "web_url=${WEB_TERMINAL_BASE_URL%/}/t/${SESSION_ID}"
-            echo "pubkey_credential_id=${WEBAUTHN_CREDENTIAL_ID:-unset}"
-            echo "path_mode=$PATH_MODE"
-          } > "$fields"
-
-          cat "$fields"
-          {
-            echo '```text'
-            cat "$fields"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          # 字段文件保留到收尾统一删除，期间另存为制品供 CI 侧读取（只含这 9 行）
-
-      - name: 暂存路由字段
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: 建立调试会话
+        id: session
+        uses: ./
         with:
-          name: route-fields
-          path: ${{ github.workspace }}/actssh-tmp/fields
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: 启动网页桥接
-        id: bridge
-        timeout-minutes: 6
-        env:
-          SESSION_ID: ${{ steps.start.outputs.session_id }}
-          BRIDGE_BASE: ${{ vars.WEB_BRIDGE_BASE_URL }}
-          ALLOWED_JSON: ${{ vars.WEBAUTHN_ALLOWED_CREDENTIALS }}
-          CREDENTIAL_ID: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
-        run: |
-          set -euo pipefail
-
-          # 网页通道与 SSH 反连并行：桥接起不来时只记录失败并标注，不中断本步骤，SSH 通道保持可用。
-          # 失败阶段名固定三档：bridge-connect / bridge-register / bridge-admission。
-          unavailable() {
-            echo "失败[阶段 $1]：$2；网页通道不可用，SSH 通道不受影响" >&2
-            echo "::warning::网页通道不可用（$1）：$2；SSH 通道不受影响"
-            exit 0
-          }
-
-          [ -n "${SESSION_ID:-}" ] || unavailable bridge-connect "未取得会话标识"
-
-          # 基地址缺省 wss://wuge.fun；只接受站点根或已带 /runner 的终点，路径规则与中继 /runner/<id> 一致
-          base="${BRIDGE_BASE:-wss://wuge.fun}"
-          base="${base%/}"
-          case "$base" in
-            ws://*/*|wss://*/*)
-              case "$base" in
-                */runner) bridge_base="$base" ;;
-                *) unavailable bridge-connect "WEB_BRIDGE_BASE_URL 只允许 /runner 路径" ;;
-              esac
-              ;;
-            ws://?*|wss://?*) bridge_base="${base}/runner" ;;
-            *) unavailable bridge-connect "WEB_BRIDGE_BASE_URL 只接受 ws:// 或 wss:// 地址" ;;
-          esac
-
-          # 准入允许清单：只放公开的凭据标识与公钥，作业内生成、随作业销毁。
-          # 空数组 [] 仅在开放注册（WEBAUTHN_CREDENTIAL_ID 为空）时合法，按单次自举注册运行。
-          [ -n "${ALLOWED_JSON:-}" ] || unavailable bridge-admission "未配置 WEBAUTHN_ALLOWED_CREDENTIALS，准入无允许清单可用"
-          printf '%s' "$ALLOWED_JSON" > "$WORKDIR/webauthn-allowed.json"
-          allow_empty=0
-          if [ -z "${CREDENTIAL_ID:-}" ]; then
-            allow_empty=1
-          fi
-          if ! python3 - "$WORKDIR/webauthn-allowed.json" "$allow_empty" <<'PY'
-          import json, sys
-          raw = json.load(open(sys.argv[1], encoding="utf-8"))
-          if not isinstance(raw, list):
-              raise SystemExit("允许清单顶层必须是数组")
-          if not raw and sys.argv[2] != "1":
-              raise SystemExit("允许清单为空且未开放注册")
-          for item in raw:
-              if not isinstance(item, dict) or not item.get("credential_id") or not item.get("public_key"):
-                  raise SystemExit("允许清单条目缺少 credential_id 或 public_key")
-          if raw:
-              print(f"允许清单条目数 {len(raw)}")
-          else:
-              print("允许清单为空数组，按自举注册运行（本会话只接受首个注册）")
-          PY
-          then
-            unavailable bridge-admission "WEBAUTHN_ALLOWED_CREDENTIALS 不是合法 JSON 数组，或空数组未配合开放注册"
-          fi
-
-          # 依赖装在 RUNNER_TEMP 虚拟环境里，避免宿主 Python 的 externally-managed 限制，也不占用制品目录
-          venv="${RUNNER_TEMP}/actssh-web-bridge-venv"
-          rm -rf "$venv"
-          if ! python3 -m venv "$venv" >/dev/null 2>&1; then
-            unavailable bridge-connect "无法创建 Python 虚拟环境"
-          fi
-          if ! "$venv/bin/pip" install --quiet --disable-pip-version-check \
-              -r scripts/requirements-web-bridge.txt \
-              -r scripts/requirements-web-admission.txt; then
-            unavailable bridge-connect "网页桥接或准入依赖安装失败（websockets/fido2）"
-          fi
-
-          # 准入命令走同一虚拟环境；凭据标识为空时开放注册引导，由浏览器首次注册生成
-          admission="$venv/bin/python scripts/web_admission.py --session-id $SESSION_ID --tmux-session $SESSION_NAME --allowed-credentials $WORKDIR/webauthn-allowed.json"
-          if [ -z "${CREDENTIAL_ID:-}" ]; then
-            admission="$admission --allow-registration"
-          fi
-
-          # 后台反连，不阻塞随后的会话等待；标准输出与 JSONL 日志只落文件
-          nohup "$venv/bin/python" scripts/start_web_bridge.py \
-            "$SESSION_ID" "$bridge_base" "$admission" \
-            --run-id "${GITHUB_RUN_ID:-}" \
-            > "$WORKDIR/bridge.out" 2> "$WORKDIR/bridge.err" &
-          bridge_pid=$!
-          echo "$bridge_pid" > "$WORKDIR/bridge.pid"
-
-          bridge_host="${bridge_base#*://}"
-          bridge_host="${bridge_host%%/*}"
-          for _ in $(seq 1 20); do
-            if ! kill -0 "$bridge_pid" 2>/dev/null; then
-              set +e
-              wait "$bridge_pid"
-              rc=$?
-              set -e
-              stage="$(jq -r '.data.stage // empty' "$WORKDIR/bridge.out" 2>/dev/null || true)"
-              error_code="$(jq -r '.error_code // empty' "$WORKDIR/bridge.out" 2>/dev/null || true)"
-              message="$(jq -r '.message // empty' "$WORKDIR/bridge.out" 2>/dev/null || true)"
-              if [ "$rc" -eq 0 ]; then
-                echo "网页通道已结束（桥接进程正常退出，阶段 ${stage:-unknown}）"
-                exit 0
-              fi
-              case "${stage:-}" in
-                register-rejected) stage_name=bridge-register ;;
-                admission-start|admission-exit) stage_name=bridge-admission ;;
-                *) stage_name=bridge-connect ;;
-              esac
-              unavailable "$stage_name" "桥接进程退出码 ${rc}，阶段 ${stage:-unknown}，error_code ${error_code:-none}，${message:-无输出}"
-            fi
-            if grep -q '"event":"bridge.connected"' "$WORKDIR/bridge.err" 2>/dev/null &&
-               grep -q '"event":"admission.started"' "$WORKDIR/bridge.err" 2>/dev/null; then
-              echo "网页通道已就绪：runner 已反连 ${bridge_host}/runner/${SESSION_ID}，等待浏览器注册与准入"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "::warning::网页通道状态待确认：20 秒内未观测到 connected/admission.started 事件"
-          echo "网页通道已启动但未确认：桥接进程 ${bridge_pid} 仍在运行"
-
-      - name: 等待会话结束
-        timeout-minutes: 35
-        run: |
-          set -euo pipefail
-
-          # 退出钩子：先停会话（进程退出即会话消失），再清临时文件
-          cleanup() {
-            upterm session stop "$SESSION_NAME" >/dev/null 2>&1 || true
-            if [ -n "${WORKDIR:-}" ]; then rm -rf -- "$WORKDIR"; fi
-          }
-          trap cleanup EXIT INT TERM
-
-          # 无人接入 10 分钟后会话自行结束；有访客接入则持续到会话退出。
-          # v0.41.1 退出码：0=被停止或无人接入超时；125=结局不可知；128+N=被信号结束；其余为会话内命令的退出码。
-          set +e
-          upterm session wait "$SESSION_NAME" >/dev/null 2>&1
-          rc=$?
-          set -e
-
-          if [ "$rc" -eq 125 ]; then
-            echo "失败[阶段 session-wait]：无法确认会话结局（upterm session wait 返回 125）" >&2
-            exit 1
-          fi
-
-          # 已结束的会话仍会从本地记录回答，因此按 status 判定，不能只看命令是否成功
-          status="$(upterm session info "$SESSION_NAME" -o json 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)"
-          case "${status:-}" in
-            ready|starting)
-              echo "失败[阶段 session-wait]：等待返回 $rc，但会话状态仍为 $status" >&2
-              exit 1
-              ;;
-          esac
-          echo "会话已结束（upterm session wait 返回码 $rc，记录状态 ${status:-不可读}）"
-
-      - name: 收尾清理
-        if: always()
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-          # session stop 在会话已结束时不算错误（源码：已结束会报出结局并以 0 退出），无此会话为 4
-          upterm session stop "$SESSION_NAME" >/dev/null 2>&1 || true
-          pkill -f "upterm host" >/dev/null 2>&1 || true
-          # 网页桥接与准入子进程一并清理，不遗留反连
-          if [ -n "${WORKDIR:-}" ] && [ -f "$WORKDIR/bridge.pid" ]; then
-            kill "$(cat "$WORKDIR/bridge.pid")" >/dev/null 2>&1 || true
-          fi
-          pkill -f "scripts/start_web_bridge.py" >/dev/null 2>&1 || true
-          pkill -f "scripts/web_admission.py" >/dev/null 2>&1 || true
-          rm -rf "${RUNNER_TEMP:-/tmp}/actssh-web-bridge-venv"
-          tmux kill-session -t actssh >/dev/null 2>&1 || true
-          rm -rf "$WORKDIR"
-          echo "会话进程、网页桥接与临时文件已清理"
+          ssh: true
+          relay-host: ssh.wuge.fun
+          relay-port: "2222"
+          ssh-user: itwuge
+          session-minutes: "45"
+          web-base-url: ${{ vars.WEB_TERMINAL_BASE_URL }}
+          bridge-base-url: ${{ vars.WEB_BRIDGE_BASE_URL }}
+          known-hosts: ${{ vars.UPTERM_RELAY_KNOWN_HOST }}
+          allowed-credentials: ${{ vars.WEBAUTHN_ALLOWED_CREDENTIALS }}
+          upterm-version: v0.41.1
+          direct-endpoint: ${{ vars.UPTERM_DIRECT_ENDPOINT }}
+          # 沿用原工作流：会话期间把 9 行路由字段另存为 route-fields 制品
+          route-artifact-name: route-fields
+          route-artifact-retention-days: "1"

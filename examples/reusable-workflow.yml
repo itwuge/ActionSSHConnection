@@ -1,0 +1,47 @@
+name: 调试会话（可复用工作流）
+
+# 用 workflow_call 接入：整个 job（运行器、超时、清理）由本仓库的可复用工作流托管，
+# 调用方只负责触发条件和 job 级权限。
+#
+# 可复用工作流的 outputs 用法与 Composite Action 相同：
+#   ${{ needs.debug.outputs.web-url }} 等（需要时用 needs 引用）。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    permissions:
+      contents: read
+    uses: itwuge/ActionSSHConnection/.github/workflows/reusable-session.yml@v1
+    with:
+      ssh: true
+      relay-host: ssh.wuge.fun
+      relay-port: "2222"
+      ssh-user: itwuge
+      session-minutes: "30"
+      # 换中继时三件套要一起改：host / port / known-hosts
+      known-hosts: "[ssh.wuge.fun]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIP8Ue4hfxEXVelScsPdHN837quBEx/K6GCd+p6jrl34"
+      # 空数组表示开放一次网页自举注册
+      allowed-credentials: "[]"
+      # 锁定检出本仓库的 ref；调用方用 SHA 时这里也传同一个 SHA
+      action-upterm-ref: v1
+
+  report:
+    needs: debug
+    runs-on: ubuntu-latest
+    steps:
+      - name: 打印可复用工作流的 outputs
+        run: |
+          set -euo pipefail
+          echo "session-id: ${{ needs.debug.outputs.session-id }}"
+          echo "ssh-user: ${{ needs.debug.outputs.ssh-user }}"
+          echo "relay: ${{ needs.debug.outputs.relay-host }}:${{ needs.debug.outputs.relay-port }}"
+          echo "web-url: ${{ needs.debug.outputs.web-url }}"
+          echo "pubkey-fingerprint: ${{ needs.debug.outputs.pubkey-fingerprint }}"
+          echo "expires-at: ${{ needs.debug.outputs.expires-at }}"
+          echo "pubkey-credential-id: ${{ needs.debug.outputs.pubkey-credential-id }}"
+          echo "path-mode: ${{ needs.debug.outputs.path-mode }}"

@@ -1,0 +1,23 @@
+name: 调试会话（最小调用）
+
+# 最少行数的接法：只打开会话，其余全部走 Action 默认值。
+# 默认值是本仓库当前的中继（ssh.wuge.fun:2222）、站点（https://wuge.fun）与登入用户（itwuge）；
+# 换到自己的中继时必须显式覆盖 relay-host / relay-port / known-hosts / ssh-user。
+#
+# 注意：ssh 默认是 false（只做前置校验）；要真的登入必须写 ssh: true。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    # 要比会话上限（session-minutes，默认 45）大一些
+    timeout-minutes: 50
+    steps:
+      - uses: itwuge/ActionSSHConnection@v1
+        with:
+          ssh: true

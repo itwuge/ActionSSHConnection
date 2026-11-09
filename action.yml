@@ -1,0 +1,199 @@
+name: 'ActionSSHConnection 调试会话'
+description: '在作业内开出可 SSH 与网页接入的临时调试会话（upterm 中继 + WebAuthn 网页准入）'
+author: 'itwuge'
+branding:
+  icon: 'terminal'
+  color: 'purple'
+
+# 调用方式：
+#   - uses: itwuge/ActionSSHConnection@v1        （Composite Action，推荐默认）
+#   - .github/workflows/reusable-session.yml     （可复用工作流，整个 job 由本仓库托管）
+# 本 Action 只执行入口层逻辑，脚本全部引用本仓库 scripts/ 下的实现，不复制第二份。
+#
+# 默认 ssh: 'false'，即只做前置校验、不建立任何会话（避免一次误调用就开出可登入的 shell）。
+# 要真正拿到会话必须显式 ssh: true。
+
+inputs:
+  ssh:
+    description: '是否建立会话。true=安装客户端并反连中继，false=仅做前置校验（输出 none）'
+    required: false
+    default: 'false'
+  relay-host:
+    description: '中继主机名（uptermd 所在主机），如 ssh.wuge.fun'
+    required: false
+    default: 'ssh.wuge.fun'
+  relay-port:
+    description: '中继 uptermd 端口（不是宿主 sshd 的 22）'
+    required: false
+    default: '2222'
+  web-base-url:
+    description: '网页终端站点根地址，不含 /t/ 与会话参数，如 https://wuge.fun'
+    required: false
+    default: 'https://wuge.fun'
+  bridge-base-url:
+    description: 'runner 反连桥接基地址（ws:// 或 wss://），自动补 /runner；只接受站点根或已带 /runner 的终点'
+    required: false
+    default: 'wss://wuge.fun'
+  known-hosts:
+    description: '中继主机 known_hosts 行（防中间人，非授权依据）；端口非 22 时必须用 [host]:port 方括号形式'
+    required: false
+    default: '[ssh.wuge.fun]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIP8Ue4hfxEXVelScsPdHN837quBEx/K6GCd+p6jrl34'
+  ssh-user:
+    description: '允许登入的 GitHub 用户名；访客公钥闸门只放行该用户登记的公钥'
+    required: false
+    default: 'itwuge'
+  session-minutes:
+    description: '会话最长存活分钟数，同时用于计算 expires-at 与等待超时'
+    required: false
+    default: '45'
+  allowed-credentials:
+    description: '网页准入允许清单（单行 JSON 数组）；空数组 [] 表示开放一次自举注册'
+    required: false
+    default: '[]'
+  upterm-version:
+    description: 'upterm 客户端版本（GitHub Release tag），默认已核实的 v0.41.1'
+    required: false
+    default: 'v0.41.1'
+  action-upterm-ref:
+    description: '本仓库 ref，可复用工作流检出 Action 代码时使用；Composite 直接调用时仅作日志标注'
+    required: false
+    default: 'v1'
+  direct-endpoint:
+    description: '直连候选对端 host[:port]；留空即按「无可用对端地址」判直连失败（数据面直连未验证）'
+    required: false
+    default: ''
+  route-artifact-name:
+    description: '非空时把 9 行路由字段暂存为制品（沿用原工作流的 route-fields 行为），留空不上传'
+    required: false
+    default: ''
+  route-artifact-retention-days:
+    description: '路由字段制品保留天数'
+    required: false
+    default: '1'
+
+outputs:
+  session-id:
+    description: '会话标识（ssh 关闭时为 none）'
+    value: ${{ steps.route.outputs.session_id }}
+  ssh-user:
+    description: 'SSH 登入名，含嵌入式路由后缀；ssh 关闭时为 none'
+    value: ${{ steps.route.outputs.ssh_user }}
+  relay-host:
+    description: '中继主机'
+    value: ${{ steps.route.outputs.relay_host }}
+  relay-port:
+    description: '中继端口'
+    value: ${{ steps.route.outputs.relay_port }}
+  web-url:
+    description: '网页终端入口地址（ssh 关闭时为 none）'
+    value: ${{ steps.route.outputs.web_url }}
+  pubkey-fingerprint:
+    description: '允许登入的公钥指纹（逗号分隔）；ssh 关闭时为 none'
+    value: ${{ steps.route.outputs.pubkey_fingerprint }}
+  expires-at:
+    description: '会话预计到期时间（UTC，按 session-minutes 推算）'
+    value: ${{ steps.route.outputs.expires_at }}
+  pubkey-credential-id:
+    description: 'WebAuthn 凭据标识；未预置时为 unset'
+    value: ${{ steps.route.outputs.pubkey_credential_id }}
+  path-mode:
+    description: '连接路径：relay / direct / disabled'
+    value: ${{ steps.route.outputs.path_mode }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 校验入口与前置配置
+      id: precheck
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/scripts/action/precheck.sh"
+      env:
+        ACTSSH_ACTION_REF: ${{ inputs.action-upterm-ref }}
+        ACTSSH_WORKDIR: ${{ github.workspace }}/actssh-tmp
+        ACTSSH_SSH_ENABLED: ${{ inputs.ssh }}
+        ACTSSH_RELAY_HOST: ${{ inputs.relay-host }}
+        ACTSSH_RELAY_PORT: ${{ inputs.relay-port }}
+        ACTSSH_SSH_USER: ${{ inputs.ssh-user }}
+        ACTSSH_SESSION_MINUTES: ${{ inputs.session-minutes }}
+        ACTSSH_KNOWN_HOST: ${{ inputs.known-hosts }}
+        ACTSSH_WEB_BASE_URL: ${{ inputs.web-base-url }}
+        ACTSSH_DIRECT_ENDPOINT: ${{ inputs.direct-endpoint }}
+        ACTSSH_DISPATCH_KEYWORD: ${{ github.event.client_payload.keyword || '' }}
+        ACTSSH_DISPATCH_SENDER: ${{ github.event.sender.login }}
+        GH_TOKEN: ${{ github.token }}
+
+    - name: 安装 upterm 客户端
+      if: steps.precheck.outputs.enabled == 'true'
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/scripts/action/install-upterm.sh"
+      env:
+        ACTSSH_WORKDIR: ${{ github.workspace }}/actssh-tmp
+        ACTSSH_UPTERM_VERSION: ${{ inputs.upterm-version }}
+
+    - name: 启动会话
+      id: start
+      if: steps.precheck.outputs.enabled == 'true'
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/scripts/action/start-session.sh"
+      env:
+        ACTSSH_WORKDIR: ${{ github.workspace }}/actssh-tmp
+        ACTSSH_RELAY_HOST: ${{ inputs.relay-host }}
+        ACTSSH_RELAY_PORT: ${{ inputs.relay-port }}
+        ACTSSH_SESSION_NAME: actssh
+        ACTSSH_JOIN_TIMEOUT: 10m
+
+    - name: 输出路由字段
+      id: route
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/scripts/action/route.sh"
+      env:
+        ACTSSH_ENABLED: ${{ steps.precheck.outputs.enabled }}
+        ACTSSH_WORKDIR: ${{ github.workspace }}/actssh-tmp
+        ACTSSH_RELAY_HOST: ${{ inputs.relay-host }}
+        ACTSSH_RELAY_PORT: ${{ inputs.relay-port }}
+        ACTSSH_WEB_BASE_URL: ${{ inputs.web-base-url }}
+        ACTSSH_CREDENTIAL_ID: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
+        ACTSSH_SESSION_ID: ${{ steps.start.outputs.session_id }}
+        ACTSSH_SSH_LOGIN_USER: ${{ steps.start.outputs.ssh_user }}
+        ACTSSH_FINGERPRINTS: ${{ steps.precheck.outputs.fingerprints }}
+        ACTSSH_EXPIRES_AT: ${{ steps.precheck.outputs.expires_at }}
+        ACTSSH_PATH_MODE: ${{ steps.precheck.outputs.path_mode }}
+
+    - name: 暂存路由字段
+      if: inputs.route-artifact-name != ''
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.route-artifact-name }}
+        path: ${{ github.workspace }}/actssh-tmp/fields
+        if-no-files-found: error
+        retention-days: ${{ inputs.route-artifact-retention-days }}
+
+    - name: 启动网页桥接
+      if: steps.precheck.outputs.enabled == 'true'
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/scripts/action/bridge.sh"
+      env:
+        ACTSSH_SCRIPTS_DIR: ${{ github.action_path }}
+        ACTSSH_WORKDIR: ${{ github.workspace }}/actssh-tmp
+        ACTSSH_SESSION_NAME: actssh
+        ACTSSH_SESSION_ID: ${{ steps.start.outputs.session_id }}
+        ACTSSH_BRIDGE_BASE: ${{ inputs.bridge-base-url }}
+        ACTSSH_ALLOWED_JSON: ${{ inputs.allowed-credentials }}
+        ACTSSH_CREDENTIAL_ID: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
+
+    - name: 等待会话结束
+      if: steps.precheck.outputs.enabled == 'true'
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/scripts/action/wait-session.sh"
+      env:
+        ACTSSH_WORKDIR: ${{ github.workspace }}/actssh-tmp
+        ACTSSH_SESSION_NAME: actssh
+        ACTSSH_SESSION_MINUTES: ${{ inputs.session-minutes }}
+
+    - name: 收尾清理
+      if: always()
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/scripts/action/cleanup.sh"
+      env:
+        ACTSSH_WORKDIR: ${{ github.workspace }}/actssh-tmp
+        ACTSSH_SESSION_NAME: actssh

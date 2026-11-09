@@ -1,0 +1,153 @@
+name: 可复用调试会话
+
+# 可复用工作流：整段 job 由本仓库托管，调用方只需在 job 级别 uses 本文件。
+# 实现与根目录 action.yml 完全一致（检出本仓库代码后调用同一个 Composite Action），不复制逻辑。
+#
+# 调用方示例：
+#   jobs:
+#     debug:
+#       permissions:
+#         contents: read
+#       uses: itwuge/ActionSSHConnection/.github/workflows/reusable-session.yml@v1
+#       with:
+#         ssh: true
+#
+# 注意：inputs.action-upterm-ref 决定检出本仓库的 ref（默认 v1），调用方锁定 SHA 时请一并传入。
+
+on:
+  workflow_call:
+    inputs:
+      ssh:
+        description: "是否建立会话；false 只做前置校验"
+        type: boolean
+        required: false
+        default: false
+      relay-host:
+        description: "中继主机名"
+        type: string
+        required: false
+        default: "ssh.wuge.fun"
+      relay-port:
+        description: "中继 uptermd 端口"
+        type: string
+        required: false
+        default: "2222"
+      web-base-url:
+        description: "网页终端站点根地址"
+        type: string
+        required: false
+        default: "https://wuge.fun"
+      bridge-base-url:
+        description: "runner 反连桥接基地址"
+        type: string
+        required: false
+        default: "wss://wuge.fun"
+      known-hosts:
+        description: "中继主机 known_hosts 行"
+        type: string
+        required: false
+        default: "[ssh.wuge.fun]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIP8Ue4hfxEXVelScsPdHN837quBEx/K6GCd+p6jrl34"
+      ssh-user:
+        description: "允许登入的 GitHub 用户名"
+        type: string
+        required: false
+        default: "itwuge"
+      session-minutes:
+        description: "会话最长存活分钟数"
+        type: string
+        required: false
+        default: "45"
+      allowed-credentials:
+        description: "网页准入允许清单（单行 JSON 数组）"
+        type: string
+        required: false
+        default: "[]"
+      upterm-version:
+        description: "upterm 客户端版本"
+        type: string
+        required: false
+        default: "v0.41.1"
+      action-upterm-ref:
+        description: "检出本仓库代码时锁定的 ref"
+        type: string
+        required: false
+        default: "v1"
+      direct-endpoint:
+        description: "直连候选对端 host[:port]"
+        type: string
+        required: false
+        default: ""
+    outputs:
+      session-id:
+        description: "会话标识"
+        value: ${{ jobs.session.outputs.session-id }}
+      ssh-user:
+        description: "SSH 登入名"
+        value: ${{ jobs.session.outputs.ssh-user }}
+      relay-host:
+        description: "中继主机"
+        value: ${{ jobs.session.outputs.relay-host }}
+      relay-port:
+        description: "中继端口"
+        value: ${{ jobs.session.outputs.relay-port }}
+      web-url:
+        description: "网页终端入口地址"
+        value: ${{ jobs.session.outputs.web-url }}
+      pubkey-fingerprint:
+        description: "允许登入的公钥指纹"
+        value: ${{ jobs.session.outputs.pubkey-fingerprint }}
+      expires-at:
+        description: "会话预计到期时间（UTC）"
+        value: ${{ jobs.session.outputs.expires-at }}
+      pubkey-credential-id:
+        description: "WebAuthn 凭据标识或 unset"
+        value: ${{ jobs.session.outputs.pubkey-credential-id }}
+      path-mode:
+        description: "连接路径 relay / direct / disabled"
+        value: ${{ jobs.session.outputs.path-mode }}
+
+permissions:
+  contents: read
+
+jobs:
+  session:
+    name: debug-session
+    runs-on: ubuntu-latest
+    # 会话上限之外再留 10 分钟给安装与清理
+    timeout-minutes: ${{ fromJSON(inputs.session-minutes) + 10 }}
+    outputs:
+      session-id: ${{ steps.session.outputs.session-id }}
+      ssh-user: ${{ steps.session.outputs.ssh-user }}
+      relay-host: ${{ steps.session.outputs.relay-host }}
+      relay-port: ${{ steps.session.outputs.relay-port }}
+      web-url: ${{ steps.session.outputs.web-url }}
+      pubkey-fingerprint: ${{ steps.session.outputs.pubkey-fingerprint }}
+      expires-at: ${{ steps.session.outputs.expires-at }}
+      pubkey-credential-id: ${{ steps.session.outputs.pubkey-credential-id }}
+      path-mode: ${{ steps.session.outputs.path-mode }}
+    steps:
+      # 检出本仓库（不是调用方仓库），用于拿到 action.yml 与 scripts/action 下的实现
+      - name: 检出 Action 仓库
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: itwuge/ActionSSHConnection
+          ref: ${{ inputs.action-upterm-ref }}
+          path: .actssh-action
+          persist-credentials: false
+
+      - name: 建立调试会话
+        id: session
+        uses: ./.actssh-action
+        with:
+          ssh: ${{ inputs.ssh }}
+          relay-host: ${{ inputs.relay-host }}
+          relay-port: ${{ inputs.relay-port }}
+          web-base-url: ${{ inputs.web-base-url }}
+          bridge-base-url: ${{ inputs.bridge-base-url }}
+          known-hosts: ${{ inputs.known-hosts }}
+          ssh-user: ${{ inputs.ssh-user }}
+          session-minutes: ${{ inputs.session-minutes }}
+          allowed-credentials: ${{ inputs.allowed-credentials }}
+          upterm-version: ${{ inputs.upterm-version }}
+          action-upterm-ref: ${{ inputs.action-upterm-ref }}
+          direct-endpoint: ${{ inputs.direct-endpoint }}

@@ -1,0 +1,65 @@
+name: 调试会话（读取 outputs）
+
+# 调用后在后续步骤使用 9 个路由字段：打印到摘要、写入文件、按需做通知或校验。
+# outputs 只在会话建立后才有值；ssh: false 时 session-id / ssh-user / web-url 为 none。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: 建立调试会话
+        id: ssh
+        uses: itwuge/ActionSSHConnection@v1
+        with:
+          ssh: true
+          session-minutes: "30"
+
+      # 会话结束后（或收尾清理后）继续使用字段；作业进行中想拿到字段请看 docs/接入指南.md 的制品方式
+      - name: 打印路由字段
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "session_id=${{ steps.ssh.outputs.session-id }}"
+          echo "ssh_user=${{ steps.ssh.outputs.ssh-user }}"
+          echo "relay=${{ steps.ssh.outputs.relay-host }}:${{ steps.ssh.outputs.relay-port }}"
+          echo "web_url=${{ steps.ssh.outputs.web-url }}"
+          echo "fingerprint=${{ steps.ssh.outputs.pubkey-fingerprint }}"
+          echo "expires_at=${{ steps.ssh.outputs.expires-at }}"
+          echo "credential_id=${{ steps.ssh.outputs.pubkey-credential-id }}"
+          echo "path_mode=${{ steps.ssh.outputs.path-mode }}"
+
+      # 例：会话存在时把网页地址写进 JSON 供后续机器读取
+      - name: 写一份字段 JSON
+        if: always()
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg session_id "${{ steps.ssh.outputs.session-id }}" \
+            --arg ssh_user "${{ steps.ssh.outputs.ssh-user }}" \
+            --arg relay_host "${{ steps.ssh.outputs.relay-host }}" \
+            --arg relay_port "${{ steps.ssh.outputs.relay-port }}" \
+            --arg web_url "${{ steps.ssh.outputs.web-url }}" \
+            --arg fingerprint "${{ steps.ssh.outputs.pubkey-fingerprint }}" \
+            --arg expires_at "${{ steps.ssh.outputs.expires-at }}" \
+            --arg credential_id "${{ steps.ssh.outputs.pubkey-credential-id }}" \
+            --arg path_mode "${{ steps.ssh.outputs.path-mode }}" \
+            '{session_id:$session_id,ssh_user:$ssh_user,relay_host:$relay_host,
+              relay_port:$relay_port,web_url:$web_url,pubkey_fingerprint:$fingerprint,
+              expires_at:$expires_at,pubkey_credential_id:$credential_id,path_mode:$path_mode}' \
+            > route-fields.json
+          cat route-fields.json
+
+      - name: 暂存字段文件
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: route-fields-json
+          path: route-fields.json
+          retention-days: 1
