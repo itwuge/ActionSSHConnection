@@ -30,7 +30,7 @@
 | `uptermd.service` | systemd 单元：只读系统与密钥、仅 `/run` 可写、资源上限、低端口能力 |
 | `firewall.sh` | ufw / nftables 双后端：SSH 与 WS 入口限速、管理面来源限制、指标端口仅环回 |
 | `rotate-relay-key.sh` | 反连注册标识轮换（服务身份密钥），输出 known_hosts 公钥行，支持回滚 |
-| `check-relay-health.sh` | 只读健康检查，输出单行 JSON，判据为监听齐备、路由为空、无会话文件、资源与日志上限生效 |
+| `check-relay-health.sh` | 只读健康检查，输出单行 JSON，判据为监听齐备、路由为空、无会话文件、资源上限生效；journald 容量仅提示 |
 | `README.md` | 本文件 |
 
 ## 3. 中转与打洞的关系
@@ -106,6 +106,7 @@ sudo deploy/install-uptermd.sh --version v0.41.1 --sha256 <发布包 SHA256>
 - 下载发布包并校验哈希，原子替换二进制；
 - 写 `/etc/uptermd/uptermd.env`，**不写** `UPTERMD_AUTHORIZED_KEYS`，**不创建** `authorized_keys`；
 - 安装 `uptermd.service`，设置开机自启；
+- 默认**不写** journald 上限、**不重启** `systemd-journald`：中继可能与非中继服务共用一台机，全局 `SystemMaxUse` 会影响同机其它服务的日志保留。确实需要时显式加 `--journald-max 200M`，并在确认该机为专用中继后再用；
 - 重启后核对 SSH 监听（默认 22，可由 `--ssh-addr` 覆盖）、8443 监听、`MemoryMax`/`CPUQuota`/`TasksMax`、活动路由为 0、运行期目录无会话文件。
 
 退出码 10 表示空路由或禁落盘自检未通过，退出码 11 表示资源上限未生效。
@@ -132,9 +133,9 @@ stdout 恰好一行 JSON，字段为 `ok`、`message`、`error_code`、`data`、
 - `listen_state`：SSH、WS、环回 WS 三类监听；
 - `route_table_empty`：`routing_active_connections_count` 是否为 0；
 - `session_files_found`：运行目录条目与状态目录中的预期外文件；
-- `journal_cap`：journald 上限配置与实际占用。
+- `journal_cap`：journald 上限配置与实际占用，`advisory:true` 表示仅提示，不参与 `ok` 判定。
 
-退出码：0 全部通过；1 判据未通过或状态取不到；2 参数或依赖错误。
+退出码：0 全部通过；1 判据未通过或状态取不到；2 参数或依赖错误。`journal_cap` 不达标只向 stderr 打一条 `[WARN]`，不改变退出码。
 
 ## 7. 验证判据
 
@@ -146,7 +147,7 @@ stdout 恰好一行 JSON，字段为 `ok`、`message`、`error_code`、`data`、
 4. `systemctl show -p MemoryMax -p CPUQuotaPerSecUSec -p TasksMax uptermd.service` 与 `1G`、`150%`、`512` 对应。
 5. `/run/uptermd` 为空；`/var/lib/uptermd` 只有主机密钥与轮换归档。
 6. 重启一次服务后立即复查第 3、5 项，作为「重启后映射为空、无会话文件」的证据。
-7. journald 实际占用不超过 200M，且 `90-uptermd-limits.conf` 中 `SystemMaxUse=200M`。
+7. journald 容量仅作提示：200M 为准的提示阈值，超出只在 stderr 告警，不计入 `ok`；是否封顶由运维按机器用途决定。
 
 ## 8. 反连注册标识轮换
 
@@ -173,7 +174,7 @@ sudo deploy/rotate-relay-key.sh --apply
 | 指标不可达 | 查 9100 是否只绑环回、服务是否 active | 不要为了排障把 9100 暴露到公网 |
 | 服务起不来且日志提示只读文件系统 | 查是否往 `/var/lib/uptermd`、`/etc/uptermd` 或 home 写文件 | 这是沙箱预期行为；确认版本是否支持只读运行，必要时调整 `ReadOnlyPaths` 并记录 |
 | 绑定 22 报权限不足 | 查单元是否授予 `CAP_NET_BIND_SERVICE` | 保留 `AmbientCapabilities`，不要改成 root 运行 |
-| journal 占用超限 | `journalctl --disk-usage` | 检查 `90-uptermd-limits.conf` 是否生效并执行 vacuum |
+| journal 占用偏高 | `journalctl --disk-usage` | 默认不封顶，健康检查只提示；确认该机为专用中继时才用 `--journald-max 200M` 写入并 `journalctl --vacuum-size` |
 
 ## 10. 回滚
 
@@ -201,3 +202,5 @@ sudo deploy/rotate-relay-key.sh --apply
 10. 两个入口同时进入同一会话时，TUI 的实际可用性。
 
 补充实测条件：Ubuntu 22.04.5 的 `journalctl --disk-usage` 在部署前为 416.1M，写入 `SystemMaxUse=200M` 并重启 journald 后不会立即压到上限，需按第 9 节执行一次 `journalctl --vacuum-size`；本机压到 144.0M 后健康检查通过。同日做了同机端到端会话（upterm host + ssh 访客）：建会话、访客执行命令、回收均成功；访客在共享 shell 内 `exit` 会结束宿主命令并立即回收会话（2026-11-09 生产机复测：`session wait` 0.040s 返回，指标 0.053s 归零；走 exec 通道执行单条命令不影响会话，需显式 stop）。全程 `/run/uptermd` 与 `/var/lib/uptermd` 无新增文件，监听端口不变，停后 `sessions_active_count` 归零。另：中继只接受 publickey 认证，runner 未设闸门时访客也必须提供任意一把私钥，无密钥连接被拒（exit 255，`Permission denied`）。2026-11-09 阿里云成都 ECS（Ubuntu 20.04.6，2 vCPU/2 GiB/40 GiB）以 `--ssh-addr 0.0.0.0:2222` 部署，系统 sshd 保持 22 未改，22 上的连接未中断。闸门与时延实测：中继白名单只拦宿主注册，清单外宿主 exit 1（`Permission denied`），清单内 exit 0；中继白名单外的访客仍可登录，runner 侧清单外访客 exit 255（`Permission denied`）。访客 `exit` 后会话立即结束：从访客 ssh 返回计，`upterm session wait` 0.160s 返回（exit 0），10ms 粒度下活动会话指标 0.045s 归零；原连接串立即重连失败（exit 255，`Permission denied`）。
+
+journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、Nuxt 与其它服务，部署时写入的全局 `SystemMaxUse=200M` 会改变同机所有服务的日志保留，已删除 `/etc/systemd/journald.conf.d/90-uptermd-limits.conf` 并重启 `systemd-journald`，既有 1.4G 历史日志保留未动。安装脚本相应改为默认不写 journald 片段（需显式 `--journald-max`），健康检查把 `journal_cap` 降为提示项、`advisory:true`、不参与 `ok` 判定。
