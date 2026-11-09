@@ -82,11 +82,20 @@ on:
         type: string
         required: false
         default: "v1"
-      direct-endpoint:
-        description: "直连候选对端 host[:port]"
+      direct-mode:
+        description: "直连路径：none（默认）/ tailscale"
         type: string
         required: false
-        default: ""
+        default: "none"
+      direct-ssh-port:
+        description: "直连 sshd 监听端口（仅绑 tailnet 地址）"
+        type: string
+        required: false
+        default: "2222"
+    secrets:
+      tailscale-auth-key:
+        description: "Tailscale 临时 auth key（调用方 Secret 传入；不打印不落盘，缺失即回落中继）"
+        required: false
     outputs:
       session-id:
         description: "会话标识"
@@ -163,4 +172,6 @@ jobs:
           credential-id: ${{ inputs.credential-id }}
           upterm-version: ${{ inputs.upterm-version }}
           action-upterm-ref: ${{ inputs.action-upterm-ref }}
-          direct-endpoint: ${{ inputs.direct-endpoint }}
+          direct-mode: ${{ inputs.direct-mode }}
+          direct-ssh-port: ${{ inputs.direct-ssh-port }}
+          tailscale-auth-key: ${{ secrets.tailscale-auth-key }}

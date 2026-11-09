@@ -32,11 +32,24 @@ if [ -n "$session_id" ]; then
   watchdog_pid=$!
 fi
 
+# 直连校验进程的输出来自后台，不在本步骤的 stdout 管道里；这里跟随它的日志，
+# 让 path_verified=direct/derp 与固定提示语在会话进行中就能出现在作业日志里。
+follow_pid=""
+if [ -f "$workdir/direct.state" ]; then
+  ( tail -n +1 -F "$workdir/direct-verify.log" 2>/dev/null ) &
+  follow_pid=$!
+  echo "$follow_pid" > "$workdir/direct-verify.follow.pid" 2>/dev/null || true
+fi
+
 # 退出钩子：先停会话（进程退出即会话消失），再清临时文件
 cleanup_on_exit() {
+  if [ -n "${follow_pid:-}" ]; then kill "$follow_pid" >/dev/null 2>&1 || true; fi
   if [ -n "${watchdog_pid:-}" ]; then kill "$watchdog_pid" >/dev/null 2>&1 || true; fi
   upterm session stop "$session_name" >/dev/null 2>&1 || true
-  if [ -n "${workdir:-}" ]; then rm -rf -- "$workdir"; fi
+  # 直连会话把 state 留给 cleanup.sh：它要先打印最终 path_verified，再按 state 注销 Tailscale 节点
+  if [ -n "${workdir:-}" ] && [ ! -f "$workdir/direct.state" ]; then
+    rm -rf -- "$workdir"
+  fi
 }
 trap cleanup_on_exit EXIT INT TERM
 

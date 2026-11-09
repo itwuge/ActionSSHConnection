@@ -1,0 +1,30 @@
+name: 调试会话（Tailscale 直连）
+
+# 可选直连路径：runner 自行安装 Tailscale，用调用方 Secret 传入的临时 auth key 加入 tailnet，
+# 只在 tailnet 地址上起 sshd，仅承载 SSH；网页仍走中继桥接。
+#
+# 调用方需要准备：
+#   1) 一个 tailnet，且本机设备已加入（否则直连地址不可达）；
+#   2) 仓库 Secret TS_AUTHKEY = `tailscale authkey --ephemeral --preauth --tags tag:actssh-runner` 的输出；
+#   3) ACL 只放行调用方身份到 tag:actssh-runner 的 2222 端口。
+# 任一步失败自动回落中继：session_id 不变、作业不失败，日志给出「直连未建立，已切换到中继转发」。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: itwuge/ActionSSHConnection@v1
+        with:
+          ssh: true
+          direct-mode: tailscale
+          tailscale-auth-key: ${{ secrets.TS_AUTHKEY }}
+          direct-ssh-port: "2222"
+          # 会话进行中读 9 个字段走这个制品；direct_endpoint 与 path_verified 只出现在日志与作业摘要里
+          route-artifact-name: route-fields

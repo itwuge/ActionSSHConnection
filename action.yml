@@ -1,5 +1,5 @@
 name: 'ActionSSHConnection 调试会话'
-description: '在作业内开出可 SSH 与网页接入的临时调试会话（upterm 中继 + WebAuthn 网页准入）'
+description: '在作业内开出可 SSH 与网页接入的临时调试会话（upterm 中继 + 可选 Tailscale 直连 + WebAuthn 网页准入）'
 author: 'itwuge'
 branding:
   icon: 'terminal'
@@ -66,10 +66,18 @@ inputs:
     description: '本仓库 ref，可复用工作流检出 Action 代码时使用；Composite 直接调用时仅作日志标注'
     required: false
     default: 'v1'
-  direct-endpoint:
-    description: '直连候选对端 host[:port]；留空即按「无可用对端地址」判直连失败（数据面直连未验证）'
+  direct-mode:
+    description: '直连路径：none=只用中继（默认），tailscale=runner 自行安装 Tailscale 并在 tailnet 地址上起 sshd'
+    required: false
+    default: 'none'
+  tailscale-auth-key:
+    description: 'Tailscale 临时 auth key（建议 ephemeral + tag:actssh-runner）；只从环境读取，不打印不落盘；缺失即回落中继'
     required: false
     default: ''
+  direct-ssh-port:
+    description: '直连 sshd 监听端口（仅绑 tailnet 地址），同时也是 direct_endpoint 的端口段'
+    required: false
+    default: '2222'
   route-artifact-name:
     description: '非空时把 9 行路由字段暂存为制品（沿用原工作流的 route-fields 行为），留空不上传'
     required: false
@@ -126,7 +134,8 @@ runs:
         ACTSSH_IDLE_MINUTES: ${{ inputs.idle-minutes }}
         ACTSSH_KNOWN_HOST: ${{ inputs.known-hosts }}
         ACTSSH_WEB_BASE_URL: ${{ inputs.web-base-url }}
-        ACTSSH_DIRECT_ENDPOINT: ${{ inputs.direct-endpoint }}
+        ACTSSH_DIRECT_MODE: ${{ inputs.direct-mode }}
+        ACTSSH_DIRECT_SSH_PORT: ${{ inputs.direct-ssh-port }}
         ACTSSH_DISPATCH_KEYWORD: ${{ github.event.client_payload.keyword || '' }}
         ACTSSH_DISPATCH_SENDER: ${{ github.event.sender.login }}
         GH_TOKEN: ${{ github.token }}
@@ -151,6 +160,19 @@ runs:
         ACTSSH_SESSION_NAME: actssh
         ACTSSH_JOIN_TIMEOUT: ${{ format('{0}m', inputs.idle-minutes) }}
 
+    - name: 建立直连路径
+      id: direct
+      if: steps.precheck.outputs.enabled == 'true'
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/scripts/action/direct-path.sh"
+      env:
+        ACTSSH_WORKDIR: ${{ github.workspace }}/actssh-tmp
+        ACTSSH_DIRECT_MODE: ${{ inputs.direct-mode }}
+        ACTSSH_DIRECT_SSH_PORT: ${{ inputs.direct-ssh-port }}
+        ACTSSH_TAILSCALE_AUTH_KEY: ${{ inputs.tailscale-auth-key }}
+        ACTSSH_RUN_ID: ${{ github.run_id }}
+        ACTSSH_SESSION_NAME: actssh
+
     - name: 输出路由字段
       id: route
       shell: bash
@@ -166,7 +188,10 @@ runs:
         ACTSSH_SSH_LOGIN_USER: ${{ steps.start.outputs.ssh_user }}
         ACTSSH_FINGERPRINTS: ${{ steps.precheck.outputs.fingerprints }}
         ACTSSH_EXPIRES_AT: ${{ steps.precheck.outputs.expires_at }}
-        ACTSSH_PATH_MODE: ${{ steps.precheck.outputs.path_mode }}
+        ACTSSH_PATH_MODE: ${{ steps.direct.outputs.path_mode }}
+        ACTSSH_DIRECT_ENDPOINT: ${{ steps.direct.outputs.direct_endpoint }}
+        ACTSSH_DIRECT_LOGIN_USER: ${{ steps.direct.outputs.login_user }}
+        ACTSSH_PATH_VERIFIED: ${{ steps.direct.outputs.path_verified }}
 
     - name: 暂存路由字段
       if: inputs.route-artifact-name != ''

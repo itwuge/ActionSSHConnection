@@ -1,17 +1,19 @@
 # 示例对比
 
-三个示例都只依赖本仓库的 Action / 可复用工作流，不需要复制任何脚本。
+四个示例都只依赖本仓库的 Action / 可复用工作流，不需要复制任何脚本。
 
 | 文件 | 接入方式 | 适用场景 | 复杂度 |
 | --- | --- | --- | --- |
 | [action-minimal.yml](action-minimal.yml) | Composite Action | 只想临时开一个调试会话，几行搞定 | 最低 |
 | [action-with-outputs.yml](action-with-outputs.yml) | Composite Action | 拿到会话后还要在自己的步骤里用 9 个字段（通知、写文件、二次校验） | 中 |
 | [reusable-workflow.yml](reusable-workflow.yml) | 可复用工作流（`workflow_call`） | 不想维护 job 结构，整段运行器生命周期交给本仓库 | 中 |
+| [direct-tailscale.yml](direct-tailscale.yml) | Composite Action + Tailscale 直连 | 中继之外再提供一条 tailnet SSH 入口，并按 `path_verified` 区分真直连与 DERP | 中高 |
 
-## 三者的核心差别
+## 四者的核心差别
 
 - **Composite Action**：`uses: itwuge/ActionSSHConnection@v1` 是你自己 job 里的一步。job 的 `runs-on`、`timeout-minutes`、`permissions`、前后的准备/收尾步骤都由你控制。
 - **可复用工作流**：`uses: itwuge/ActionSSHConnection/.github/workflows/reusable-session.yml@v1` 占的是 **job 级** 位置，job 本身由本仓库定义，你不能往里插步骤；需要 outputs 时用 `needs.<job>.outputs.*`。
+- **直连示例**：在 Composite 基础上加 `direct-mode: tailscale` 与 `tailscale-auth-key`。直连失败自动回落中继，写法和普通调用完全一致。
 
 两者输出字段完全同名，都是 9 个。
 
@@ -26,6 +28,7 @@
 4. **权限**：job 或 workflow 需要 `permissions: contents: read`。
 5. **会话时长**：`session-minutes` 与 job 的 `timeout-minutes` 要匹配（后者更大）。
 6. **必须显式 `ssh: true`**：默认 `false` 只做前置校验，不会开出可登入的 shell。
+7. **直连示例额外三件事**：仓库 Secret `TS_AUTHKEY`（`tailscale authkey --ephemeral --preauth --tags tag:actssh-runner`）、只放行该 tag 的 ACL、以及调用方设备已加入同一个 tailnet。任一不满足都会回落中继，日志给固定提示语，不使作业失败。
 
 ## 使用 outputs 的两个注意点
 

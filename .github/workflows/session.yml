@@ -15,7 +15,9 @@ name: 调试会话
 #   WEB_BRIDGE_BASE_URL           runner 反连桥接基地址（如 wss://wuge.fun，自动补 /runner）
 # 可选仓库变量：
 #   WEBAUTHN_CREDENTIAL_ID        公钥凭据标识；空白时路由字段输出 unset，SSH 通道不受影响
-#   UPTERM_DIRECT_ENDPOINT        直连候选对端 host[:port]；不配即按「无可用对端地址」判直连失败
+#   UPTERM_DIRECT_MODE            直连路径开关：none（默认）/ tailscale
+# 可选仓库 Secret：
+#   TS_AUTHKEY                    Tailscale 临时 auth key（ephemeral + tag:actssh-runner）；未配置即回落中继
 
 on:
   workflow_dispatch:
@@ -63,7 +65,9 @@ jobs:
           allowed-credentials: ${{ vars.WEBAUTHN_ALLOWED_CREDENTIALS }}
           credential-id: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
           upterm-version: v0.41.1
-          direct-endpoint: ${{ vars.UPTERM_DIRECT_ENDPOINT }}
+          direct-mode: ${{ vars.UPTERM_DIRECT_MODE || 'none' }}
+          direct-ssh-port: "2222"
+          tailscale-auth-key: ${{ secrets.TS_AUTHKEY }}
           # 沿用原工作流：会话期间把 9 行路由字段另存为 route-fields 制品
           route-artifact-name: route-fields
           route-artifact-retention-days: "1"

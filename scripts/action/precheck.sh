@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 文件: scripts/action/precheck.sh
 # 所属目录: scripts/action/
-# 文件用途: 校验调用输入与前置配置, 生成 known_hosts 与访客公钥闸门, 计算到期时间与连接路径.
+# 文件用途: 校验调用输入与前置配置, 生成 known_hosts 与访客公钥闸门, 计算到期时间.
 # 架构定位: Action 步骤脚本; 上游是 action.yml 传入的 ACTSSH_* 环境变量, 下游是 start-session.sh 与 route.sh.
 # 职责边界: 不安装客户端, 不建立会话, 不输出连接串; 只写 GITHUB_OUTPUT.
 # 运行环境: POSIX shell + bash 4; 依赖 gh / jq / python3 / ssh-keygen / tmux（ssh 关闭时只要求 jq 与 python3）.
@@ -47,6 +47,18 @@ case "$idle_minutes" in
 esac
 [ "$idle_minutes" -gt 0 ] || fail precheck "idle-minutes 必须大于 0"
 
+# 直连路径输入：取值与端口在这里拦住，避免运行到一半才发现非法组合
+direct_mode="$(printf '%s' "${ACTSSH_DIRECT_MODE:-none}" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+case "$direct_mode" in
+  none|tailscale) ;;
+  *) fail precheck "direct-mode 只允许 none 或 tailscale" ;;
+esac
+direct_port="${ACTSSH_DIRECT_SSH_PORT:-2222}"
+case "$direct_port" in
+  ''|*[!0-9]*) fail precheck "direct-ssh-port 必须是正整数" ;;
+esac
+{ [ "$direct_port" -ge 1 ] && [ "$direct_port" -le 65535 ]; } || fail precheck "direct-ssh-port 必须在 1-65535"
+
 command -v jq >/dev/null 2>&1 || fail precheck "运行器缺少 jq"
 command -v python3 >/dev/null 2>&1 || fail precheck "运行器缺少 python3"
 
@@ -59,23 +71,8 @@ printf '%s\n' "$known_host" > "$workdir/known_hosts"
 # 到期时间按 session-minutes 推算，误差为前置步骤耗时（数秒）
 expires_at="$(date -u -d "@$(( $(date +%s) + session_minutes * 60 ))" '+%Y-%m-%dT%H:%M:%SZ')"
 
-# 阶段一：打洞。托管 runner 无入站端口，通常无可用对端地址，按「无可用对端地址」直接回落中继。
-# 配置了候选地址时只做 5 秒 TCP 可达性探针；数据面是否真的直连 [待真机确认]。
-mode=relay
-if [ -n "${ACTSSH_DIRECT_ENDPOINT:-}" ]; then
-  host="${ACTSSH_DIRECT_ENDPOINT%%:*}"
-  port=22
-  case "$ACTSSH_DIRECT_ENDPOINT" in *:*) port="${ACTSSH_DIRECT_ENDPOINT##*:}" ;; esac
-  if timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
-    mode=direct
-  fi
-fi
-if [ "$mode" = "direct" ]; then
-  echo "直连已建立（直连）"
-  echo "::warning::直连判定为 TCP 可达性探针，数据面直连未验证"
-else
-  echo "直连未建立，已切换到中继转发"
-fi
+# 连接路径不再在这里判定：直连面由 direct-path.sh 按 direct-mode 用 Tailscale 实际建立，
+# 中继面由 start-session.sh 始终建立；判定结果与固定提示语在 direct 步骤输出。
 
 # ssh=false：只做前置校验，不开会话；输出 enabled=false 供后续步骤跳过
 if [ "$ssh_enabled" != "true" ]; then
@@ -84,7 +81,6 @@ if [ "$ssh_enabled" != "true" ]; then
     echo "enabled=false"
     echo "fingerprints="
     echo "expires_at=$expires_at"
-    echo "path_mode=disabled"
   } >> "$GITHUB_OUTPUT"
   exit 0
 fi
@@ -112,8 +108,11 @@ done < "$workdir/authorized_keys"
   echo "enabled=true"
   echo "fingerprints=$fingerprints"
   echo "expires_at=$expires_at"
-  echo "path_mode=$mode"
 } >> "$GITHUB_OUTPUT"
 
+# 授权清单随作业销毁；直连面的 sshd 以 0600 读取同一份清单
+chmod 600 "$workdir/authorized_keys"
+
 echo "前置校验通过：$ssh_user 公钥 ${fingerprints}"
-echo "中继 ${relay_host}:${relay_port}，会话上限 ${session_minutes} 分钟，Action ref ${ACTSSH_ACTION_REF:-未标注}"
+echo "中继 ${relay_host}:${relay_port}，会话上限 ${session_minutes} 分钟，空闲上限 ${idle_minutes} 分钟"
+echo "直连模式 ${direct_mode}（直连端口 ${direct_port}），Action ref ${ACTSSH_ACTION_REF:-未标注}"
