@@ -708,49 +708,51 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://ssh.example.com/
 - 不要在本节流程里顺手改 ZeroTier 配置；
 - 不要把本节的 `172.17.0.1` / 容器共存写法带到新机器。
 
-## 18. 未验证项与待实现
+## 18. 验证记录与待实现
 
-### 18.1 公网 ACME 真机签发（未验证）
+### 18.1 公网 ACME 真机签发（HTTP-01 链路已验证，2026-11-09）
 
-第 13.11 节的实测走的是 `--cert-mode self-signed`，**「干净机器 + 真实域名 + 公网 HTTP-01 签发」这一组合尚未在真机验证**。当前执行环境已确认具备与不具备的条件如下。
+**已验证**：真实域名 + 公网 HTTP-01 + 正式 Let's Encrypt 签发 + 续期演练，全链路在真机跑通。验证在既有生产机 `47.109.32.249` 的 `certbot-nginx` 容器内进行，只做证书这一节，未安装 bootstrap、未改既有站点与证书谱系。
 
-已确认具备：
+域名与解析：`lab.wuge.fun`，用户添加 `*.wuge.fun` 通配符 A 记录指向 `47.109.32.249`。权威 NS（`dns29/dns30.hichina.com`）已返回该 IP；`1.1.1.1` 已同步；`223.5.5.5`/`8.8.8.8` 一度仍有 NXDOMAIN 负缓存，以权威 NS 结果为准。
 
-- 验收机（Ubuntu 22.04.5）已装 `certbot 1.21.0`，出网可达 Let's Encrypt：`https://acme-v02.api.letsencrypt.org/directory` 返回 200；
-- 本地 webroot 校验路径可用：`http://127.0.0.1/.well-known/acme-challenge/<token>` 能取到文件（自检项 `acme:webroot` 通过）。
+逐项结果（时间为本机时区）：
 
-不具备（阻塞项，缺一不可）：
+| 步骤 | 命令 | 结果 | 耗时 |
+|---|---|---|---|
+| 备份 | `tar czf /root/acme-lab-backup-<ts>/conf.d.tar.gz` | sha256 `78c3e912…b996`，server_name 行快照 16 行 | 1s |
+| 临时 80 块 | 新增 `conf.d/lab-acme-temp.conf`，`location /.well-known/acme-challenge/` → `root /usr/local/nginx/html/acme-lab` | `nginx -t` 通过、reload 成功 | 2s |
+| 公网探针 | `curl http://lab.wuge.fun/.well-known/acme-challenge/probe` | 返回 `probe-ok-20261109_231707` | <1s |
+| dry-run | `certbot certonly --webroot -w /usr/local/nginx/html/acme-lab -d lab.wuge.fun --dry-run` | 23:17:09→23:17:25，`The dry run was successful`，rc=0 | 16s |
+| 正式签发 | 同上去掉 `--dry-run` | 23:17:41→23:17:54，rc=0 | 13s |
+| 证书链 | 宿主 `openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt` | `OK`；链为 `CN=lab.wuge.fun` → `YR2` → `ISRG Root YR` → `ISRG Root X1`（fullchain 3 张）；证书公钥与私钥指纹一致 | 1s |
+| 续期演练 | `certbot renew --dry-run --cert-name lab.wuge.fun` | 23:18:13→23:25:35，`all simulated renewals succeeded`，rc=0 | 7m22s |
 
-1. **无公网入站**：验收 VM 为 NAT 网络（VM `192.168.37.132` → 宿主 `192.168.31.80` → 共享出口 NAT `115.150.84.112`），公网无法访问其 80 端口，也没有可配置的端口映射；生产机 `47.109.32.249` 按约定不得用于实验。
-2. **无域名控制权**：没有可添加 A 记录的测试子域。`lab.actssh.test` 与 `acme-lab.example.com` 在公网均为 NXDOMAIN。
+签发到的证书：`subject=CN=lab.wuge.fun`，`issuer=Let's Encrypt CN=YR2`，`serial=058209FD2405B7665A4A846552699A73F2C9`，`notBefore=2026-11-09 14:19:21Z`，`notAfter=2027-02-07 14:19:20Z`（90 天）。`renewal/lab.wuge.fun.conf` 的 `authenticator=webroot`、`webroot_path=/usr/local/nginx/html/acme-lab`，与既有两条谱系同构。
 
-真实失败证据（2026-11-09，Ubuntu 22.04.5，`certbot certonly --dry-run`，LE staging）：
+清理与回归（23:25:52 起）：
 
-```text
-Simulating a certificate request for lab.actssh.test
-An unexpected error occurred:
-The server will not issue certificates for the identifier :: Invalid identifiers requested ::
-Cannot issue for "lab.actssh.test": Domain name does not end with a valid public suffix (TLD)
-```
+- `certbot delete --cert-name lab.wuge.fun` 删除 `live/`、`archive/`、`renewal/` 下该谱系，三处目录只剩原有两个谱系；
+- 删除临时 `conf.d/lab-acme-temp.conf` 与 webroot 目录，`nginx -t` 通过后 reload；
+- `conf.d` 下全部文件的 sha256 与操作前逐字节一致（`CONF_SHA_SAME`）；`server_name` 行数 16 行、内容完全一致（`SERVER_NAMES_SAME`）；
+- 公网侧 TLS 复测：`wuge.fun`/`www`/`admin` 仍为同一张证书，序列号 `0688262A5ADD713CB15D02E89245647DB92C`、到期 `2026-12-27 16:54:14`；`ssh.wuge.fun` 仍为 `0630335A377AE9964B682731E47DF0331F66`、到期 `2027-02-07 19:10:57`，与操作前基线完全一致；四个站点 80 端口仍统一 301 到 HTTPS。
 
-结论：不是脚本或 nginx/certbot 配置问题，而是环境缺公网入口与可签发的域名。**需要用户提供**以下任一组合：
+两条环境注记（复现时会遇到）：
 
-- 一台临时云主机（干净 Ubuntu 20.04/22.04 x86_64，公网 IPv4，安全组放行 80/443），以及一个指向该 IP 的 A 记录（用户自己的测试子域）；或
-- 现有宿主机的 80 端口入站映射，以及该子域 A 记录的控制权（能改 DNS）。
+1. `certbot-nginx` 容器内没有系统 CA 包，`openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt` 会报文件不存在；链校验需把 `cert.pem`/`chain.pem` 取到宿主后用宿主的 CA 包做，或直接用 `openssl crl2pkcs7 | openssl pkcs7 -print_certs` 核对链结构；
+2. `docker cp` 读取 `live/` 下的符号链接会报 `invalid symlink`，用 `docker exec <容器> cat <路径>` 重定向到宿主文件更稳妥。
 
-具备条件后按下列顺序验证，并记录每步结果与耗时：
+**仍未验证的部分（不要扩大结论）**：本节验证的是 certbot + 公网 HTTP-01 的签发与续期链路，跑在既有容器布局上；`bootstrap.sh` 自带的 `nginx-cert.sh` 在**干净机**上用公网域名完成正式签发这一步仍未实跑（干净机实测走的是 `--cert-mode self-signed`）。要补齐时，在一台有公网 IPv4、80 端口可入站、且有 A 记录指向它的干净 Ubuntu 22.04 上执行：
 
 ```bash
-dig +short A <子域>                                  # 必须返回验证机的公网 IP
+dig +short A <子域>                                  # 必须返回该机公网 IP
 sudo ./deploy/bootstrap.sh --domain <子域> --email <邮箱> \
-  --acme-staging --admin-cidr <管理网段> --apply      # 先用 staging 打一次，避免消耗正式配额
+  --acme-staging --admin-cidr <管理网段> --apply      # 先 staging，避免消耗正式配额
 sudo ./deploy/bootstrap.sh --domain <子域> --email <邮箱> \
-  --admin-cidr <管理网段> --apply                     # 再跑正式签发
-sudo certbot renew --dry-run                          # 续期演练
-sudo ./deploy/bootstrap/selfcheck.sh --domain <子域>  # 期望 cert:expiry 剩余约 90 天且非 self-signed
+  --admin-cidr <管理网段> --apply                     # 正式签发
+sudo certbot renew --dry-run
+sudo ./deploy/bootstrap/selfcheck.sh --domain <子域>  # 期望 cert:expiry 约 90 天且非 self-signed
 ```
-
-验收判据：`/etc/actssh/tls/` 下证书由 Let's Encrypt 签发（`openssl x509 -issuer` 含 `Let's Encrypt`）、`selfcheck.sh` 全项 `[OK]`、`certbot renew --dry-run` 成功、续期 hook 与 cron 兜底均存在。未取得上述证据前，不得把「公网 ACME 已跑通」写成已验证。
 
 ### 18.2 待实现：SSH 鉴权失败限速
 
