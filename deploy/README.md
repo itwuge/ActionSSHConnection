@@ -179,7 +179,7 @@ sudo deploy/rotate-relay-key.sh --apply
 
 1. ~~`User=upterm` 加 `AmbientCapabilities=CAP_NET_BIND_SERVICE` 能否在 Ubuntu 20.04 上稳定绑定 22。~~ 2026-11-09 在 Ubuntu 22.04.5（systemd 249）实测通过：服务以 `upterm` 身份监听 `0.0.0.0:22`；20.04 仍未验证。
 2. ~~`ProtectSystem=strict`、`ReadOnlyPaths`、`WorkingDirectory=/run/uptermd` 与 uptermd 实际写路径是否冲突；若冲突，禁落盘判据需调整。~~ 2026-11-09 实测未冲突：服务正常运行，`/var/lib/uptermd` 与 `/etc/uptermd` 无新增写入，`/run/uptermd` 保持为空。
-3. 不设置 `UPTERMD_AUTHORIZED_KEYS` 时，runner 反连注册是否确实无需服务器侧公钥登记；以及设置空文件时是否拒绝所有宿主注册。
+3. ~~不设置 `UPTERMD_AUTHORIZED_KEYS` 时，runner 反连注册是否确实无需服务器侧公钥登记；~~ 2026-11-09 实测通过：未设置该项时客户端用临时密钥成功注册并建立会话。设置空文件时是否拒绝所有宿主注册仍未验证。
 4. WS 监听 8443 加 TLS 终止层的组合能否完成浏览器 `wss://` 连接；反向代理选型与证书轮换方式未定。
 5. ~~指标名 `routing_active_connections_count` 在 v0.41.1 的实际输出格式与标签情况。~~ 2026-11-09 实测：v0.41.1 不存在该名字，实际为 `upterm_uptermd_sessions_active_count` 与 `upterm_uptermd_routing_authenticated_connections_count{kind=...}`；脚本已改为按候选名识别。
 6. ~~重启后 `/run/uptermd` 确实为空、`/var/lib/uptermd` 无新增会话文件。~~ 2026-11-09 实测通过：重启后 `/run/uptermd` 为空，`/var/lib/uptermd` 仅有 `server_key` 与 `server_key.pub`。
@@ -188,4 +188,4 @@ sudo deploy/rotate-relay-key.sh --apply
 9. 打洞优先策略在自建 runner 或同 NAT 环境下是否可成功；托管 runner 只验中继分支。
 10. 两个入口同时进入同一会话时，TUI 的实际可用性。
 
-补充实测条件：Ubuntu 22.04.5 的 `journalctl --disk-usage` 在部署前为 416.1M，写入 `SystemMaxUse=200M` 并重启 journald 后不会立即压到上限，需按第 9 节执行一次 `journalctl --vacuum-size`；本机压到 144.0M 后健康检查通过。
+补充实测条件：Ubuntu 22.04.5 的 `journalctl --disk-usage` 在部署前为 416.1M，写入 `SystemMaxUse=200M` 并重启 journald 后不会立即压到上限，需按第 9 节执行一次 `journalctl --vacuum-size`；本机压到 144.0M 后健康检查通过。同日做了同机端到端会话（upterm host + ssh 访客）：建会话、访客执行命令、显式 stop 均成功；访客退出不会结束会话，需显式 stop；全程 `/run/uptermd` 与 `/var/lib/uptermd` 无新增文件，监听端口不变，停后 `sessions_active_count` 归零。
