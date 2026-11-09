@@ -46,6 +46,10 @@ inputs:
     description: '会话最长存活分钟数，同时用于计算 expires-at 与等待超时'
     required: false
     default: '45'
+  idle-minutes:
+    description: '空闲上限：SSH 与网页合计无人连接超过该分钟数即结束会话；不得超过 session-minutes'
+    required: false
+    default: '10'
   allowed-credentials:
     description: '网页准入允许清单（单行 JSON 数组）；空数组 [] 表示开放一次自举注册'
     required: false
@@ -119,6 +123,7 @@ runs:
         ACTSSH_RELAY_PORT: ${{ inputs.relay-port }}
         ACTSSH_SSH_USER: ${{ inputs.ssh-user }}
         ACTSSH_SESSION_MINUTES: ${{ inputs.session-minutes }}
+        ACTSSH_IDLE_MINUTES: ${{ inputs.idle-minutes }}
         ACTSSH_KNOWN_HOST: ${{ inputs.known-hosts }}
         ACTSSH_WEB_BASE_URL: ${{ inputs.web-base-url }}
         ACTSSH_DIRECT_ENDPOINT: ${{ inputs.direct-endpoint }}
@@ -144,7 +149,7 @@ runs:
         ACTSSH_RELAY_HOST: ${{ inputs.relay-host }}
         ACTSSH_RELAY_PORT: ${{ inputs.relay-port }}
         ACTSSH_SESSION_NAME: actssh
-        ACTSSH_JOIN_TIMEOUT: 10m
+        ACTSSH_JOIN_TIMEOUT: ${{ format('{0}m', inputs.idle-minutes) }}
 
     - name: 输出路由字段
       id: route
@@ -193,6 +198,8 @@ runs:
         ACTSSH_WORKDIR: ${{ github.workspace }}/actssh-tmp
         ACTSSH_SESSION_NAME: actssh
         ACTSSH_SESSION_MINUTES: ${{ inputs.session-minutes }}
+        ACTSSH_IDLE_MINUTES: ${{ inputs.idle-minutes }}
+        ACTSSH_SESSION_ID: ${{ steps.start.outputs.session_id }}
 
     - name: 收尾清理
       if: always()

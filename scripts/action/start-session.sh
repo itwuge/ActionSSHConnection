@@ -18,7 +18,9 @@ join_timeout="${ACTSSH_JOIN_TIMEOUT:-10m}"
 # --detach 成功时退出码为 0，失败为 1；-o json 只把 JSON 打到 stdout。
 # 必须显式给出长驻托管命令（v0.41.1 源码：run COMMAND, or $SHELL without one）：
 # 缺省 $SHELL 在无访客的 detached PTY 下立即退出，会话会在启动数秒后自行结束。
-# 托管命令用 tmux，使 SSH 与网页访客进入同一终端进程；访客在会话内 exit 即 tmux 退出、会话结束。
+# 托管命令交给 hosted-command.sh：它常驻 attach tmux，访客断开或 exit 都不会让托管命令退出，
+# 因此会话在存活期内可反复进入；结束只由显式 stop、空闲超时或作业超时触发。
+hosted_command="$(dirname "$0")/hosted-command.sh"
 if ! upterm host \
     --accept \
     --detach \
@@ -30,7 +32,7 @@ if ! upterm host \
     --no-sftp \
     --pty-size 80x24 \
     -o json \
-    -- tmux new-session -A -s "$session_name" \
+    -- bash "$hosted_command" "$session_name" \
     > "$workdir/session.json" 2> "$workdir/session.err"; then
   rm -f "$workdir/session.json" "$workdir/session.err"
   echo "失败[阶段 start-session]：客户端异常退出，原因见运行报告，具体输出不外显" >&2

@@ -23,8 +23,9 @@
 允许清单文件只允许公钥与凭据标识, 格式为 JSON 数组:
   [{"credential_id": "<base64url>", "public_key": "<base64url CBOR COSE 公钥>", "transports": ["internal"]}]
 
-空数组([]) + --allow-registration 表示首次自举: 本会话只接受首个注册请求, 成功后立即绑定该凭据,
-同一会话内后续注册一律拒绝; 自举凭据只存在于本进程内存, 不写仓库变量、不落盘、不打印公钥.
+空数组([]) + --allow-registration 表示首次自举: 本会话只接受首个注册请求, 成功后绑定该凭据,
+并把公钥回写到 --allowed-credentials 指向的作业临时文件, 使同一会话后续的网页连接可直接进入;
+回写只含公钥与凭据标识, 不写仓库变量、不打印公钥、不进制品, 随作业销毁.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ import argparse
 import base64
 import binascii
 import errno
+import fcntl
 import hashlib
 import hmac
 import json
@@ -84,6 +86,11 @@ CLIENT_VERSION = "0.1.0"
 DEFAULT_CHALLENGE_TTL_SECONDS = 60.0
 DEFAULT_AUTH_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_ATTEMPTS = 3
+# 跨连接失败上限: 单连接 3 次, 全会话 10 次 / 10 分钟滑窗; 超过即拒绝后续准入请求.
+# 选 10/10 的理由: 正常用户凭据只有一把, 失败多来自旧设备或误点, 10 次足够容错;
+# 滑窗 10 分钟与空闲超时默认值一致, 避免长时间累积误伤, 同时把爆破速率压到每分钟 1 次以内.
+DEFAULT_GLOBAL_MAX_ATTEMPTS = 10
+DEFAULT_FAILURE_WINDOW_SECONDS = 600.0
 MIN_TIMEOUT_MS = 10_000
 MAX_TIMEOUT_MS = 300_000
 ALLOWED_COSE_ALGORITHMS = frozenset({-7, -257})  # ES256 与 RS256
@@ -849,6 +856,12 @@ class SessionOptions:
     auth_timeout_seconds: float = DEFAULT_AUTH_TIMEOUT_SECONDS
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     user_verification: str = "preferred"
+    # 跨连接状态目录: 网页在连标记、跨连接失败计数、自举注册后的允许清单回写都放这里.
+    # 为空表示不落盘(仅单进程语义), 供自测使用; Action 内始终传入 RUNNER 侧临时目录.
+    state_dir: str = ""
+    allowed_credentials_path: str = ""
+    global_max_attempts: int = DEFAULT_GLOBAL_MAX_ATTEMPTS
+    failure_window_seconds: float = DEFAULT_FAILURE_WINDOW_SECONDS
 
 
 class AdmissionSession:
@@ -879,7 +892,7 @@ class AdmissionSession:
         self._pending: _PendingChallenge | None = None
         self._consumed: dict[str, float] = {}
         self._failed_attempts = 0
-        # 空清单自举成功后绑定的凭据标识; 只在内存, 进程结束即消失.
+        # 空清单自举成功后绑定的凭据标识; 进程内绑定, 并回写临时允许清单供后续连接复用.
         self._bootstrap_credential_id: bytes | None = None
         self._terminal: Any = None
         self._started_at = clock()
@@ -923,7 +936,12 @@ class AdmissionSession:
         if frame.type == FRAME_RESIZE:
             return self._handle_resize(frame.payload)
         if self._state == "admitted":
-            # 已准入后再次发起准入没有意义, 也不得重新签发挑战
+            if frame.type == FRAME_AUTH_BEGIN:
+                # 浏览器关闭后重新打开同一链接: 旧客户端已经不在, 释放旧终端并重新准入.
+                # 网页通道会话存活期内可反复进入, 不要求重新触发作业.
+                self._reset_admission(current)
+                return self._handle_auth_begin(frame.payload, current)
+            # 已准入后其它非终端帧没有意义, 也不得重新签发挑战
             self._logger.log(
                 "WARNING",
                 "admission.frame.rejected",
@@ -1028,6 +1046,21 @@ class AdmissionSession:
     # ---------- 准入开始 ----------
     def _handle_auth_begin(self, payload: bytes, now: float) -> tuple[Action, ...]:
         """处理 authBegin; 同一连接同时只允许一个待消费挑战."""
+        # 全会话失败上限已到: 直接拒绝并关闭, 不再签发挑战.
+        if self._window_failure_count() >= self._options.global_max_attempts:
+            self._logger.log(
+                "ERROR",
+                "admission.auth.blocked",
+                "限定时间窗内失败次数已达上限, 拒绝新的准入请求",
+                session_id=self.session_id,
+                window_seconds=int(self._options.failure_window_seconds),
+                stage="auth-begin",
+            )
+            self._close("AUTH_ATTEMPTS_EXCEEDED")
+            return (
+                self._send_auth_result(False, "AUTH_ATTEMPTS_EXCEEDED"),
+                CloseConnection("AUTH_ATTEMPTS_EXCEEDED"),
+            )
         try:
             source = _parse_json_object(payload)
         except AdmissionRejection as exc:
@@ -1205,8 +1238,11 @@ class AdmissionSession:
 
         self._verifier.credentials[credential.credential_id] = credential
         if self._options.bootstrap_registration and self._bootstrap_credential_id is None:
-            # 空清单自举: 只绑定到本会话内存, 不写仓库变量、不落盘、不打印公钥
+            # 空清单自举: 绑定到本进程内存, 并回写到作业临时目录的允许清单,
+            # 让同一会话后续的网页连接(每次连接一个新准入进程)可直接用同一设备进入.
+            # 只写公钥与凭据标识, 不写仓库变量、不打印公钥、不进制品.
             self._bootstrap_credential_id = credential.credential_id
+            self._persist_credential(credential)
             self._logger.log(
                 "INFO",
                 "admission.bootstrap_registered",
@@ -1293,6 +1329,8 @@ class AdmissionSession:
         self._terminal = terminal
         self._state = "admitted"
         self._failed_attempts = 0
+        # 在连标记: 空闲看门狗据此把网页访客计入「在连人数」
+        self._mark_presence()
         self._logger.log(
             "INFO",
             "admission.terminal.opened",
@@ -1337,6 +1375,26 @@ class AdmissionSession:
             )
             self._close(reason)
             return (self._send_auth_result(False, reason), CloseConnection("AUTH_ATTEMPTS_EXCEEDED"))
+
+        # 跨连接的失败计数: 同一会话每次网页连接都会新起一个准入进程, 单连接上限挡不住反复重试.
+        # 用作业临时目录里的时间戳文件做滑窗, 超过全会话上限即关闭本次准入并把状态留给后续进程.
+        shared_attempts = self._record_failure(time.time())
+        if shared_attempts >= self._options.global_max_attempts:
+            self._logger.log(
+                "ERROR",
+                "admission.auth.blocked",
+                "全局限定时间窗内失败次数超过上限, 关闭本次准入",
+                session_id=self.session_id,
+                reason=reason,
+                window_seconds=int(self._options.failure_window_seconds),
+                window_attempts=shared_attempts,
+                stage="auth",
+            )
+            self._close("AUTH_ATTEMPTS_EXCEEDED")
+            return (
+                self._send_auth_result(False, "AUTH_ATTEMPTS_EXCEEDED"),
+                CloseConnection("AUTH_ATTEMPTS_EXCEEDED"),
+            )
         return (self._send_auth_result(False, reason),)
 
     def _send_auth_result(self, ok: bool, reason: str) -> SendFrame:
@@ -1366,6 +1424,7 @@ class AdmissionSession:
         if self._terminal is not None:
             self._terminal.close()
             self._terminal = None
+        self._clear_presence()
         self._logger.log(
             "INFO",
             "admission.connection.closed",
@@ -1375,6 +1434,173 @@ class AdmissionSession:
             stage="close",
         )
         return CloseConnection(reason)
+
+    # ---------- 跨连接状态 ----------
+    def _presence_path(self) -> str | None:
+        """在连标记路径; 未配置状态目录时返回 None, 空闲看门狗就不把网页计入在连."""
+        if not self._options.state_dir:
+            return None
+        return os.path.join(self._options.state_dir, "web-presence", f"admission-{os.getpid()}.present")
+
+    def _mark_presence(self) -> None:
+        """准入成功后写标记; 标记存在期间视为有网页访客在连."""
+        path = self._presence_path()
+        if path is None:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(f"{self.session_id}\n")
+        except OSError:
+            self._logger.log(
+                "WARNING",
+                "admission.presence.failed",
+                "写入网页在连标记失败, 空闲判定会少算这一路",
+                session_id=self.session_id,
+                stage="presence",
+            )
+
+    def _clear_presence(self) -> None:
+        """移除在连标记; 文件已不存在也视为成功, 收尾阶段不因它失败."""
+        path = self._presence_path()
+        if path is None:
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def _reset_admission(self, now: float) -> None:
+        """释放上一条终端并回到未准入状态; 供浏览器重新打开链接时复用同一准入进程."""
+        if self._terminal is not None:
+            self._terminal.close()
+            self._terminal = None
+        self._clear_presence()
+        self._state = "awaiting"
+        self._pending = None
+        self._consumed.clear()
+        self._failed_attempts = 0
+        self._started_at = now
+        self._logger.log(
+            "INFO",
+            "admission.reentered",
+            "检测到重新进入, 已释放上一条终端并重新发起准入",
+            session_id=self.session_id,
+            stage="reenter",
+        )
+
+    def _failure_log_path(self) -> str | None:
+        """跨连接失败时间戳文件路径; 未配置状态目录时不落盘."""
+        if not self._options.state_dir:
+            return None
+        return os.path.join(self._options.state_dir, "webauthn-failures.json")
+
+    def _read_failure_stamps(self, path: str) -> list[float]:
+        """读取失败时间戳并按窗口过滤; 文件损坏按空列表处理, 不阻断准入."""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        cutoff = time.time() - self._options.failure_window_seconds
+        return [float(item) for item in raw if isinstance(item, (int, float)) and float(item) >= cutoff]
+
+    def _record_failure(self, now_wall: float) -> int:
+        """
+        记录一次失败并返回窗口内失败数.
+
+        用文件锁串行化多个准入进程的写入, 文件里只存时间戳, 不含任何凭据或公钥.
+        """
+        path = self._failure_log_path()
+        if path is None:
+            return 0
+        try:
+            with open(path + ".lock", "a", encoding="utf-8") as lock_fh:
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)
+                stamps = self._read_failure_stamps(path)
+                stamps.append(now_wall)
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(stamps, fh)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, path)
+                return len(stamps)
+        except OSError:
+            return 0
+
+    def _window_failure_count(self) -> int:
+        """只看不写: 判断当前窗口内失败数是否已达全会话上限."""
+        path = self._failure_log_path()
+        if path is None:
+            return 0
+        return len(self._read_failure_stamps(path))
+
+    def _persist_credential(self, credential: AllowedCredential) -> None:
+        """
+        把自举注册的凭据写回允许清单文件.
+
+        只写凭据标识、CBOR 公钥与传输方式, 不写私钥, 不打印公钥, 不进入制品或摘要.
+        """
+        path = self._options.allowed_credentials_path
+        if not path:
+            return
+        try:
+            raw_public_key = _fido2_api().cbor.encode(dict(credential.public_key))
+        except (TypeError, ValueError):
+            self._logger.log(
+                "WARNING",
+                "admission.credential.persist_failed",
+                "公钥重新编码失败, 本次自举只在当前进程生效",
+                session_id=self.session_id,
+                stage="registration",
+            )
+            return
+        entry = {
+            "credential_id": b64url_encode(credential.credential_id),
+            "public_key": b64url_encode(bytes(raw_public_key)),
+            "transports": list(credential.transports),
+        }
+        try:
+            with open(path + ".lock", "a", encoding="utf-8") as lock_fh:
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        existing = json.load(fh)
+                except (OSError, ValueError):
+                    existing = []
+                if not isinstance(existing, list):
+                    existing = []
+                if any(
+                    isinstance(item, dict) and item.get("credential_id") == entry["credential_id"]
+                    for item in existing
+                ):
+                    return
+                existing.append(entry)
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(existing, fh, ensure_ascii=False)
+                    fh.write("\n")
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, path)
+        except OSError:
+            self._logger.log(
+                "WARNING",
+                "admission.credential.persist_failed",
+                "允许清单回写失败, 本次自举只在当前进程生效",
+                session_id=self.session_id,
+                stage="registration",
+            )
+            return
+        self._logger.log(
+            "INFO",
+            "admission.credential.persisted",
+            "自举公钥已写回允许清单, 同一会话的后续网页连接可直接准入",
+            session_id=self.session_id,
+            credential_id_prefix=b64url_encode(credential.credential_id)[:8],
+            stage="registration",
+        )
 
 
 def _extract_challenge_text(source: Mapping[str, Any]) -> str:
@@ -1643,6 +1869,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--challenge-ttl", type=float, default=DEFAULT_CHALLENGE_TTL_SECONDS, help="挑战有效期秒数")
     parser.add_argument("--auth-timeout", type=float, default=DEFAULT_AUTH_TIMEOUT_SECONDS, help="整体准入超时秒数")
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS, help="同一连接允许的失败次数上限")
+    parser.add_argument("--state-dir", default="", help="跨连接状态目录: 网页在连标记与失败计数; 留空表示不落盘")
     parser.add_argument("--run-id", default=None, help="日志 run_id, 缺省取 GITHUB_RUN_ID 或时间戳")
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO", help="日志级别")
     parser.add_argument("--log-dir", default=None, help="日志目录; 缺省写 stderr, 指定后写 <log-dir>/<run_id>.jsonl")
@@ -1721,6 +1948,8 @@ def run(args: argparse.Namespace, logger: JsonLogger) -> int:
         auth_timeout_seconds=args.auth_timeout,
         max_attempts=args.max_attempts,
         user_verification=args.user_verification,
+        state_dir=args.state_dir,
+        allowed_credentials_path=args.allowed_credentials,
     )
     session = AdmissionSession(
         options=options,

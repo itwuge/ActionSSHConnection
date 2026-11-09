@@ -21,6 +21,7 @@ if [ -n "$workdir" ] && [ -f "$workdir/bridge.pid" ]; then
 fi
 pkill -f "scripts/start_web_bridge.py" >/dev/null 2>&1 || true
 pkill -f "scripts/web_admission.py" >/dev/null 2>&1 || true
+pkill -f "scripts/action/idle-watch.sh" >/dev/null 2>&1 || true
 rm -rf "${RUNNER_TEMP:-/tmp}/actssh-web-bridge-venv"
 tmux kill-session -t "$session_name" >/dev/null 2>&1 || true
 if [ -n "$workdir" ]; then rm -rf -- "$workdir"; fi

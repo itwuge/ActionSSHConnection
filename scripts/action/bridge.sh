@@ -81,8 +81,10 @@ if ! "$venv/bin/pip" install --quiet --disable-pip-version-check \
   unavailable bridge-connect "网页桥接或准入依赖安装失败（websockets/fido2）"
 fi
 
-# 准入命令走同一虚拟环境；凭据标识为空时开放注册引导，由浏览器首次注册生成
-admission="$venv/bin/python $scripts_dir/web_admission.py --session-id $session_id --tmux-session $session_name --allowed-credentials $workdir/webauthn-allowed.json"
+# 准入命令走同一虚拟环境；凭据标识为空时开放注册引导，由浏览器首次注册生成。
+# --state-dir 让准入进程把「网页在连标记」「跨连接失败计数」「自举后的公钥回写」放进作业临时目录，
+# 使同一会话内浏览器断开重开仍可用同一设备直接进入，并让空闲看门狗把网页访客计入在连人数。
+admission="$venv/bin/python $scripts_dir/web_admission.py --session-id $session_id --tmux-session $session_name --allowed-credentials $workdir/webauthn-allowed.json --state-dir $workdir"
 if [ -z "${credential_id:-}" ]; then
   admission="$admission --allow-registration"
 fi

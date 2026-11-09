@@ -41,6 +41,11 @@ case "$session_minutes" in
   ''|*[!0-9]*) fail precheck "session-minutes 必须是正整数" ;;
 esac
 [ "$session_minutes" -gt 0 ] || fail precheck "session-minutes 必须大于 0"
+idle_minutes="${ACTSSH_IDLE_MINUTES:-10}"
+case "$idle_minutes" in
+  ''|*[!0-9]*) fail precheck "idle-minutes 必须是正整数" ;;
+esac
+[ "$idle_minutes" -gt 0 ] || fail precheck "idle-minutes 必须大于 0"
 
 command -v jq >/dev/null 2>&1 || fail precheck "运行器缺少 jq"
 command -v python3 >/dev/null 2>&1 || fail precheck "运行器缺少 python3"

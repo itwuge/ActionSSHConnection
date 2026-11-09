@@ -57,6 +57,11 @@ on:
         type: string
         required: false
         default: "45"
+      idle-minutes:
+        description: "空闲上限：SSH 与网页合计无人连接超过该分钟数即结束会话"
+        type: string
+        required: false
+        default: "10"
       allowed-credentials:
         description: "网页准入允许清单（单行 JSON 数组）"
         type: string
@@ -153,6 +158,7 @@ jobs:
           known-hosts: ${{ inputs.known-hosts }}
           ssh-user: ${{ inputs.ssh-user }}
           session-minutes: ${{ inputs.session-minutes }}
+          idle-minutes: ${{ inputs.idle-minutes }}
           allowed-credentials: ${{ inputs.allowed-credentials }}
           credential-id: ${{ inputs.credential-id }}
           upterm-version: ${{ inputs.upterm-version }}

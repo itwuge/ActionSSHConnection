@@ -20,6 +20,14 @@
 
 网页通道另需 `WEB_BRIDGE_BASE_URL`（如 `wss://wuge.fun`）与 `WEBAUTHN_ALLOWED_CREDENTIALS`（单行 JSON，`[]` 表示开放一次自举注册）。字段与排查见 [docs/接入指南.md](docs/接入指南.md)。
 
+常用可选输入：
+
+| 输入 | 默认 | 说明 |
+| --- | --- | --- |
+| `session-minutes` | `45` | 会话最长存活分钟数，不得超过 45（job 超时固定 55） |
+| `idle-minutes` | `10` | 无人连接（SSH + 网页合计）超过该分钟数即结束会话；不得大于 `session-minutes` |
+| `ssh-user` | `itwuge` | 只放行该 GitHub 账号登记的公钥 |
+
 > `ssh` 默认是 `false`：只做前置校验、不建立会话。要真正拿到会话必须显式写 `ssh: true`。
 
 ## 两种接入方式
@@ -40,7 +48,9 @@ SSH 访客 ──ssh──▶ 中继 ssh.wuge.fun:2222 (uptermd) ◀──反连
 
 - runner 无入站端口：SSH 侧由 `upterm host` 主动反连中继；网页侧由 `start_web_bridge.py` 反连 `wss://<中继>/runner/<session_id>`，准入脚本 `web_admission.py` 验签后把字节流接到同一个 tmux 会话。
 - 日志与摘要只输出 9 个公开路由字段：`session_id`、`ssh_user`、`relay_host`、`relay_port`、`web_url`、`pubkey_fingerprint`、`expires_at`、`pubkey_credential_id`、`path_mode`。客户端原始 JSON、连接串、公钥内容不外显。
-- 会话由 `session-minutes`（默认 45）限时；无人接入时 `join-timeout`（10 分钟）先结束。
+- **会话存活期内可反复进入**：断开（关客户端、断网、SSH 里 `exit`）后用同一连接串重连即可，不需要重新触发 workflow；网页重新打开同一链接，已注册设备直接进。
+- 会话只在四种情况下结束：显式结束（`upterm session stop actssh`）、空闲超时（`idle-minutes`，默认 10 分钟，SSH 与网页合计）、会话上限（`session-minutes`，默认 45）、作业上限（55 分钟）。结束后重连一律被拒。
+- 失败尝试上限（防爆破）：网页单连接 3 次、全会话 10 次 / 10 分钟滑窗，超限只在窗口内拒绝新尝试，不结束会话；SSH 认证在中继侧完成，runner 看不到失败次数，需要限速请在中继或前置网关做。
 
 ## 前置条件与安全边界（摘要）
 
