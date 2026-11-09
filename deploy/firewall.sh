@@ -90,6 +90,7 @@ show_usage() {
   --rate-limit-ssh              对 SSH 与 WS 入口启用按源限速, 仅 ufw 后端有效
   --nft-conf <path>             nftables 主配置路径
   --nft-ruleset <path>          规则文件路径
+  --dry-run                     与缺省行为一致, 只做演练
   --apply                       实际应用; 缺省只做演练
   -h, --help                    打印本说明
 USAGE
@@ -177,6 +178,7 @@ _parse_args() {
             --rate-limit-ssh) RATE_LIMIT_SSH=1; shift ;;
             --nft-conf) NFT_CONF="${2:?缺少 --nft-conf 取值}"; shift 2 ;;
             --nft-ruleset) NFT_RULESET="${2:?缺少 --nft-ruleset 取值}"; shift 2 ;;
+            --dry-run) APPLY=0; shift ;;
             --apply) APPLY=1; shift ;;
             -h|--help) show_usage; exit 0 ;;
             *) printf '[ERROR] 未知参数: %s\n' "$1" >&2; exit 2 ;;

@@ -38,6 +38,7 @@ set -Eeuo pipefail
 #   _listen_ok <port> -> 0/1: 判断本地端口是否有监听
 #   _read_metrics -> 0/1: 拉取指标文本
 #   _active_routes <body> -> 0/1: 解析活动路由数
+#   _cpu_quota_usec <v> -> 0: 把 CPUQuota 字面值换算为微秒
 #   _session_files -> 0: 输出 JSON 数组
 #   _resource_limits -> 0/1: 输出资源上限 JSON 与是否达标
 #   _journal_cap -> 0: 输出 journald 容量 JSON 与是否达标
@@ -218,15 +219,32 @@ _read_metrics() {
 }
 
 _active_routes() {
-    # 用途: 从指标文本解析活动路由数
+    # 用途: 从指标文本解析活动路由数; v0.41.1 实际指标带 upterm_uptermd_ 前缀且没有 routing_active_connections_count
     # 参数: $1 指标文本
-    # 返回: 标准输出整数; 退出码: 0 成功; 1 指标缺失
-    local body="$1" value
-    value="$(printf '%s\n' "$body" | awk '$1 == "routing_active_connections_count" { v = $2 } END { if (v != "") print v }')"
-    if [[ -z "$value" ]]; then
-        return 1
+    # 返回: 标准输出整数; 退出码: 0 成功; 1 候选指标均缺失
+    local body="$1" name value
+    for name in routing_active_connections_count \
+        upterm_uptermd_routing_active_connections_count \
+        upterm_uptermd_sessions_active_count; do
+        value="$(printf '%s\n' "$body" | awk -v n="$name" '$1 == n { v = $2 } END { if (v != "") print v }')"
+        if [[ -n "$value" ]]; then
+            printf '%s' "$value"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_cpu_quota_usec() {
+    # 用途: 把 CPUQuotaPerSecUSec 字面值统一换算为微秒, 兼容 1500000 与 1.5s 与 1.500000s
+    # 参数: $1 systemctl 输出的字面值
+    # 返回: 标准输出微秒整数
+    local v="$1"
+    if [[ "$v" == *s ]]; then
+        awk -v v="${v%s}" 'BEGIN { printf "%.0f", v * 1000000 }'
+        return 0
     fi
-    printf '%s' "$value"
+    printf '%s' "$v"
 }
 
 _session_files() {
@@ -259,14 +277,15 @@ _resource_limits() {
     # 用途: 读取单元资源上限并判断是否与设计一致
     # 参数: 无
     # 返回: 标准输出 JSON 对象; 退出码: 0 达标; 1 未达标
-    local mem cpu tasks ok=true
+    local mem cpu tasks cpu_usec ok=true
     mem="$(systemctl show -p MemoryMax --value "$UNIT_NAME")" || return 1
     cpu="$(systemctl show -p CPUQuotaPerSecUSec --value "$UNIT_NAME")" || return 1
     tasks="$(systemctl show -p TasksMax --value "$UNIT_NAME")" || return 1
+    cpu_usec="$(_cpu_quota_usec "$cpu")"
     if [[ "$mem" != "1073741824" && "$mem" != "1G" ]]; then
         ok=false
     fi
-    if [[ "$cpu" != "1500000" && "$cpu" != "1.5s" ]]; then
+    if [[ "$cpu_usec" != "1500000" ]]; then
         ok=false
     fi
     if [[ "$tasks" != "512" ]]; then

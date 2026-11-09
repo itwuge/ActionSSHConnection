@@ -56,7 +56,7 @@ set -Eeuo pipefail
 #   _apply_journald_limits -> 0/8: 写入并生效 journald 上限
 #   _port_in_use <addr> -> 0/1: 判断监听端口是否已被占用
 #   _metrics_url -> 0: 由指标监听地址生成环回访问地址
-#   _metric_value <name> -> 0/1: 读取单个指标值
+#   _active_routes_value -> 0/1: 按候选指标名读取活动路由数
 #   _restart_service -> 0/8/9: 按变更情况启停并等待监听就绪
 #   _verify_empty_routes -> 0/10: 重启后确认内存路由为空
 #   _verify_no_disk_write -> 0/10: 确认运行期未落盘会话文件
@@ -526,16 +526,37 @@ _metrics_url() {
     printf 'http://%s:%s/metrics' "$host" "$port"
 }
 
-_metric_value() {
-    # 用途: 从 Prometheus 指标中读取单个未带标签的指标值
-    # 参数: $1 指标名
-    # 返回: 标准输出指标值; 退出码: 0 成功; 1 指标不可用或缺失
-    local name="$1" url body
+_active_routes_value() {
+    # 用途: 读取活动路由数; v0.41.1 实际指标带 upterm_uptermd_ 前缀且没有 routing_active_connections_count
+    # 参数: 无
+    # 返回: 标准输出指标值; 退出码: 0 成功; 1 指标不可用或候选名均缺失
+    local url body name value
     url="$(_metrics_url)"
     if ! body="$(curl -fsS --connect-timeout 2 --max-time 5 "$url")"; then
         return 1
     fi
-    printf '%s\n' "$body" | awk -v n="$name" '$1 == n { v = $2 } END { if (v == "") exit 1; print v }'
+    for name in routing_active_connections_count \
+        upterm_uptermd_routing_active_connections_count \
+        upterm_uptermd_sessions_active_count; do
+        value="$(printf '%s\n' "$body" | awk -v n="$name" '$1 == n { v = $2 } END { if (v != "") print v }')"
+        if [[ -n "$value" ]]; then
+            printf '%s' "$value"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_cpu_quota_usec() {
+    # 用途: 把 CPUQuotaPerSecUSec 字面值统一换算为微秒, 兼容 1500000 与 1.5s 与 1.500000s
+    # 参数: $1 systemctl 输出的字面值
+    # 返回: 标准输出微秒整数
+    local v="$1"
+    if [[ "$v" == *s ]]; then
+        awk -v v="${v%s}" 'BEGIN { printf "%.0f", v * 1000000 }'
+        return 0
+    fi
+    printf '%s' "$v"
 }
 
 _restart_service() {
@@ -591,7 +612,7 @@ _verify_empty_routes() {
         return 0
     fi
     for (( attempt = 1; attempt <= CHECK_WAIT_ATTEMPTS; attempt++ )); do
-        if value="$(_metric_value routing_active_connections_count)"; then
+        if value="$(_active_routes_value)"; then
             if [[ "$value" == "0" ]]; then
                 _log INFO "deploy.routes.empty" "重启后路由为空" "{\"attempt\":${attempt}}"
                 return 0
@@ -642,7 +663,7 @@ _verify_limits() {
     # 用途: 确认单元的内存, CPU 与任务数上限已由 systemd 生效
     # 参数: 无
     # 返回: 无; 退出码: 0 或 11
-    local mem cpu tasks
+    local mem cpu tasks cpu_usec
     if (( DRY_RUN == 1 )); then
         _say "演练: 核对 MemoryMax=1G, CPUQuota=150%, TasksMax=512 已生效"
         return 0
@@ -656,7 +677,8 @@ _verify_limits() {
     if [[ "$mem" != "1073741824" && "$mem" != "1G" ]]; then
         _die 11 "deploy.limits.memory" "MemoryMax 与设计不符: actual=${mem}"
     fi
-    if [[ "$cpu" != "1500000" && "$cpu" != "1.5s" ]]; then
+    cpu_usec="$(_cpu_quota_usec "$cpu")"
+    if [[ "$cpu_usec" != "1500000" ]]; then
         _die 11 "deploy.limits.cpu" "CPUQuota 与设计不符: actual=${cpu}"
     fi
     if [[ "$tasks" != "512" ]]; then
