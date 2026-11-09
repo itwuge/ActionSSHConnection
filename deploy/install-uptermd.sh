@@ -2,7 +2,7 @@
 # =========** 文件头 =========**
 # 文件        : install-uptermd.sh
 # 所属目录    : deploy/
-# 文件用途    : 在 Ubuntu 主机上幂等地部署或升级自托管 uptermd, 落地无状态字节转发所需的最小面: 系统用户, 目录权限, 主机密钥, 环境文件, systemd 单元, journald 上限, 禁落盘与空路由自检
+# 文件用途    : 在 Ubuntu 主机上幂等地部署或升级自托管 uptermd, 落地无状态字节转发所需的最小面: 系统用户, 目录权限, 主机密钥, 环境文件, systemd 单元, 可选 journald 上限, 禁落盘与空路由自检
 # 架构定位    : 运维部署层; 上游是运维人员手工执行, 下游是 systemd 托管的 uptermd 进程与 relay 客户端
 # 核心功能    : 依赖校验, 系统用户与目录准备, 主机密钥生成, 发布包下载与哈希校验, 二进制安装与版本核对, 环境文件与单元写入, 服务启停, 监听与资源上限核对, 重启后空路由自检, 禁落盘校验
 # 职责边界    : 不改系统 sshd 端口, 不改云安全组, 不登记任何宿主或访客公钥, 不写 authorized_keys, 不做密钥轮换, 不应用防火墙规则; 22 端口被占用时只报错并给出处置提示, 不自动迁移
@@ -24,6 +24,8 @@
 #               UPTERMD_RUNTIME_DIR      运行期内存目录, 默认 /run/uptermd; 只允许该目录可写
 #               UPTERMD_HANDSHAKE_TIMEOUT 握手超时, 默认 60s
 #               UPTERMD_CHECK_WAIT_ATTEMPTS 自检等待次数, 默认 10
+#               UPTERMD_JOURNALD_MAX     可选 journald SystemMaxUse, 默认空; 为空时不写片段也不重启 journald,
+#                                        因为中继可能与其他服务共用一台机, 全局封顶会影响同机其它服务
 #               UPTERMD_UNIT_PATH        systemd 单元安装路径, 默认 /etc/systemd/system/uptermd.service
 #               UPTERMD_UNIT_SRC         单元模板路径, 默认与本脚本同目录的 uptermd.service
 #               UPTERMD_DEPLOY_LOG_DIR   部署日志根目录, 默认 /var/log/uptermd-deploy/logs
@@ -84,6 +86,7 @@ FETCH_ATTEMPTS="${UPTERMD_FETCH_ATTEMPTS:-3}"
 START_WAIT_ATTEMPTS="${UPTERMD_START_WAIT_ATTEMPTS:-15}"
 START_WAIT_INTERVAL_S="${UPTERMD_START_WAIT_INTERVAL_S:-1}"
 CHECK_WAIT_ATTEMPTS="${UPTERMD_CHECK_WAIT_ATTEMPTS:-10}"
+JOURNALD_MAX="${UPTERMD_JOURNALD_MAX:-}"
 
 # 单元模板默认取脚本同目录, 不依赖调用者工作目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -130,6 +133,7 @@ log_usage() {
   --unit-path <path>        systemd 单元安装路径
   --unit-src <path>         单元模板路径
   --log-dir <path>          部署日志根目录
+  --journald-max <size>     可选, 写 journald SystemMaxUse 并重启 journald, 如 200M; 缺省不写不改
   --dry-run                 只打印将要执行的动作, 不写盘不启停
   -h, --help                打印本说明
 USAGE
@@ -224,6 +228,7 @@ _parse_args() {
             --unit-path) UNIT_PATH="${2:?缺少 --unit-path 取值}"; shift 2 ;;
             --unit-src) UNIT_SRC="${2:?缺少 --unit-src 取值}"; shift 2 ;;
             --log-dir) LOG_DIR="${2:?缺少 --log-dir 取值}"; shift 2 ;;
+            --journald-max) JOURNALD_MAX="${2:?缺少 --journald-max 取值}"; shift 2 ;;
             --dry-run) DRY_RUN=1; shift ;;
             -h|--help) log_usage; exit 0 ;;
             *) printf '[ERROR] 未知参数: %s\n' "$1" >&2; exit 2 ;;
@@ -477,10 +482,15 @@ _apply_file() {
 }
 
 _apply_journald_limits() {
-    # 用途: 写入 journald 保留量上限, 仅在该文件确实变化时重启 journald
+    # 用途: 仅在显式给出 --journald-max 时写入 journald 保留量上限; 缺省不动, 避免影响共用同一台机的其它服务
     # 参数: 无
     # 返回: 无; 退出码: 0 或 8
     local tmp="${TMP_DIR}/journald.conf" before="$CHANGED"
+    if [[ -z "$JOURNALD_MAX" ]]; then
+        _say "跳过 journald 上限: 未指定 --journald-max, 保持系统原有日志策略"
+        _log INFO "deploy.journald.skipped" "未指定 journald 上限, 不写片段" "{}"
+        return 0
+    fi
     if [[ ! -d "$JOURNALD_DROPIN_DIR" ]]; then
         if (( DRY_RUN == 1 )); then
             _say "演练: 将创建目录 ${JOURNALD_DROPIN_DIR}"
@@ -490,8 +500,8 @@ _apply_journald_limits() {
     fi
     printf '%s\n' \
         '[Journal]' \
-        '# 由 deploy/install-uptermd.sh 生成, 全局生效' \
-        'SystemMaxUse=200M' \
+        '# 由 deploy/install-uptermd.sh 按 --journald-max 生成, 全局生效' \
+        "SystemMaxUse=${JOURNALD_MAX}" \
         'SystemMaxFileSize=50M' \
         >"$tmp"
     _apply_file "$tmp" "$JOURNALD_DROPIN" 0644 root root

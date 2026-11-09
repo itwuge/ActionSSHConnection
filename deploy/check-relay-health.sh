@@ -4,7 +4,7 @@
 # 所属目录    : deploy/
 # 文件用途    : 检查中转机是否满足 v3 无状态判据: 重启后内存映射为空, 无会话文件落盘, 监听与资源上限生效
 # 架构定位    : 运维健康检查层; 上游是运维人员或自动化巡检, 下游是 systemd 单元与 uptermd 指标端点
-# 核心功能    : 单元状态, SSH/WS/指标监听, 活动路由数, 会话文件, 资源上限, journald 容量六类检查, 汇总为单行 JSON
+# 核心功能    : 单元状态, SSH/WS/指标监听, 活动路由数, 会话文件, 资源上限五类判定, journald 容量仅作提示, 汇总为单行 JSON
 # 职责边界    : 不重启服务, 不改配置, 不读取会话内容, 不判定访客身份; 只做只读探测
 # 运行环境    : Ubuntu 20.04 及以上, bash 5.x, 以 root 或有权限读取单元状态的账号执行
 # 依赖关系    : 依赖 systemctl, curl, jq, ss, find, awk; 由 deploy/README.md 的验证章节调用
@@ -18,7 +18,7 @@
 #               CH_RUNTIME_DIR     内存运行目录, 默认 /run/uptermd
 #               CH_UNIT            systemd 单元名, 默认 uptermd.service
 #               CH_JOURNAL_DROPIN  journald 上限片段, 默认 /etc/systemd/journald.conf.d/90-uptermd-limits.conf
-#               CH_JOURNAL_MAX     期望的 journald 上限字面量, 默认 200M
+#               CH_JOURNAL_MAX     journald 占用提示阈值, 默认 200M; 只告警, 不影响 ok 判定
 #               CH_LOG_DIR         检查日志根目录, 默认 /var/log/uptermd-deploy/logs
 # 退出码      : 0 全部判据通过; 1 判据未通过或状态取不到; 2 参数或依赖错误; 130/143 中断
 # 输出        : 标准输出恰好一行 JSON: {ok, message, error_code, data, confirm}
@@ -41,7 +41,7 @@ set -Eeuo pipefail
 #   _cpu_quota_usec <v> -> 0: 把 CPUQuota 字面值换算为微秒
 #   _session_files -> 0: 输出 JSON 数组
 #   _resource_limits -> 0/1: 输出资源上限 JSON 与是否达标
-#   _journal_cap -> 0: 输出 journald 容量 JSON 与是否达标
+#   _journal_cap -> 0: 输出 journald 容量 JSON, 仅提示不判定
 #   _emit <ok> <message> <error_code> <data_json> <confirm> -> 不返回
 #   _cleanup -> 0: 删除临时文件
 
@@ -316,9 +316,9 @@ _to_bytes() {
 }
 
 _journal_cap() {
-    # 用途: 读取 journald 上限配置与实际占用, 判断是否在 200M 内
+    # 用途: 读取 journald 上限配置与实际占用, 仅作提示; 中继可能与其他服务共用一台机, 全局封顶会影响别人, 故不计入判定
     # 参数: 无
-    # 返回: 标准输出 JSON 对象; 退出码: 0 达标; 1 未达标或无法读取
+    # 返回: 标准输出 JSON 对象; 退出码: 恒 0
     local configured="" usage_bytes=0 usage_text="" ok=false
     if [[ -f "$JOURNAL_DROPIN" ]]; then
         configured="$(awk -F= '$1 == "SystemMaxUse" { print $2 }' "$JOURNAL_DROPIN" | tail -n 1)"
@@ -337,11 +337,8 @@ _journal_cap() {
         --arg limit "$JOURNAL_MAX" --arg configured "$configured" \
         --arg usage "$usage_text" --argjson usage_bytes "$usage_bytes" \
         --argjson ok "$ok" \
-        '{limit:$limit,configured:$configured,usage:$usage,usage_bytes:$usage_bytes,within_cap:$ok}'
-    if [[ "$ok" == "true" ]]; then
-        return 0
-    fi
-    return 1
+        '{limit:$limit,configured:$configured,usage:$usage,usage_bytes:$usage_bytes,within_cap:$ok,advisory:true}'
+    return 0
 }
 
 # =========** 清理 =========**
@@ -426,14 +423,11 @@ if [[ -z "$limits_json" ]]; then
     limits_json='{}'
 fi
 
-journal_json="{}"
-journal_ok=false
-if journal_json="$(_journal_cap)"; then
-    journal_ok=true
-fi
+journal_json="$(_journal_cap)"
 if [[ -z "$journal_json" ]]; then
     journal_json='{}'
 fi
+journal_within_cap="$(printf '%s' "$journal_json" | jq -r '.within_cap // false')"
 
 listen_ok=false
 if [[ "$listen_ssh" == "true" && ( "$listen_ws" == "true" || "$listen_ws_backend" == "true" ) ]]; then
@@ -478,10 +472,11 @@ if [[ "$limits_ok" != "true" ]]; then
     _log ERROR "health.limits.invalid" "资源上限与设计不符" "{}"
     _emit false "资源上限与设计不符, 需核对单元文件与 systemd 版本" "RELAY_LIMITS_INVALID" "$data" "$confirm"
 fi
-if [[ "$journal_ok" != "true" ]]; then
-    _log ERROR "health.journal.invalid" "journald 上限或占用不达标" "{}"
-    _emit false "journald 上限未配置为 ${JOURNAL_MAX} 或实际占用超限" "RELAY_JOURNAL_INVALID" "$data" "$confirm"
+if [[ "$journal_within_cap" != "true" ]]; then
+    # 中继可能与非中继服务共用一台机, 全局封顶会影响别人, 这里只提示不拦截
+    _say "[WARN] journald 容量仅作提示, 不影响判定: max=${JOURNAL_MAX} usage=$(printf '%s' "$journal_json" | jq -r '.usage // "unknown"')"
+    _log WARN "health.journal.advisory" "journald 容量超出提示阈值, 不影响判定" "{}"
 fi
 
 _log INFO "health.run.finished" "全部判据通过" "{\"active_routes\":0}"
-_emit true "中转运行正常: 监听齐备, 路由为空, 无会话文件, 资源与日志上限生效" "" "$data" "$confirm"
+_emit true "中转运行正常: 监听齐备, 路由为空, 无会话文件, 资源上限生效" "" "$data" "$confirm"
