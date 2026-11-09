@@ -7,18 +7,18 @@ name: 调试会话
 #   1) workflow_dispatch：布尔输入 start_session，默认 false
 #   2) repository_dispatch：event_type 固定 start-session，client_payload.keyword 固定 start-session
 #
-# 日志字段（9 项，均不得掩码、均不得取自 secrets）：
-#   relay_host / port / session_id / ssh_user / pubkey_fingerprint / expires_at /
-#   web_url / pubkey_credential_id / path_mode
+# 客户端：自建步骤调用 upterm 客户端（不走任何封装 action）。
+#   - 客户端原始输出（含 ticket 的连接串）只写入文件，stdout/stderr 一律重定向丢弃；
+#   - 日志与摘要只按白名单输出 9 项：relay_host / port / session_id / ssh_user /
+#     pubkey_fingerprint / expires_at / web_url / pubkey_credential_id / path_mode；
+#   - session_id 只取连接串用户名部分冒号前的片段，ticket 不进任何载体。
 #
 # 必需仓库变量（均为非秘密路由信息）：
-#   UPTERM_RELAY_KNOWN_HOST   中转主机 known_hosts 行（公钥，防中间人）
+#   UPTERM_RELAY_KNOWN_HOST   中继主机 known_hosts 行（公钥，防中间人）
 #   WEB_TERMINAL_BASE_URL     网页终端静态页地址（不含会话参数）
 #   WEBAUTHN_CREDENTIAL_ID    公钥凭据标识（WebAuthn credential id，公开标识）
 # 可选仓库变量：
 #   UPTERM_DIRECT_ENDPOINT    直连候选对端 host[:port]；不配即按「无可用对端地址」判直连失败
-#
-# 明确不做：不对连接块加 ::add-mask::；不开启 full-access / allow-exec / allow-forwarding。
 
 on:
   workflow_dispatch:
@@ -38,7 +38,13 @@ env:
   RELAY_HOST: relay.wuge.fun
   RELAY_PORT: "22"
   SSH_USER: itwuge
+  SESSION_NAME: actssh
   JOB_TIMEOUT_MINUTES: "45"
+  JOIN_TIMEOUT: 10m
+  UPTERM_VERSION: v0.41.1
+  UPTERM_ASSET: upterm_linux_amd64.tar.gz
+  UPTERM_SHA256: 3007d4ce09e9f70a390e1b52e5a0b591fc9fa473196ca76d8f72b5f1cd723b31
+  WORKDIR: ${{ runner.temp }}/actssh
   WEB_TERMINAL_BASE_URL: ${{ vars.WEB_TERMINAL_BASE_URL }}
   WEBAUTHN_CREDENTIAL_ID: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
   UPTERM_DIRECT_ENDPOINT: ${{ vars.UPTERM_DIRECT_ENDPOINT }}
@@ -66,16 +72,17 @@ jobs:
           DISPATCH_SENDER: ${{ github.event.sender.login }}
           DISPATCH_KEYWORD: ${{ github.event.client_payload.keyword || '' }}
           KNOWN_HOST: ${{ vars.UPTERM_RELAY_KNOWN_HOST }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
           if [ "$EVENT_NAME" = "repository_dispatch" ]; then
             if [ "${DISPATCH_KEYWORD:-}" != "start-session" ]; then
-              echo "拒绝：client_payload.keyword 必须为 start-session，实际为 ${DISPATCH_KEYWORD:-空}" >&2
+              echo "失败[阶段 precheck]：client_payload.keyword 必须为 start-session" >&2
               exit 1
             fi
             if [ "$DISPATCH_SENDER" != "$SSH_USER" ]; then
-              echo "拒绝：repository_dispatch 发起者不是 $SSH_USER" >&2
+              echo "失败[阶段 precheck]：repository_dispatch 发起者不是 $SSH_USER" >&2
               exit 1
             fi
           fi
@@ -85,13 +92,44 @@ jobs:
           [ -n "${WEB_TERMINAL_BASE_URL:-}" ] || missing="$missing WEB_TERMINAL_BASE_URL"
           [ -n "${WEBAUTHN_CREDENTIAL_ID:-}" ] || missing="$missing WEBAUTHN_CREDENTIAL_ID"
           if [ -n "$missing" ]; then
-            echo "缺少仓库变量：$missing" >&2
+            echo "失败[阶段 precheck]：缺少仓库变量$missing" >&2
+            exit 1
+          fi
+
+          install -m 700 -d "$WORKDIR"
+
+          # 中继主机公钥只用于防中间人，不作为授权依据
+          printf '%s\n' "$KNOWN_HOST" > "$WORKDIR/known_hosts"
+
+          # runner 侧访客公钥闸门：只放行该 GitHub 用户登记的公钥
+          gh api "users/$SSH_USER/keys" --paginate --jq '.[].key' > "$WORKDIR/authorized_keys" || {
+            echo "失败[阶段 fetch-keys]：取不到 $SSH_USER 的公钥" >&2
+            exit 1
+          }
+          if [ ! -s "$WORKDIR/authorized_keys" ]; then
+            echo "失败[阶段 fetch-keys]：$SSH_USER 未登记 SSH 公钥" >&2
+            exit 1
+          fi
+
+          fingerprints=""
+          while IFS= read -r key; do
+            [ -n "$key" ] || continue
+            fp="$(printf '%s\n' "$key" | ssh-keygen -lf /dev/stdin 2>/dev/null | awk '{print $2}')"
+            [ -n "$fp" ] || continue
+            fingerprints="${fingerprints:+$fingerprints,}$fp"
+          done < "$WORKDIR/authorized_keys"
+          if [ -z "$fingerprints" ]; then
+            echo "失败[阶段 fetch-keys]：公钥指纹计算失败" >&2
             exit 1
           fi
 
           # 到期时间按作业超时上限推算，误差为前置步骤耗时（数秒）
           expires_at="$(date -u -d "@$(( $(date +%s) + JOB_TIMEOUT_MINUTES * 60 ))" '+%Y-%m-%dT%H:%M:%SZ')"
-          echo "expires_at=$expires_at" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "fingerprints=$fingerprints"
+            echo "expires_at=$expires_at"
+          } >> "$GITHUB_OUTPUT"
 
       - name: 判定连接路径
         id: path
@@ -119,20 +157,75 @@ jobs:
           fi
           echo "path_mode=$mode" >> "$GITHUB_OUTPUT"
 
-      - name: 建立会话
-        id: upterm
-        uses: owenthereal/action-upterm@6c2d60e09009f59cb4c45c88767c78701f14d121 # v2.8.1
+      - name: 安装 upterm 客户端
         timeout-minutes: 5
-        with:
-          # 以 detached 模式启动，便于取得会话标识并在会话进行中输出 9 项字段；
-          # 作业内其余步骤结束后由本动作 post 步骤等待访客接入（10 分钟无人接入即结束）。
-          detached: true
-          upterm-server: ssh://relay.wuge.fun:22
-          # 上游参数保留；v3 认定准入由 runner 侧承担，runner 侧尚未实现，实际仍受该参数约束。
-          limit-access-to-users: itwuge
-          wait-timeout-minutes: 10
-          upterm-version: v0.41.1
-          known-hosts: ${{ vars.UPTERM_RELAY_KNOWN_HOST }}
+        run: |
+          set -euo pipefail
+
+          url="https://github.com/owenthereal/upterm/releases/download/${UPTERM_VERSION}/${UPTERM_ASSET}"
+          if ! curl -fsSL --retry 2 --max-time 120 -o "$WORKDIR/upterm.tar.gz" "$url"; then
+            echo "失败[阶段 install-client]：下载 $UPTERM_ASSET 失败" >&2
+            exit 1
+          fi
+
+          actual="$(sha256sum "$WORKDIR/upterm.tar.gz" | awk '{print $1}')"
+          if [ "$actual" != "$UPTERM_SHA256" ]; then
+            echo "失败[阶段 install-client]：校验和不匹配（$UPTERM_VERSION）" >&2
+            exit 1
+          fi
+
+          mkdir -p "$WORKDIR/bin"
+          tar -xzf "$WORKDIR/upterm.tar.gz" -C "$WORKDIR/bin" upterm || {
+            echo "失败[阶段 install-client]：解包失败" >&2
+            exit 1
+          }
+          chmod 700 "$WORKDIR/bin/upterm"
+          "$WORKDIR/bin/upterm" version >/dev/null 2>&1 || {
+            echo "失败[阶段 install-client]：客户端无法执行" >&2
+            exit 1
+          }
+          echo "$WORKDIR/bin" >> "$GITHUB_PATH"
+
+      - name: 启动会话
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+
+          # 客户端原始输出只落文件；stdout/stderr 全部重定向，绝不打印。
+          if ! upterm host \
+              --accept \
+              --detach \
+              --name "$SESSION_NAME" \
+              --server "ssh://${RELAY_HOST}:${RELAY_PORT}" \
+              --known-hosts "$WORKDIR/known_hosts" \
+              --authorized-keys "$WORKDIR/authorized_keys" \
+              --join-timeout "$JOIN_TIMEOUT" \
+              --no-sftp \
+              --pty-size 80x24 \
+              -o json > "$WORKDIR/session.json" 2> "$WORKDIR/session.err"; then
+            echo "失败[阶段 start-session]：客户端异常退出，原因见运行报告，具体输出不外显" >&2
+            exit 1
+          fi
+
+          if command -v jq >/dev/null 2>&1; then
+            ssh_command="$(jq -r '.sshCommand // .ssh_command // empty' "$WORKDIR/session.json" 2>/dev/null || true)"
+          else
+            ssh_command="$(tr -d '\n' < "$WORKDIR/session.json" | sed -n 's/.*"sshCommand"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+          fi
+          if [ -z "${ssh_command:-}" ]; then
+            echo "失败[阶段 linking]：未取得可接入的连接串，会话未完成注册" >&2
+            exit 1
+          fi
+
+          # 连接串只留在文件内，供下一步解析；不落日志
+          printf '%s' "$ssh_command" > "$WORKDIR/conn"
+          rm -f "$WORKDIR/session.json" "$WORKDIR/session.err"
+
+          # 会话存在性复核：只取退出码，不读输出
+          if ! upterm session info "$SESSION_NAME" >/dev/null 2>&1; then
+            echo "失败[阶段 linking]：会话未在中继登记" >&2
+            exit 1
+          fi
 
       - name: 准备共享终端
         timeout-minutes: 2
@@ -152,43 +245,47 @@ jobs:
         id: route
         timeout-minutes: 2
         env:
-          GH_TOKEN: ${{ github.token }}
           EXPIRES_AT: ${{ steps.precheck.outputs.expires_at }}
+          FINGERPRINTS: ${{ steps.precheck.outputs.fingerprints }}
           PATH_MODE: ${{ steps.path.outputs.path_mode }}
-          SSH_COMMAND: ${{ steps.upterm.outputs.ssh-command }}
         run: |
           set -euo pipefail
 
-          # 会话标识取自上游输出；上游当前形式为 ssh <会话标识>:<ticket>@<主机>，
-          # 只取冒号前部分，ticket 属上游凭据，不写入任何字段。
-          session_id="$(printf '%s' "$SSH_COMMAND" | sed -E 's/^ssh +([^@]+)@.*$/\1/' | cut -d: -f1)"
-          if [ -z "$session_id" ] || [ "$session_id" = "$SSH_COMMAND" ]; then
-            echo "无法从上游输出解析会话标识" >&2
+          if [ ! -s "$WORKDIR/conn" ]; then
+            echo "失败[阶段 parse-connection]：连接串文件为空" >&2
             exit 1
           fi
 
-          fingerprints=""
-          key_count=0
-          while IFS= read -r key; do
-            [ -n "$key" ] || continue
-            fp="$(printf '%s\n' "$key" | ssh-keygen -lf /dev/stdin 2>/dev/null | awk '{print $2}')"
-            [ -n "$fp" ] || continue
-            key_count=$((key_count + 1))
-            fingerprints="${fingerprints:+$fingerprints,}$fp"
-          done < <(gh api "users/$SSH_USER/keys" --paginate --jq '.[].key')
+          conn="$(cat "$WORKDIR/conn")"
+          case "$conn" in
+            ssh\ *@*) : ;;
+            *)
+              echo "失败[阶段 parse-connection]：连接串格式不符合预期" >&2
+              exit 1
+              ;;
+          esac
+          user_part="${conn#* }"       # 去掉前缀命令（ssh）
+          user_part="${user_part%%@*}" # 取 @ 前的用户名部分
+          session_id="${user_part%%:*}" # 只取冒号前片段，ticket 丢弃
 
-          if [ "$key_count" -eq 0 ]; then
-            echo "GitHub 用户 $SSH_USER 未登记 SSH 公钥，无法限定访客" >&2
+          if [ -z "$session_id" ]; then
+            echo "失败[阶段 parse-connection]：无法解析会话标识" >&2
             exit 1
           fi
+          case "$session_id" in
+            *[!A-Za-z0-9._-]*)
+              echo "失败[阶段 parse-connection]：会话标识含非法字符" >&2
+              exit 1
+              ;;
+          esac
 
-          fields="$(mktemp)"
+          fields="$WORKDIR/fields"
           {
             echo "relay_host=$RELAY_HOST"
             echo "port=$RELAY_PORT"
             echo "session_id=$session_id"
             echo "ssh_user=$SSH_USER"
-            echo "pubkey_fingerprint=$fingerprints"
+            echo "pubkey_fingerprint=$FINGERPRINTS"
             echo "expires_at=$EXPIRES_AT"
             echo "web_url=${WEB_TERMINAL_BASE_URL}#session_id=${session_id}"
             echo "pubkey_credential_id=$WEBAUTHN_CREDENTIAL_ID"
@@ -201,4 +298,42 @@ jobs:
             cat "$fields"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          rm -f "$fields"
+          rm -f "$fields" "$WORKDIR/conn"
+
+      - name: 等待会话结束
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+
+          # 退出钩子：先停会话（进程退出即会话消失），再清临时文件
+          cleanup() {
+            upterm session stop "$SESSION_NAME" >/dev/null 2>&1 || true
+            if [ -n "${WORKDIR:-}" ]; then rm -rf -- "$WORKDIR"; fi
+          }
+          trap cleanup EXIT INT TERM
+
+          # 无人接入 10 分钟后会话自行结束；有访客接入则持续到会话退出。
+          set +e
+          upterm session wait "$SESSION_NAME" >/dev/null 2>&1
+          rc=$?
+          set -e
+
+          # 会话已消失即视为正常收尾；仍存在说明未正常结束
+          if upterm session info "$SESSION_NAME" >/dev/null 2>&1; then
+            echo "失败[阶段 session-wait]：等待返回 $rc，但会话仍存在" >&2
+            exit 1
+          fi
+          echo "会话已结束（客户端返回码 $rc）"
+
+      - name: 收尾清理
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          upterm session stop "$SESSION_NAME" >/dev/null 2>&1 || true
+          if upterm session info "$SESSION_NAME" >/dev/null 2>&1; then
+            pkill -f "upterm host" >/dev/null 2>&1 || true
+          fi
+          tmux kill-session -t actssh >/dev/null 2>&1 || true
+          rm -rf "$WORKDIR"
+          echo "会话进程与临时文件已清理"
