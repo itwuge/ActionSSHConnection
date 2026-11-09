@@ -373,21 +373,31 @@ jobs:
             *) unavailable bridge-connect "WEB_BRIDGE_BASE_URL 只接受 ws:// 或 wss:// 地址" ;;
           esac
 
-          # 准入允许清单：只放公开的凭据标识与公钥，作业内生成、随作业销毁
+          # 准入允许清单：只放公开的凭据标识与公钥，作业内生成、随作业销毁。
+          # 空数组 [] 仅在开放注册（WEBAUTHN_CREDENTIAL_ID 为空）时合法，按单次自举注册运行。
           [ -n "${ALLOWED_JSON:-}" ] || unavailable bridge-admission "未配置 WEBAUTHN_ALLOWED_CREDENTIALS，准入无允许清单可用"
           printf '%s' "$ALLOWED_JSON" > "$WORKDIR/webauthn-allowed.json"
-          if ! python3 - "$WORKDIR/webauthn-allowed.json" <<'PY'
+          allow_empty=0
+          if [ -z "${CREDENTIAL_ID:-}" ]; then
+            allow_empty=1
+          fi
+          if ! python3 - "$WORKDIR/webauthn-allowed.json" "$allow_empty" <<'PY'
           import json, sys
           raw = json.load(open(sys.argv[1], encoding="utf-8"))
-          if not isinstance(raw, list) or not raw:
-              raise SystemExit("允许清单必须是非空数组")
+          if not isinstance(raw, list):
+              raise SystemExit("允许清单顶层必须是数组")
+          if not raw and sys.argv[2] != "1":
+              raise SystemExit("允许清单为空且未开放注册")
           for item in raw:
               if not isinstance(item, dict) or not item.get("credential_id") or not item.get("public_key"):
                   raise SystemExit("允许清单条目缺少 credential_id 或 public_key")
-          print(f"允许清单条目数 {len(raw)}")
+          if raw:
+              print(f"允许清单条目数 {len(raw)}")
+          else:
+              print("允许清单为空数组，按自举注册运行（本会话只接受首个注册）")
           PY
           then
-            unavailable bridge-admission "WEBAUTHN_ALLOWED_CREDENTIALS 不是合法非空 JSON 数组"
+            unavailable bridge-admission "WEBAUTHN_ALLOWED_CREDENTIALS 不是合法 JSON 数组，或空数组未配合开放注册"
           fi
 
           # 依赖装在 RUNNER_TEMP 虚拟环境里，避免宿主 Python 的 externally-managed 限制，也不占用制品目录
