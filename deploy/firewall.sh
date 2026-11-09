@@ -2,18 +2,23 @@
 # =========** 文件头 =========**
 # 文件        : firewall.sh
 # 所属目录    : deploy/
-# 文件用途    : 为中转机落地上网边界: 放行 uptermd 的 relay 端口, 把管理面 SSH 限到白名单来源, 阻断指标端口的非环回访问
+# 文件用途    : 为中转机落地上网边界: 放行 SSH 与 WS 入口, 对新连接做速率上限, 把管理面 SSH 限到白名单来源, 阻断指标端口的非环回访问
 # 架构定位    : 运维网络层; 上游是 deploy/README.md 的防火墙章节, 下游是 ufw 或 nftables 的入站策略
 # 核心功能    : 后端探测, 规则生成, 演练输出, 防锁死校验, 应用与持久化, 应用后核对
-# 职责边界    : 不改 sshd 配置, 不改云安全组, 不处理出站策略; 后端冲突时只报错不做两种管理器的合并
+# 职责边界    : 不改 sshd 配置, 不改云安全组, 不处理出站策略, 不做内容级审计; 后端冲突时只报错不做两种管理器的合并
 # 运行环境    : Ubuntu 20.04 及以上, bash 5.x, 以 root 执行, 需已装 ufw 或 nftables 之一
 # 依赖关系    : 依赖 ufw 或 nft, systemctl, jq, id, install; 由 deploy/README.md 的防火墙章节调用
 #
 # 输入        : 均可由同名环境变量预置, 命令行参数优先
 #               FW_BACKEND           auto 或 ufw 或 nftables, 默认 auto
-#               FW_RELAY_PORT        uptermd 对外端口, 默认 22
+#               FW_RELAY_PORT        uptermd SSH 对外端口, 默认 22
+#               FW_WS_PORT           WS 对外端口, 默认 443; 由 TLS 终止层监听并转发到环回 WS
 #               FW_ADMIN_PORT        管理面 SSH 端口, 默认 22022
 #               FW_METRICS_PORT      指标端口, 默认 9100
+#               FW_RELAY_RATE        SSH 新连接速率, 默认 20/second
+#               FW_RELAY_BURST       SSH 新连接突发量, 默认 40
+#               FW_WS_RATE           WS 新连接速率, 默认 20/second
+#               FW_WS_BURST          WS 新连接突发量, 默认 40
 #               FW_NFT_CONF          nftables 主配置路径, 默认 /etc/nftables.conf
 #               FW_NFT_RULESET       规则文件路径, 默认 /etc/uptermd/uptermd-guard.nft
 #               FW_DEPLOY_LOG_DIR    日志根目录, 默认 /var/log/uptermd-deploy/logs
@@ -40,8 +45,13 @@ set -Eeuo pipefail
 # =========** 常量与默认值 =========**
 BACKEND="${FW_BACKEND:-auto}"
 RELAY_PORT="${FW_RELAY_PORT:-22}"
+WS_PORT="${FW_WS_PORT:-443}"
 ADMIN_PORT="${FW_ADMIN_PORT:-22022}"
 METRICS_PORT="${FW_METRICS_PORT:-9100}"
+RELAY_RATE="${FW_RELAY_RATE:-20/second}"
+RELAY_BURST="${FW_RELAY_BURST:-40}"
+WS_RATE="${FW_WS_RATE:-20/second}"
+WS_BURST="${FW_WS_BURST:-40}"
 NFT_CONF="${FW_NFT_CONF:-/etc/nftables.conf}"
 NFT_RULESET="${FW_NFT_RULESET:-/etc/uptermd/uptermd-guard.nft}"
 LOG_DIR="${FW_DEPLOY_LOG_DIR:-/var/log/uptermd-deploy/logs}"
@@ -71,12 +81,13 @@ show_usage() {
 
 选项:
   --backend <auto|ufw|nftables> 指定后端
-  --relay-port <port>           uptermd 对外端口, 默认 22
+  --relay-port <port>           uptermd SSH 对外端口, 默认 22
+  --ws-port <port>              WS 对外端口, 默认 443
   --admin-port <port>           管理面 SSH 端口, 默认 22022
   --admin-cidr <cidr>           允许访问管理面的来源网段, 可重复
   --allow-admin-anywhere        管理面不限来源, 仅限临时排障
   --metrics-port <port>         指标端口, 默认 9100
-  --rate-limit-ssh              对 relay 端口启用按源限速, 仅 ufw 后端有效
+  --rate-limit-ssh              对 SSH 与 WS 入口启用按源限速, 仅 ufw 后端有效
   --nft-conf <path>             nftables 主配置路径
   --nft-ruleset <path>          规则文件路径
   --apply                       实际应用; 缺省只做演练
@@ -158,6 +169,7 @@ _parse_args() {
         case "$1" in
             --backend) BACKEND="${2:?缺少 --backend 取值}"; shift 2 ;;
             --relay-port) RELAY_PORT="${2:?缺少 --relay-port 取值}"; shift 2 ;;
+            --ws-port) WS_PORT="${2:?缺少 --ws-port 取值}"; shift 2 ;;
             --admin-port) ADMIN_PORT="${2:?缺少 --admin-port 取值}"; shift 2 ;;
             --admin-cidr) ADMIN_CIDRS+=("${2:?缺少 --admin-cidr 取值}"); shift 2 ;;
             --allow-admin-anywhere) ALLOW_ADMIN_ANYWHERE=1; shift ;;
@@ -171,7 +183,13 @@ _parse_args() {
         esac
     done
     if [[ "$RELAY_PORT" == "$ADMIN_PORT" ]]; then
-        _die 2 "firewall.args.conflict" "relay 端口与管理面端口相同, 需分开: port=${RELAY_PORT}"
+        _die 2 "firewall.args.conflict" "SSH 入口端口与管理面端口相同, 需分开: port=${RELAY_PORT}"
+    fi
+    if [[ "$WS_PORT" == "$ADMIN_PORT" || "$WS_PORT" == "$RELAY_PORT" ]]; then
+        _die 2 "firewall.args.conflict" "WS 入口端口不能与管理面或 SSH 入口相同: port=${WS_PORT}"
+    fi
+    if [[ "$METRICS_PORT" == "$RELAY_PORT" || "$METRICS_PORT" == "$WS_PORT" ]]; then
+        _die 2 "firewall.args.conflict" "指标端口不能与入口端口相同: port=${METRICS_PORT}"
     fi
     LOG_FILE="${LOG_DIR}/${RUN_ID}.jsonl"
 }
@@ -281,7 +299,8 @@ _apply_ufw() {
     else
         rule="allow"
     fi
-    _ufw_cmd "$rule" "$RELAY_PORT/tcp" comment 'uptermd relay'
+    _ufw_cmd "$rule" "$RELAY_PORT/tcp" comment 'uptermd ssh entry'
+    _ufw_cmd "$rule" "$WS_PORT/tcp" comment 'uptermd ws entry'
     _ufw_cmd deny "$METRICS_PORT/tcp" comment 'uptermd metrics loopback only'
     if (( APPLY == 1 )); then
         # --force 避免交互式确认, 否则脚本会挂在提示上
@@ -314,7 +333,15 @@ _render_nft() {
         printf '    iif lo accept\n'
         printf '    ct state established,related accept\n'
         printf '    ct state invalid drop\n'
+        # 新连接按全局速率上限放行, 超限直接丢弃; 阈值需按真机流量标定
+        printf '    tcp dport %s ct state new limit rate %s burst %s packets accept\n' \
+            "$RELAY_PORT" "$RELAY_RATE" "$RELAY_BURST"
+        printf '    tcp dport %s ct state new drop\n' "$RELAY_PORT"
         printf '    tcp dport %s accept\n' "$RELAY_PORT"
+        printf '    tcp dport %s ct state new limit rate %s burst %s packets accept\n' \
+            "$WS_PORT" "$WS_RATE" "$WS_BURST"
+        printf '    tcp dport %s ct state new drop\n' "$WS_PORT"
+        printf '    tcp dport %s accept\n' "$WS_PORT"
         if [[ -n "$cidr_list" ]]; then
             printf '    ip saddr { %s } tcp dport %s accept\n' "$cidr_list" "$ADMIN_PORT"
             printf '    tcp dport %s drop\n' "$ADMIN_PORT"
@@ -376,16 +403,21 @@ _verify() {
         return 0
     fi
     if [[ "$BACKEND" == "ufw" ]]; then
-        if ! ufw status verbose | grep -q "${RELAY_PORT}"; then
-            _die 5 "firewall.verify.relay" "核对失败: ufw 未显示 relay 端口放行 port=${RELAY_PORT}"
-        fi
+        for port in "$RELAY_PORT" "$WS_PORT"; do
+            if ! ufw status verbose | grep -q "${port}"; then
+                _die 5 "firewall.verify.entry" "核对失败: ufw 未显示入口端口放行 port=${port}"
+            fi
+        done
     else
-        if ! nft list table inet "$NFT_TABLE" | grep -q "dport ${RELAY_PORT}"; then
-            _die 5 "firewall.verify.relay" "核对失败: nftables 未显示 relay 端口放行"
-        fi
+        for port in "$RELAY_PORT" "$WS_PORT"; do
+            if ! nft list table inet "$NFT_TABLE" | grep -q "dport ${port}"; then
+                _die 5 "firewall.verify.entry" "核对失败: nftables 未显示入口端口规则 port=${port}"
+            fi
+        done
     fi
-    _say "核对通过: relay 端口 ${RELAY_PORT} 已放行, 管理面端口 ${ADMIN_PORT} 受来源限制, 指标端口 ${METRICS_PORT} 仅环回"
-    _log INFO "firewall.verify.ok" "规则核对通过" "{\"relay_port\":${RELAY_PORT}}"
+    _say "核对通过: SSH ${RELAY_PORT} 与 WS ${WS_PORT} 已放行并限速, 管理面端口 ${ADMIN_PORT} 受来源限制, 指标端口 ${METRICS_PORT} 仅环回"
+    _log INFO "firewall.verify.ok" "规则核对通过" \
+        "{\"relay_port\":${RELAY_PORT},\"ws_port\":${WS_PORT}}"
 }
 
 # =========** 清理 =========**
