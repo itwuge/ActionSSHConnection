@@ -405,6 +405,15 @@ _install_binary() {
     extract="${dir}/extract"
     desired="${VERSION#v}"
 
+    # 幂等: 现有二进制版本与目标一致时不再下载, 避免无谓替换与服务重启
+    if [[ -x "$BIN_PATH" ]]; then
+        local existing=""
+        if existing="$(_binary_version "$BIN_PATH" 2>/dev/null)" && [[ "$existing" == "$desired" ]]; then
+            _say "已安装 uptermd ${desired}, 跳过下载与替换"
+            return 0
+        fi
+    fi
+
     _fetch "${RELEASE_BASE}/${VERSION}/${asset}" "$tarball"
     want="$(_resolve_sha256 "$asset" "$dir")"
     got="$(sha256sum "$tarball" | awk '{print $1}')"

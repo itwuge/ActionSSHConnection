@@ -105,6 +105,8 @@ _pack() {
             exit 3
         fi
     done
+    # 打包前补齐执行位: 否则解包后 ./install.sh 与 bootstrap/*.sh 会因无执行权限失败
+    chmod 0755 "${RELAY_DIR}"/*.sh "${RELAY_DIR}/bootstrap"/*.sh
     mkdir -p "$OUT_DIR"
     local tar_path="${OUT_DIR}/${BUNDLE_NAME}-${VERSION}.tar.gz"
     if ! tar -czf "$tar_path" \

@@ -69,6 +69,20 @@ sudo ./install.sh --domain relay.example.com --email ops@example.com --apply
 
 未验证：公网域名 + 真实 ACME（webroot/standalone）未在干净机实跑，本轮用 self-signed 代替并如实标注；「宿主机已有 Docker 容器占用 80/443 → 退出码 8」是代码与主流程验证，未在干净机上复现该冲突现场。
 
+### 0.6 生产宿主接管实测（2026-11-10，47.109.32.249）
+
+已有手工部署的宿主 nginx（`/etc/nginx/conf.d` 6 个文件、两张 Let's Encrypt 证书）上执行：
+
+```bash
+sudo ./install.sh --domain wuge.fun --email 7111479@qq.com --cert-mode acme \
+  --www-alias --ssh-domain ssh.wuge.fun --web-root /var/www/actssh/html \
+  --nginx-mode host --admin-ssh-port 22 --relay-port 2222 --bridge-port 8081 --apply
+```
+
+结果：6 个配置文件全部「采用(规范化后等价)」，未写入任何文件（mtime 保持接管前）；两张证书序列号不变；nginx master PID 不变（仅 graceful reload 换 worker，80/443 无中断）；uptermd「本次是否变更: 0」；连跑两次快照除 worker PID 外无差异。公网复测：`/t/` 200、`/ws/` 与 `/runner/` 101、`wuge.fun`/`ssh.wuge.fun` 证书序列号与本地一致、2222 建会话登入成功。`--skip-firewall` 用于保持宿主防火墙原状态（ufw 原本 inactive）。
+
+接管踩到的两个坑（已修）：host 模式校验必须用默认前缀 `nginx -t`，加 `-p` 会把 `load_module` 相对路径改到 `/etc/nginx/modules` 而误报模块缺失；自检的 nginx 单元在 host 模式下应为 `nginx.service` 而非 `actssh-nginx.service`。
+
 ## 1. 准入核实结论
 
 结论：`uptermd` **默认不强制**宿主在服务器 `authorized_keys` 白名单注册；设置 `UPTERMD_AUTHORIZED_KEYS` 后，只有清单内公钥可以注册为宿主，清单外密钥会被拒绝。
@@ -103,9 +117,7 @@ sudo ./install.sh --domain relay.example.com --email ops@example.com --apply
 | `firewall.sh` | ufw / nftables 双后端：SSH 与 WS 入口限速、管理面来源限制、指标端口仅环回 |
 | `rotate-relay-key.sh` | 反连注册标识轮换（服务身份密钥），输出 known_hosts 公钥行，支持回滚 |
 | `check-relay-health.sh` | 只读健康检查，输出单行 JSON，判据为监听齐备、路由为空、无会话文件、资源上限生效；journald 容量仅提示 |
-| `nginx/ssh.wuge.fun.conf` | 网页终端子域入口的 nginx 站点片段示例，仅落仓库不自动部署；文件头写明部署与回滚步骤 |
 | `actssh-web-bridge.service` | 网页桥接进程的 systemd 单元：非 root、整机只读、无写路径、内存/CPU/任务数上限 |
-| `nginx/web-bridge-location.conf` | `/ws/` 与 `/runner/` 两个 location 片段示例，含 Upgrade 头、禁缓冲、长连接超时；仅落仓库不自动部署 |
 | `bridge/relay_bridge.py` | 桥接服务实现（无状态配对与字节转发），由上面的单元拉起 |
 | `bridge/jsonl_logger.py` | 桥接与 runner 侧共用的 JSONL 日志器 |
 | `bridge/requirements-web-bridge.txt` | 桥接依赖锁（`websockets==10.4`） |
@@ -299,7 +311,7 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
 | runner 桥接客户端 | `scripts/start_web_bridge.py` | 主动出站 `/runner/<session_id>`，把字节流接到准入子进程 stdin/stdout，按阶段非零退出 |
 | 依赖锁 | `relay/bridge/requirements-web-bridge.txt` | `websockets==10.4` |
 | 单元文件 | `relay/actssh-web-bridge.service` | 非 root、整机只读、无写路径、`MemoryMax=128M` / `CPUQuota=50%` / `TasksMax=64` |
-| nginx 片段 | `relay/nginx/web-bridge-location.conf` | `/ws/` 与 `/runner/`，Upgrade 头、禁缓冲、3600s 读写超时；只落仓库不自动部署 |
+| nginx conf.d | `relay/bootstrap/nginx-cert.sh` | 安装时生成 `default.conf`、`www.conf`、`ssh.<domain>.conf`、`ssl.conf`、`web-bridge-location.inc`、`actssh-web-static.inc`；deprecated 的 `relay/nginx/` 静态示例已移除 |
 | 自测 | `relay/bridge/test_relay_bridge.py`、`scripts/test_start_web_bridge.py` | 配对、透传、拒绝、清理、1 MiB 边界、退出码与五字段 |
 
 桥接服务放在 `relay/bridge/`：设计更正 5.2 明确指定该路径，且它与 `scripts/web_admission.py` 同属 runner/中继共用的 Python 交付面；`relay/` 只放进程托管与反代资产，与现有 `uptermd.service`、`nginx/` 的口径一致。
@@ -346,11 +358,10 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
    sudo systemctl daemon-reload && sudo systemctl enable --now actssh-web-bridge.service
    sudo systemctl status actssh-web-bridge.service
    ```
-4. 只 include nginx 片段，不改主配置：
+4. nginx 片段由安装器生成，不手工复制：
    ```bash
-   sudo install -m 0644 relay/nginx/web-bridge-location.conf /etc/actssh/nginx/conf.d/web-bridge-location.conf
-   # 在 443 server 块内加一行：include /etc/actssh/nginx/conf.d/web-bridge-location.conf;
-   sudo nginx -t -c /etc/actssh/nginx/nginx.conf && sudo systemctl reload actssh-nginx.service
+   sudo ./relay/install.sh --relay-only --apply   # 或完整形态，见第 5 节
+   # 生成位置: /etc/actssh/nginx/conf.d/ (dedicated) 或 /etc/nginx/conf.d/ (--nginx-mode host)
    ```
 5. 在 runner 侧并行启动桥接客户端（不改 SSH 反连）：
    ```bash
@@ -456,10 +467,13 @@ relay/
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--domain <fqdn>` | 无 | `full` 形态必填；`relay-only` 可省略 |
-| `--acme-email <mail>` / `--email` | 空 | ACME 注册邮箱，可省略 |
+| `--acme-email <mail>` / `--email` | `7111479@qq.com` | ACME 注册邮箱；`acme` 与 `standalone` 下必填，`self-signed` 忽略 |
 | `--acme-staging` | 关 | 使用 ACME 预发布目录，避免打爆正式配额 |
 | `--cert-mode acme\|standalone\|self-signed` | `acme` | `acme`(别名 `webroot`) 用宿主 certbot webroot 签发，不停服；`standalone` 签发时临时停 `actssh-nginx` 独占 80；`self-signed` 仅无公网 DNS 的实验环境 |
-| `--web-root <dir>` | 空 | 网页终端静态目录；缺省时根路径 404 |
+| `--web-root <dir>` | `/var/www/actssh/html` | 网页终端静态目录，安装时自动创建 |
+| `--www-alias` | 关 | 增加 `www.<domain>` 301 站点，并让主证书一并覆盖 `www` |
+| `--ssh-domain <fqdn>` | 空 | 额外站点：该域名整体反代到 uptermd WS（默认 `127.0.0.1:8443`），使用独立证书 |
+| `--nginx-mode host\|dedicated` | `dedicated` | `dedicated` 安装独立 `actssh-nginx`；`host` 接管宿主 nginx 的 `/etc/nginx/conf.d`，不停止宿主 nginx，已存在等价配置直接采用；`--adopt-host-nginx` 为别名 |
 | `--relay-only` / `--no-web-bridge` | 关 | 只装中继，不装 nginx / 证书 / 桥接；纯 SSH 反向隧道形态 |
 | `--with-direct` / `--no-direct` | `with-direct` | 中继 SSH 是否对外直连；关闭时只监听 `127.0.0.1` |
 | `--bridge-host <host>` | `127.0.0.1` | 桥接监听地址，同时作为 nginx 上游地址 |
@@ -503,7 +517,7 @@ relay/
 | `/etc/actssh/tls/` | 证书与私钥 | `0750 root actssh-ops` |
 | `/etc/actssh/bridge.env` | 桥接唯一参数来源 | `0640 root actssh-bridge` |
 | `/var/log/actssh/nginx/` | nginx 访问与错误日志 | `0750 root actssh-ops` |
-| `/var/www/actssh-acme/` | certbot webroot | `0755 root root` |
+| `/var/www/actssh/acme/` | certbot webroot | `0755 root root` |
 | `/opt/actssh-web-bridge/` | 桥接代码与 venv | `0750 root actssh-bridge` |
 | `/var/lib/uptermd/` | 中继主机密钥 | `0700 upterm upterm` |
 | `/etc/uptermd/uptermd.env` | 中继参数 | `0640 root root` |
@@ -526,7 +540,7 @@ relay/
 
 | 模式 | 校验方式 | 是否停服 | 适用 |
 |---|---|---|---|
-| `acme`（默认，别名 `webroot`） | 宿主 certbot `--webroot -w /var/www/actssh-acme`，HTTP-01 | 不停服 | 有公网 DNS 与 80 入站，推荐 |
+| `acme`（默认，别名 `webroot`） | 宿主 certbot `--webroot -w /var/www/actssh/acme`，HTTP-01 | 不停服 | 有公网 DNS 与 80 入站，推荐 |
 | `standalone` | 宿主 certbot `--standalone`，签发时停 `actssh-nginx` 独占 80，结束后自动拉起；续期沿用同一 pre/post hook | 签发与续期瞬间停服 | 80 端口能腾出但 webroot 不便暴露 |
 | `self-signed` | 本地 openssl 自签 | 不停服 | 无公网 DNS 的实验环境，不访问 ACME |
 
@@ -609,7 +623,7 @@ shellcheck -x -S warning relay/*.sh relay/bootstrap/*.sh
 | 动作 | 命令要点 | 结果 | 耗时 |
 | --- | --- | --- | --- |
 | 首次部署 | `--domain lab.actssh.test --cert-mode self-signed --admin-ssh-port 22022 --admin-cidr 192.168.37.0/24 --apply` | 退出 0，自检 17/17：3 个单元 active、7 个监听、nginx 语法、证书 89 天、ACME webroot、`/ws/` 与 `/runner/` 均 101、`relay:health ok=true` | 147.7s（packages 111s / nginx 6s / uptermd 5s / bridge 7s / firewall 4s / selfcheck 12s） |
-| 卸载（保留数据） | `./relay/uninstall.sh --apply` | 退出 0；3 个单元 inactive、7 个端口全部释放、`/etc/actssh`、`/opt/actssh-web-bridge`、`/etc/logrotate.d/actssh` 已删；`/var/lib/uptermd`、`/var/www/actssh-acme` 保留 | 4.1s |
+| 卸载（保留数据） | `./relay/uninstall.sh --apply` | 退出 0；3 个单元 inactive、7 个端口全部释放、`/etc/actssh`、`/opt/actssh-web-bridge`、`/etc/logrotate.d/actssh` 已删；`/var/lib/uptermd`、`/var/www/actssh/acme` 保留 | 4.1s |
 | 换参重装 | `--relay-only --relay-port 2323 --admin-ssh-port 22022 --admin-cidr 192.168.37.0/24 --apply` | 退出 0，自检 6/6：`uptermd` active、2222 不再监听、2323 监听、WS 8443 与指标 9100 仅环回、`relay:health ok=true` | 15.9s（packages 0s 复用 / uptermd 4s / firewall 8s / selfcheck 1s） |
 | 升级路径 | `--upgrade --apply` | 退出 0，读回上次 relay-only 参数，自检 6/6，无副作用 | 15.4s |
 
@@ -627,9 +641,9 @@ sudo ./relay/uninstall.sh --apply --purge-data --domain ssh.example.com
 
 | 开关 | 行为 |
 |---|---|
-| 默认（`--keep-data`） | 停用并删除三个单元、`/etc/actssh`（含独立 nginx 实例与其 pid 目录）、`/etc/uptermd` 下的规则文件、logrotate、`/etc/cron.d/actssh-certbot`、`/etc/letsencrypt/renewal-hooks/deploy/actssh-nginx-reload`、`/usr/local/bin/uptermd`、`/opt/actssh-web-bridge`；保留 `/var/lib/uptermd`、`/etc/uptermd`、`/var/www/actssh-acme`、ACME 证书谱系、状态与备份 |
-| `--purge-data` | 追加删除 `/var/lib/uptermd`、`/etc/uptermd`、`/var/www/actssh-acme`（webroot）、`/var/lib/actssh-bootstrap`；给出 `--domain` 时一并删除该域名的证书谱系：`/etc/letsencrypt/live|archive|renewal/<域名>` |
-| `--remove-firewall` | 回收本方案写入的 ufw 放行规则与 `uptermd_guard` nftables 表 |
+| 默认（`--keep-data`） | 停用并删除三个单元、`/etc/actssh`（含独立 nginx 实例与其 pid 目录）、`/etc/uptermd` 下的规则文件、logrotate、`/etc/cron.d/actssh-certbot`、`/etc/letsencrypt/renewal-hooks/deploy/actssh-nginx-reload`、`/usr/local/bin/uptermd`、`/opt/actssh-web-bridge`；保留 `/var/lib/uptermd`、`/etc/uptermd`、`/var/www/actssh/acme`、ACME 证书谱系、状态与备份 |
+| `--purge-data` | 追加删除 `/var/lib/uptermd`、`/etc/uptermd`、`/var/www/actssh/acme`（webroot）、`/var/www/actssh/html`、`/var/log/actssh`、`/var/log/actssh-bootstrap`、`/var/log/uptermd-relay`、`/run/uptermd`、`/var/lib/actssh-bootstrap`，并删除安装器创建的 `upterm`、`actssh-bridge` 系统用户与 `actssh-ops` 组（仍有进程占用时保留并告警）；给出 `--domain` 时一并删除该域名的证书谱系：`/etc/letsencrypt/live|archive|renewal/<域名>` |
+| `--remove-firewall` | 回收本方案写入的 ufw 放行规则与 `uptermd_guard` nftables 表；安装前 ufw 处于关闭状态时，卸载后自动还原为关闭，避免留下 `default deny` 改变主机暴露面 |
 
 从不删除：apt 软件包、系统 sshd 配置、发行版 nginx 站点、非本方案创建的目录。
 
