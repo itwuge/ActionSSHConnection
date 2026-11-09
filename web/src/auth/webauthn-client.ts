@@ -40,6 +40,7 @@ export type WebAuthnErrorCode =
   | 'NOT_SECURE_CONTEXT'
   | 'RP_ID_MISMATCH'
   | 'INVALID_PAYLOAD'
+  | 'CREDENTIAL_NOT_ALLOWED'
   | 'CREDENTIAL_FAILED';
 
 /**

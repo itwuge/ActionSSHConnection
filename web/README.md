@@ -8,7 +8,8 @@
 - 到中转 WS 的二进制帧收发，路径只携带 `session_id`。
 - WebAuthn 注册与断言的**浏览器端部分**（`navigator.credentials.create/get`），私钥留在认证器，页面只接触公钥侧材料。
 - 准入状态机：等待挑战、等待验签结果、未对接、被拒绝、出错。
-- 页面不保存任何凭据，不使用 URL 带 token 的做法，不展示密钥材料，不使用 `localStorage`、`sessionStorage`、Cookie 或 IndexedDB。
+- 页面不保存任何可复用凭据，不使用 URL 带 token 的做法，不展示密钥材料。
+- 首次进入引导注册本设备通行密钥；注册成功后仅在本机 `localStorage` 记录公开的凭据标识与登记时间，用于后续直接进入。记录中不含私钥、断言或任何可直接登录的凭据，单独泄露不能完成认证。
 
 不在本目录内：runner 侧验签、中继实现、发布执行、浏览器打洞。
 
@@ -36,17 +37,13 @@ npm run check
 npm run serve
 ```
 
-打开 `http://127.0.0.1:5173/`。
+打开 `http://127.0.0.1:5173/t/demo-local?relay=ws%3A%2F%2F127.0.0.1%3A8787`。
 
-也可以直接双击 `index.html` 打开：终端界面可渲染，但 `file://` 不是安全上下文，通行密钥不可用，且页面只建议用于查看布局；真实准入必须在 `https://wuge.fun` 下进行。
+页面地址形态与 tmate 一致：会话标识放在路径末尾 `/t/<会话ID>`。`?relay=` 只在 `localhost`、`127.0.0.1`、`[::1]` 下生效，用于把页面指向本地模拟中继，不属于凭据；部署域下中继地址自动取页面同域。
 
-页面支持两个查询参数预填表单，二者都不属于凭据：
+页面脚本与样式按根路径 `/dist/` 引用，因此不要直接双击 `index.html`（`file://` 下加载不到 `/dist`），请用 `npm run serve` 打开。
 
-```text
-http://127.0.0.1:5173/?relay=wss%3A%2F%2Fwuge.fun&session=<session_id>
-```
-
-页面已声明 `referrer=no-referrer`，避免地址栏中的 `session_id` 通过 Referer 外泄。
+页面已声明 `referrer=no-referrer`，避免路径中的会话标识通过 Referer 外泄。
 
 ## 4. 本地验证（不验签）
 
@@ -67,10 +64,10 @@ npm run serve
 打开：
 
 ```text
-http://127.0.0.1:5173/?relay=ws%3A%2F%2F127.0.0.1%3A8787&session=demo-local
+http://127.0.0.1:5173/t/demo-local?relay=ws%3A%2F%2F127.0.0.1%3A8787
 ```
 
-点击「连接」后应看到：终端出现模拟中继横幅与 `mock$`、连接状态为「已连接」、当前路径为「中继转发(relay)」，并出现黄色提示「当前准入由本地模拟器放行，服务端未验签」。模拟中继返回的 `verifier` 固定为 `mock`，页面据此显式区分真实准入与模拟放行。
+首次进入会出现「首次使用」引导，写明「一次注册, 之后直接进」。本地调试域无法完成真实注册，「注册本设备并进入」为禁用；点击「已注册过, 直接进入」后应看到：终端出现 `mock$`、状态行为「已连接(模拟环境, 未验签)」。模拟中继返回的 `verifier` 固定为 `mock`，页面据此显式区分真实准入与模拟放行。
 
 模拟中继只监听 `127.0.0.1`，`ws://` 明文仅对本机地址放行；其他地址必须使用 `wss://`。
 
@@ -79,10 +76,19 @@ http://127.0.0.1:5173/?relay=ws%3A%2F%2F127.0.0.1%3A8787&session=demo-local
 ## 5. 部署口径
 
 - 依赖方标识（rpId）固定为 `wuge.fun`，配置位置：[config.ts](src/config.ts) 的 `WEB_RP_ID`。
-- 页面与中继同域部署，页面必须通过 `https://wuge.fun` 或其子域打开，例如 `https://wuge.fun/web/`；中继端点同域，例如 `wss://wuge.fun/ws/<session_id>`。
+- 页面地址固定为 `https://wuge.fun/t/<会话ID>`；静态资源从根路径 `/dist/` 加载，因此产物部署在站点根目录，且 `/t/<会话ID>` 需回退到 `index.html`。
+- 中继端点同域，例如 `wss://wuge.fun/ws/<会话ID>`；部署域下页面不提供中继地址输入。
 - 页面在非 `wuge.fun` 域打开时，页面会立即显示明确提示并禁用注册按钮；即使强行连接，服务端下发挑战后也会因依赖方标识不符而失败，不会静默无响应。
 - 服务端下发的 `rpId` 必须等于 `wuge.fun`，否则前端拒绝发起认证并提示配置不一致。
-- 中继地址输入框允许填写任意合规的 `wss://` 主机，但真实准入仍受上面的 rpId 约束：页面域名与 rpId 不匹配时不能完成签名。
+
+### 5.1 首次注册到直接进
+
+1. 打开 `https://wuge.fun/t/<会话ID>`。本机无登记记录时，终端上方显示「首次使用」引导，核心文案是「一次注册, 之后直接进」。
+2. 点击「注册本设备并进入」。前端在已连通的 WS 上发送 `authBegin`（`intent=register`），由 runner 侧下发 `registrationOptions`。
+3. 浏览器调用 `navigator.credentials.create` 在设备内生成通行密钥；私钥不出设备，页面只提交公钥侧材料（`registration`）。
+4. runner 侧确认注册并回 `authResult.ok=true` 后，页面把公开凭据标识写入本机 `localStorage`，随即进入终端。
+5. 之后同一浏览器再打开任一 `/t/<会话ID>`，页面直接以 `authBegin`（`intent=assert`）发起断言并进入，不再出现登记引导；清除站点数据或更换浏览器后回到第 1 步。
+6. 若服务端允许清单不含本机凭据，页面提示「本机登记的凭据不在服务端允许清单内, 需要重新登记本设备」，不会卡在无提示状态。
 
 ## 6. 服务端对接清单（一页）
 
@@ -93,6 +99,7 @@ http://127.0.0.1:5173/?relay=ws%3A%2F%2F127.0.0.1%3A8787&session=demo-local
 | 项 | 约定 |
 | --- | --- |
 | 传输 | WebSocket，只收发二进制帧；文本帧按协议错误提示 |
+| 页面地址 | `https://wuge.fun/t/<session_id>`，会话标识在路径，与 tmate 的 `/t/<id>` 一致 |
 | 路径 | `/ws/<session_id>`，只放会话标识，不带 token、口令、公钥 |
 | 会话标识 | 字母、数字、下划线、连字符，长度 1 到 128 |
 | 中继职责 | 无状态字节转发，不解析帧，不判准入，不存凭据 |
@@ -227,8 +234,8 @@ http://127.0.0.1:5173/?relay=ws%3A%2F%2F127.0.0.1%3A8787&session=demo-local
 
 | 令牌 | 含义 | 前端表现 |
 | --- | --- | --- |
-| `UNKNOWN_SESSION` | 会话不存在，尚未建立或已结束 | 提示「会话不存在」，建议核对会话标识 |
-| `ROUTE_GONE` | 会话路由已回收，runner 侧连接已断开 | 提示「会话路由已回收」，建议重新获取会话信息 |
+| `UNKNOWN_SESSION` | 会话不存在，尚未建立或已结束 | 提示「会话不存在或已结束. 请向发起者索取新的连接串.」 |
+| `ROUTE_GONE` | 会话路由已回收，runner 侧连接已断开 | 提示「会话已结束, 连接已回收. 请重新发起会话获取新的连接串.」 |
 
 准入失败：用 `authResult.ok=false` 加 `reason` 原因码表达。前端已映射以下原因码为中文提示：
 
@@ -277,19 +284,21 @@ http://127.0.0.1:5173/?relay=ws%3A%2F%2F127.0.0.1%3A8787&session=demo-local
 ## 7. 已知未验证与待确认
 
 - 中继 WS 端点 `/ws/<session_id>` 实际部署与 TLS 证书未真机验证。
+- 线上静态站点需把 `/t/<会话ID>` 回退到 `index.html`，且 `/dist/` 按站点根路径提供；该部署形态未真机验证。
+- 首次注册流程依赖 runner 侧接受 `intent=register` 并回 `registrationOptions`，注册前置条件尚未开放（见 6.5 最后一项）。
 - 中继是否严格原样转发二进制帧、是否会改变帧边界，待真机确认；前端按 6.2 的长度前缀可容忍合并与拆分。
 - 关闭码具体数值未确定；前端只识别 `reason` 中的 `UNKNOWN_SESSION` 与 `ROUTE_GONE`。
-- 注册通道的前置条件与载体未定，见 6.5 最后一项。
 - 网页通道不实现浏览器打洞，一期固定走中继。
 
 ## 8. 文件清单
 
 | 文件 | 用途 |
 | --- | --- |
-| `index.html` | 入口页，固定节点与静态文案 |
-| `src/main.ts` | 入口脚本，节点校验与查询参数预填 |
+| `index.html` | 入口页，连接串与终端两段结构 |
+| `src/main.ts` | 入口脚本，解析 `/t/<会话ID>` 路径与中继地址 |
 | `src/config.ts` | 部署域名与 rpId 配置，页面域名判定 |
-| `src/app-controller.ts` | 连接、帧分流、准入渲染、断线提示 |
+| `src/app-controller.ts` | 自动进入或登记引导、连接、帧分流、准入渲染、断线提示 |
+| `src/storage/credential-store.ts` | 本机记录公开凭据标识，用于后续直接进入 |
 | `src/transport/relay-client.ts` | 中继 WS 连接与地址校验 |
 | `src/terminal/terminal-view.ts` | xterm 渲染、尺寸自适应、输入采集 |
 | `src/protocol/frames.ts` | 二进制帧编解码 |

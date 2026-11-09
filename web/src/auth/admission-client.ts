@@ -67,6 +67,8 @@ export interface AdmissionSnapshot {
   detail: string;
   /** 验签方标识; 仅 admitted 阶段有值, mock 表示本地模拟器放行. */
   verifier: string | null;
+  /** 准入失败原因码; 仅 denied 阶段有值, 用于界面决定是否引导重新登记. */
+  failureReason?: string;
 }
 
 /**
@@ -78,6 +80,11 @@ export type FrameSend = (type: FrameType, payload: Uint8Array) => void;
  * 状态变化回调; 控制器据此更新界面与终端锁定.
  */
 export type AdmissionListener = (snapshot: AdmissionSnapshot) => void;
+
+/**
+ * 注册成功回调; 只在服务端确认注册结果后触发, 参数为凭据标识.
+ */
+export type RegisteredListener = (credentialId: string) => void;
 
 // =========** 类 =========**
 /**
@@ -93,11 +100,17 @@ export type AdmissionListener = (snapshot: AdmissionSnapshot) => void;
 export class AdmissionClient {
   private readonly listener: AdmissionListener;
 
+  private readonly onRegistered: RegisteredListener;
+
   private readonly send: FrameSend;
 
   private snapshot: AdmissionSnapshot = { phase: 'idle', detail: '未开始', verifier: null };
 
   private intent: AdmissionIntent = 'assert';
+
+  private preferredCredentialId: string | null = null;
+
+  private pendingRegistrationId: string | null = null;
 
   private timer: number | null = null;
 
@@ -106,10 +119,12 @@ export class AdmissionClient {
   /**
    * @param listener 状态变化回调, 调用方保证不抛异常.
    * @param send 帧发送函数, 连接未打开时应抛错, 由本模块转为 error 状态.
+   * @param onRegistered 注册成功回调; 传入凭据标识用于本机记忆, 不传则不记录.
    */
-  constructor(listener: AdmissionListener, send: FrameSend) {
+  constructor(listener: AdmissionListener, send: FrameSend, onRegistered: RegisteredListener = () => undefined) {
     this.listener = listener;
     this.send = send;
+    this.onRegistered = onRegistered;
   }
 
   /** 当前是否已准入; 控制器用它决定终端输入是否上送. */
@@ -121,24 +136,27 @@ export class AdmissionClient {
    * 发起准入.
    *
    * @param intent assert 表示日常进入, register 表示登记本设备通行密钥.
+   * @param preferredCredentialId 本机已登记的凭据标识; 服务端未限定允许清单时用它缩小选择范围.
    * @returns 无; 结果通过状态回调上报.
    * @throws {Error} 发送失败时抛错, 触发条件是连接已关闭.
    */
-  begin(intent: AdmissionIntent): void {
+  begin(intent: AdmissionIntent, preferredCredentialId: string | null = null): void {
     if (this.disposed) {
       return;
     }
     this.clearTimer();
     this.intent = intent;
-    this.update({ phase: 'awaiting-challenge', detail: '已发送准入请求, 等待验签挑战', verifier: null });
+    this.preferredCredentialId = preferredCredentialId;
+    this.pendingRegistrationId = null;
+    this.update({ phase: 'awaiting-challenge', detail: '正在验证设备', verifier: null });
     const payload: AuthBeginPayload = { intent, clientVersion: CLIENT_VERSION };
     this.send(FRAME_TYPE.authBegin, encodeJson(payload));
     this.timer = window.setTimeout(() => {
       this.timer = null;
-      // 没收到挑战说明服务端准入尚未实现, 照实上报, 不把终端当作已放行
+      // 没收到挑战说明服务端准入尚未就绪, 照实上报, 不把终端当作已放行
       this.update({
         phase: 'not-integrated',
-        detail: `未在 ${CHALLENGE_TIMEOUT_MS / 1000} 秒内收到验签挑战, runner 侧准入进程尚未对接, 终端保持锁定`,
+        detail: '会话服务尚未就绪, 暂时无法进入; 请稍后重试.',
         verifier: null
       });
     }, CHALLENGE_TIMEOUT_MS);
@@ -179,6 +197,8 @@ export class AdmissionClient {
    */
   reset(): void {
     this.clearTimer();
+    this.preferredCredentialId = null;
+    this.pendingRegistrationId = null;
     this.update({ phase: 'idle', detail: '未开始', verifier: null });
   }
 
@@ -206,8 +226,16 @@ export class AdmissionClient {
     }
     this.clearTimer();
     const challenge = parseAuthChallenge(payload);
-    this.update({ phase: 'awaiting-result', detail: '挑战已收到, 等待设备内签名', verifier: null });
-    const assertion = await createAssertion(challenge);
+    const preferred = this.preferredCredentialId;
+    if (preferred !== null && challenge.allowCredentialIds.length > 0 && !challenge.allowCredentialIds.includes(preferred)) {
+      throw new WebAuthnClientError('CREDENTIAL_NOT_ALLOWED', '本机登记的凭据不在服务端允许清单内, 需要重新登记本设备.');
+    }
+    const effective =
+      preferred !== null && challenge.allowCredentialIds.length === 0
+        ? { ...challenge, allowCredentialIds: [preferred] }
+        : challenge;
+    this.update({ phase: 'awaiting-result', detail: '请在设备上确认', verifier: null });
+    const assertion = await createAssertion(effective);
     this.send(FRAME_TYPE.authAssertion, encodeJson(assertion));
   }
 
@@ -225,8 +253,9 @@ export class AdmissionClient {
     }
     this.clearTimer();
     const options = parseRegistrationOptions(payload);
-    this.update({ phase: 'awaiting-result', detail: '注册选项已收到, 等待设备内创建通行密钥', verifier: null });
+    this.update({ phase: 'awaiting-result', detail: '正在登记本设备', verifier: null });
     const registration = await createPasskey(options);
+    this.pendingRegistrationId = registration.credentialId;
     this.send(FRAME_TYPE.registration, encodeJson(registration));
   }
 
@@ -241,9 +270,14 @@ export class AdmissionClient {
     this.clearTimer();
     const result = parseAuthResult(payload);
     if (result.ok) {
+      const registeredId = this.pendingRegistrationId;
+      this.pendingRegistrationId = null;
+      if (registeredId !== null && this.intent === 'register') {
+        this.onRegistered(registeredId);
+      }
       this.update({
         phase: 'admitted',
-        detail: result.reason.length > 0 ? result.reason : '准入通过',
+        detail: result.reason.length > 0 ? result.reason : '已进入会话',
         verifier: result.verifier
       });
       return;
@@ -251,7 +285,8 @@ export class AdmissionClient {
     this.update({
       phase: 'denied',
       detail: describeFailure(result.reason),
-      verifier: result.verifier.length > 0 ? result.verifier : null
+      verifier: result.verifier.length > 0 ? result.verifier : null,
+      failureReason: result.reason
     });
   }
 

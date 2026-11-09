@@ -28,18 +28,24 @@ const MIME_TYPES = new Map([
 ]);
 
 /**
- * 把请求路径映射为允许访问的文件; 只放行根路径与 dist 下的文件.
+ * 把请求路径映射为允许访问的文件; 根路径与 /t/<会话ID> 返回 index.html, 其余只放行 dist 下的文件.
  *
  * @param requestUrl 请求的 URL, 可能含查询串.
  * @returns 绝对文件路径; 不允许访问时返回 null.
  */
 function resolveRequestPath(requestUrl) {
   const pathname = new URL(requestUrl, `http://${HOST}:${PORT}`).pathname;
-  const decoded = decodeURIComponent(pathname);
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
   if (decoded.includes('\0')) {
     return null;
   }
-  const relative = decoded === '/' ? 'index.html' : decoded.replace(/^\/+/, '');
+  const isSessionPath = /^\/t\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\/?$/.test(decoded);
+  const relative = decoded === '/' || isSessionPath ? 'index.html' : decoded.replace(/^\/+/, '');
   if (relative !== 'index.html' && !relative.startsWith('dist/')) {
     return null;
   }

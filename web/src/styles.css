@@ -1,8 +1,8 @@
 /* 文件: styles.css
  * 所属目录: web/src/
- * 文件用途: 网页终端的布局与主题样式, 覆盖表单, 状态区, 终端容器与断线浮层.
+ * 文件用途: 网页终端的布局与主题样式, 分连接串与终端两段, 覆盖登记引导与提示浮层.
  * 架构定位: 前端层样式, 与 index.html 的固定结构一一对应, 不参与逻辑.
- * 核心功能: 深色终端主题; 自适应布局; 状态标签; 浮层与移动端换行.
+ * 核心功能: 深色终端主题; 连接串一行展示; 终端铺满剩余空间; 浮层与移动端换行.
  * 职责边界: 不含脚本行为, 不引入外部字体与远程资源, 避免发布时产生第三方请求.
  * 运行环境: 现代浏览器, 依赖 CSS 变量与 flex 布局.
  * 依赖关系: 被 main.ts 引入并打包为 dist/app.css.
@@ -37,69 +37,32 @@ body {
   font-family: var(--sans);
 }
 
-body {
+.page {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  gap: 10px;
+  height: 100%;
+  padding: 12px;
 }
 
-.app-header {
+.connect {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 14px 20px;
-  border-bottom: 1px solid var(--panel-edge);
-  background: var(--panel);
-}
-
-.app-header h1 {
-  margin: 0;
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-
-.app-header .subtitle {
-  margin: 0;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.app-main {
-  display: flex;
-  flex: 1;
   flex-direction: column;
-  gap: 14px;
-  padding: 16px 20px 20px;
-  min-height: 0;
-}
-
-.control-panel {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: 12px;
-  padding: 14px;
+  gap: 6px;
+  padding: 10px 12px;
   border: 1px solid var(--panel-edge);
   border-radius: var(--radius);
   background: var(--panel);
 }
 
-.field {
+.connect-row {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-width: 220px;
-  flex: 1 1 240px;
+  gap: 8px;
 }
 
-.field label {
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.field input {
+.connect-row input {
+  flex: 1;
+  min-width: 0;
   height: 36px;
   padding: 0 10px;
   border: 1px solid var(--panel-edge);
@@ -110,15 +73,9 @@ body {
   font-size: 13px;
 }
 
-.field input:focus {
+.connect-row input:focus {
   outline: 2px solid var(--accent-soft);
   border-color: var(--accent);
-}
-
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
 }
 
 button {
@@ -131,6 +88,7 @@ button {
   font-family: var(--sans);
   font-size: 13px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 button:hover:not(:disabled) {
@@ -149,52 +107,32 @@ button:disabled {
   cursor: not-allowed;
 }
 
-.form-message {
-  flex-basis: 100%;
+.status {
   margin: 0;
-  min-height: 18px;
-  color: var(--danger);
-  font-size: 12px;
-}
-
-.status-bar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 24px;
-  margin: 0;
-  padding: 10px 14px;
-  border: 1px solid var(--panel-edge);
-  border-radius: var(--radius);
-  background: var(--panel);
-  font-size: 12px;
-}
-
-.status-bar dt {
   color: var(--muted);
-  margin-bottom: 4px;
-}
-
-.status-bar dd {
-  margin: 0;
-  font-family: var(--mono);
   font-size: 12px;
-  word-break: break-all;
 }
 
-.warning-line {
+.status[data-state="admitted"] {
+  color: var(--accent);
+}
+
+.status[data-state="failed"] {
+  color: var(--danger);
+}
+
+.message {
   margin: 0;
-  padding: 10px 14px;
-  border: 1px solid rgba(230, 192, 123, 0.5);
-  border-radius: var(--radius);
-  background: rgba(230, 192, 123, 0.1);
+  min-height: 16px;
   color: var(--warn);
   font-size: 12px;
+  line-height: 1.5;
 }
 
 .terminal-shell {
   position: relative;
   flex: 1;
-  min-height: 320px;
+  min-height: 240px;
   padding: 10px;
   border: 1px solid var(--panel-edge);
   border-radius: var(--radius);
@@ -207,53 +145,64 @@ button:disabled {
   height: 100%;
 }
 
-.notice {
+.overlay {
   position: absolute;
   inset: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 14px;
+  gap: 10px;
   padding: 24px;
-  background: rgba(7, 11, 17, 0.88);
+  background: rgba(7, 11, 17, 0.9);
   backdrop-filter: blur(2px);
   text-align: center;
 }
 
-.notice[hidden] {
+.overlay[hidden] {
   display: none;
 }
 
-.notice p {
+.overlay-title {
   margin: 0;
-  max-width: 560px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.overlay-text {
+  margin: 0;
+  max-width: 520px;
   color: var(--text);
   font-size: 14px;
   line-height: 1.7;
 }
 
-.notice button {
+.overlay-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.overlay button {
   min-width: 120px;
 }
 
-.app-footer {
-  padding: 0 20px 16px;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.6;
-}
-
 @media (max-width: 640px) {
-  .app-main {
-    padding: 12px;
+  .page {
+    padding: 8px;
   }
 
-  .field {
-    min-width: 100%;
+  .connect-row {
+    flex-wrap: wrap;
   }
 
-  .status-bar {
-    gap: 14px;
+  .connect-row input {
+    flex-basis: 100%;
+  }
+
+  .connect-row button {
+    flex: 1;
   }
 }

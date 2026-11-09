@@ -58,7 +58,7 @@ export function describePageHostNotice(mode: PageHostMode, hostname: string): st
     return '';
   }
   if (mode === 'local') {
-    return '本地调试域名: 通行密钥只绑定 wuge.fun, 此处只能连接本地模拟中继验证界面, 无法完成真实准入.';
+    return '本地调试环境: 仅用于界面验证, 无法完成真实准入.';
   }
-  return `当前页面域名 ${hostname} 不在 wuge.fun 域下, 通行密钥无法使用; 请通过 wuge.fun 或其子域的页面进入.`;
+  return `请通过 wuge.fun 或其子域打开本页; 当前域名 ${hostname} 无法使用通行密钥.`;
 }
