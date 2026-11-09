@@ -61,7 +61,7 @@
 
 - Ubuntu 20.04 及以上，systemd 245 及以上，bash 5.x，root 执行。
 - 中转机可出网访问 GitHub Releases。
-- 22 端口空闲；系统 sshd 已迁到 22022，或另有可用的管理面入口。
+- 中继监听端口空闲。默认设计是 relay 占用 22、系统 sshd 迁到 22022（见 6.1）；若不允许动 22（例如既有生产机），改用 `--ssh-addr 0.0.0.0:2222`，此时 2222 必须空闲且云安全组放行（见 6.1.1）。
 - 云安全组先放行管理面来源，再改主机防火墙；主机防火墙只做兜底。
 - WS 入口需要 TLS 终止层：`uptermd` 只监听环回 `127.0.0.1:8443` 的明文 WS，公网 `wss://` 由反向代理终止 TLS 后转发到该端口。反向代理选型与证书管理不在本目录脚本内，属真机实施项。
 
@@ -75,6 +75,17 @@
 4. 云安全组只对管理来源放行新端口。
 
 不要在未确认新端口可登录前关闭当前连接，避免锁死。
+
+### 6.1.1 不迁移 sshd：中继改用非 22 端口
+
+既有生产机上不要动 22 时，保持系统 sshd 原样，只给中继另开端口：
+
+```bash
+sudo deploy/install-uptermd.sh --version v0.41.1 --ssh-addr 0.0.0.0:2222
+sudo deploy/check-relay-health.sh <中转地址> 2222
+```
+
+监听地址只由 `/etc/uptermd/uptermd.env` 的 `UPTERMD_SSH_ADDR` 决定，单元文件不写死端口；`--ssh-addr` 是安装脚本既有参数，无需为端口改脚本。安全组需另行放行该端口，脚本不改云侧配置；未放行时机器内可自测，外部不可达属预期。
 
 ### 6.2 安装或升级 uptermd
 
@@ -95,7 +106,7 @@ sudo deploy/install-uptermd.sh --version v0.41.1 --sha256 <发布包 SHA256>
 - 下载发布包并校验哈希，原子替换二进制；
 - 写 `/etc/uptermd/uptermd.env`，**不写** `UPTERMD_AUTHORIZED_KEYS`，**不创建** `authorized_keys`；
 - 安装 `uptermd.service`，设置开机自启；
-- 重启后核对 22 与 8443 监听、`MemoryMax`/`CPUQuota`/`TasksMax`、活动路由为 0、运行期目录无会话文件。
+- 重启后核对 SSH 监听（默认 22，可由 `--ssh-addr` 覆盖）、8443 监听、`MemoryMax`/`CPUQuota`/`TasksMax`、活动路由为 0、运行期目录无会话文件。
 
 退出码 10 表示空路由或禁落盘自检未通过，退出码 11 表示资源上限未生效。
 
@@ -116,7 +127,7 @@ sudo deploy/firewall.sh --admin-cidr <管理来源网段> --apply
 sudo deploy/check-relay-health.sh <中转地址> 22
 ```
 
-标准输出恰好一行 JSON，字段为 `ok`、`message`、`error_code`、`data`、`confirm`；`data` 至少包含：
+stdout 恰好一行 JSON，字段为 `ok`、`message`、`error_code`、`data`、`confirm`；第二个参数是中继实际 SSH 端口（非 22 时如 `2222`），仅用于监听判定，检查在机器本机执行。`data` 至少包含：
 
 - `listen_state`：SSH、WS、环回 WS 三类监听；
 - `route_table_empty`：`routing_active_connections_count` 是否为 0；
@@ -130,7 +141,7 @@ sudo deploy/check-relay-health.sh <中转地址> 22
 部署完成后按以下顺序验证：
 
 1. `systemctl is-active uptermd.service` 为 `active`。
-2. `ss -Hltn` 能看到 22、127.0.0.1:8443、127.0.0.1:9100。
+2. `ss -Hltn` 能看到配置的 SSH 监听端口（默认 22，例如 `2222`）、127.0.0.1:8443、127.0.0.1:9100。
 3. `curl -fsS http://127.0.0.1:9100/metrics` 可读，活动会话数为 0。v0.41.1 实际指标名是 `upterm_uptermd_sessions_active_count`（带 `upterm_uptermd_` 前缀），脚本按候选名依次识别。
 4. `systemctl show -p MemoryMax -p CPUQuotaPerSecUSec -p TasksMax uptermd.service` 与 `1G`、`150%`、`512` 对应。
 5. `/run/uptermd` 为空；`/var/lib/uptermd` 只有主机密钥与轮换归档。
@@ -189,4 +200,4 @@ sudo deploy/rotate-relay-key.sh --apply
 9. 打洞优先策略在自建 runner 或同 NAT 环境下是否可成功；托管 runner 只验中继分支。
 10. 两个入口同时进入同一会话时，TUI 的实际可用性。
 
-补充实测条件：Ubuntu 22.04.5 的 `journalctl --disk-usage` 在部署前为 416.1M，写入 `SystemMaxUse=200M` 并重启 journald 后不会立即压到上限，需按第 9 节执行一次 `journalctl --vacuum-size`；本机压到 144.0M 后健康检查通过。同日做了同机端到端会话（upterm host + ssh 访客）：建会话、访客执行命令、显式 stop 均成功；访客退出不会结束会话，需显式 stop；全程 `/run/uptermd` 与 `/var/lib/uptermd` 无新增文件，监听端口不变，停后 `sessions_active_count` 归零。闸门与时延实测：中继白名单只拦宿主注册，清单外宿主 exit 1（`Permission denied`），清单内 exit 0；中继白名单外的访客仍可登录，runner 侧清单外访客 exit 255（`Permission denied`）。访客 `exit` 后会话立即结束：从访客 ssh 返回计，`upterm session wait` 0.160s 返回（exit 0），10ms 粒度下活动会话指标 0.045s 归零；原连接串立即重连失败（exit 255，`Permission denied`）。
+补充实测条件：Ubuntu 22.04.5 的 `journalctl --disk-usage` 在部署前为 416.1M，写入 `SystemMaxUse=200M` 并重启 journald 后不会立即压到上限，需按第 9 节执行一次 `journalctl --vacuum-size`；本机压到 144.0M 后健康检查通过。同日做了同机端到端会话（upterm host + ssh 访客）：建会话、访客执行命令、回收均成功；访客在共享 shell 内 `exit` 会结束宿主命令并立即回收会话（2026-11-09 生产机复测：`session wait` 0.040s 返回，指标 0.053s 归零；走 exec 通道执行单条命令不影响会话，需显式 stop）。全程 `/run/uptermd` 与 `/var/lib/uptermd` 无新增文件，监听端口不变，停后 `sessions_active_count` 归零。另：中继只接受 publickey 认证，runner 未设闸门时访客也必须提供任意一把私钥，无密钥连接被拒（exit 255，`Permission denied`）。2026-11-09 阿里云成都 ECS（Ubuntu 20.04.6，2 vCPU/2 GiB/40 GiB）以 `--ssh-addr 0.0.0.0:2222` 部署，系统 sshd 保持 22 未改，22 上的连接未中断。闸门与时延实测：中继白名单只拦宿主注册，清单外宿主 exit 1（`Permission denied`），清单内 exit 0；中继白名单外的访客仍可登录，runner 侧清单外访客 exit 255（`Permission denied`）。访客 `exit` 后会话立即结束：从访客 ssh 返回计，`upterm session wait` 0.160s 返回（exit 0），10ms 粒度下活动会话指标 0.045s 归零；原连接串立即重连失败（exit 255，`Permission denied`）。
