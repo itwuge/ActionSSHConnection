@@ -1,10 +1,10 @@
 # =========** 文件头 =========**
 # 文件        : uptermd.service
 # 所属目录    : deploy/
-# 文件用途    : 以 systemd 常驻方式运行自托管 uptermd 中转服务, 承载 relay 的 SSH 监听与 Prometheus 指标
+# 文件用途    : 以 systemd 常驻方式运行自托管 uptermd 中转服务, 作为无状态字节转发器承载 SSH 与 WS 监听
 # 架构定位    : 中转端进程托管层; 上游是 deploy/install-uptermd.sh 写入的 /etc/uptermd/uptermd.env, 下游是 uptermd 二进制
-# 核心功能    : 以专用系统用户运行, 读取环境文件中的监听地址与密钥路径, 施加内存与 CPU 与任务数上限, 崩溃自动重启
-# 职责边界    : 不负责安装二进制, 不负责生成密钥, 不负责防火墙; 参数一律来自环境文件, 本单元不写死端口
+# 核心功能    : 以专用系统用户运行, 只读主机密钥, 只写 /run 内存目录, 施加内存与 CPU 与任务数上限, 崩溃自动重启
+# 职责边界    : 不负责安装二进制, 不负责生成密钥, 不负责防火墙, 不登记任何公钥; 参数一律来自环境文件, 本单元不写死端口
 # 运行环境    : Ubuntu 20.04 及以上 systemd 245 及以上, 二进制位于 /usr/local/bin/uptermd
 # 依赖关系    : 依赖 /etc/uptermd/uptermd.env 与 /var/lib/uptermd/server_key; 由 install-uptermd.sh 安装到 /etc/systemd/system/
 
@@ -19,13 +19,18 @@ Type=simple
 User=upterm
 Group=upterm
 
-# 环境文件是唯一参数来源: UPTERMD_SSH_ADDR, UPTERMD_PRIVATE_KEY, UPTERMD_AUTHORIZED_KEYS,
+# 环境文件是唯一参数来源: UPTERMD_SSH_ADDR, UPTERMD_WS_ADDR, UPTERMD_PRIVATE_KEY,
 # UPTERMD_HANDSHAKE_TIMEOUT, UPTERMD_METRIC_ADDR, UPTERMD_SSH_NETWORK.
+# 不设置 UPTERMD_AUTHORIZED_KEYS: 宿主注册门禁关闭, 中转不做任何准入判定.
 # 不加 "-" 前缀, 文件缺失时启动直接失败, 避免无参数裸跑.
 EnvironmentFile=/etc/uptermd/uptermd.env
 ExecStart=/usr/local/bin/uptermd
 
-Restart=always
+# 绑定 22 需要低端口能力; 运行身份不是 root, 必须显式授予环境能力
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=20s
 
@@ -35,7 +40,7 @@ CPUQuota=150%
 TasksMax=512
 LimitNOFILE=65536
 
-# 最小权限: 只读系统, 只写状态目录, 独立 tmp, 禁止提权与内核面改动
+# 最小权限: 整机只读, 持久密钥只读, 唯一可写目录是 /run 内存目录
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -43,16 +48,24 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
 LockPersonality=true
+SystemCallArchitectures=native
 UMask=0077
 
-# 状态与密钥目录由 systemd 创建并确保属主, 权限 0750
-StateDirectory=uptermd
-StateDirectoryMode=0750
-ReadWritePaths=/var/lib/uptermd
+# 主机密钥与配置只读; 运行期唯一可写目录由 systemd 以 tmpfs 创建并在停止时丢弃
+ReadOnlyPaths=/var/lib/uptermd /etc/uptermd
+RuntimeDirectory=uptermd
+RuntimeDirectoryMode=0750
+WorkingDirectory=/run/uptermd
+Environment=HOME=/run/uptermd
 
 StandardOutput=journal
 StandardError=journal

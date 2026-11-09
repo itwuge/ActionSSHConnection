@@ -2,10 +2,10 @@
 # =========** 文件头 =========**
 # 文件        : install-uptermd.sh
 # 所属目录    : deploy/
-# 文件用途    : 在 Ubuntu 主机上幂等地部署或升级自托管 uptermd, 落地系统用户, 目录权限, 主机密钥, 白名单占位, 环境文件, systemd 单元与 journald 上限
+# 文件用途    : 在 Ubuntu 主机上幂等地部署或升级自托管 uptermd, 落地无状态字节转发所需的最小面: 系统用户, 目录权限, 主机密钥, 环境文件, systemd 单元, journald 上限, 禁落盘与空路由自检
 # 架构定位    : 运维部署层; 上游是运维人员手工执行, 下游是 systemd 托管的 uptermd 进程与 relay 客户端
-# 核心功能    : 依赖校验, 系统用户与目录准备, 主机密钥生成, 发布包下载与哈希校验, 二进制安装与版本核对, 环境文件与单元写入, 服务启停与监听校验
-# 职责边界    : 不改系统 sshd 端口, 不改云安全组, 不写入宿主公钥内容, 不做密钥轮换; 22 端口被占用时只报错并给出处置提示, 不自动迁移
+# 核心功能    : 依赖校验, 系统用户与目录准备, 主机密钥生成, 发布包下载与哈希校验, 二进制安装与版本核对, 环境文件与单元写入, 服务启停, 监听与资源上限核对, 重启后空路由自检, 禁落盘校验
+# 职责边界    : 不改系统 sshd 端口, 不改云安全组, 不登记任何宿主或访客公钥, 不写 authorized_keys, 不做密钥轮换, 不应用防火墙规则; 22 端口被占用时只报错并给出处置提示, 不自动迁移
 # 运行环境    : Ubuntu 20.04 及以上, bash 5.x, 以 root 执行, 需出网访问 GitHub Releases
 # 依赖关系    : 依赖 curl, tar, find, sha256sum, ssh-keygen, systemctl, jq, ss, install, id, getent, awk, cmp, mktemp; 由 deploy/README.md 的部署章节调用
 #
@@ -16,18 +16,21 @@
 #               UPTERMD_BIN_PATH         二进制安装路径, 默认 /usr/local/bin/uptermd
 #               UPTERMD_USER             运行身份, 默认 upterm
 #               UPTERMD_STATE_DIR        状态与主机密钥目录, 默认 /var/lib/uptermd
-#               UPTERMD_CONF_DIR         配置与白名单目录, 默认 /etc/uptermd
-#               UPTERMD_SSH_ADDR         relay 监听地址, 默认 0.0.0.0:22
+#               UPTERMD_CONF_DIR         配置目录, 默认 /etc/uptermd
+#               UPTERMD_SSH_ADDR         relay SSH 监听地址, 默认 0.0.0.0:22
+#               UPTERMD_WS_ADDR          relay WS 监听地址, 默认 127.0.0.1:8443; 公网 443 由 TLS 终止层转发
 #               UPTERMD_SSH_NETWORK      监听协议族, 默认 tcp4
-#               UPTERMD_METRIC_ADDR      指标监听地址, 默认 127.0.0.1:9100
+#               UPTERMD_METRIC_ADDR      指标监听地址, 默认 127.0.0.1:9100, 只允许环回
+#               UPTERMD_RUNTIME_DIR      运行期内存目录, 默认 /run/uptermd; 只允许该目录可写
 #               UPTERMD_HANDSHAKE_TIMEOUT 握手超时, 默认 60s
+#               UPTERMD_CHECK_WAIT_ATTEMPTS 自检等待次数, 默认 10
 #               UPTERMD_UNIT_PATH        systemd 单元安装路径, 默认 /etc/systemd/system/uptermd.service
 #               UPTERMD_UNIT_SRC         单元模板路径, 默认与本脚本同目录的 uptermd.service
 #               UPTERMD_DEPLOY_LOG_DIR   部署日志根目录, 默认 /var/log/uptermd-deploy/logs
 #               UPTERMD_FETCH_ATTEMPTS   下载重试次数, 默认 3
 # 退出码      : 0 成功或无需变更; 2 参数或环境非法; 3 依赖命令缺失; 4 非 root; 5 下载或哈希校验失败;
 #               6 二进制版本与请求不符; 7 目录或密钥准备失败; 8 systemd 写入或服务启动失败; 9 relay 端口被占用;
-#               130 收到 INT; 143 收到 TERM
+#               10 重启后空路由或禁落盘自检未通过; 11 资源上限未生效; 130 收到 INT; 143 收到 TERM
 # 运行平台    : Linux only
 
 set -Eeuo pipefail
@@ -43,7 +46,6 @@ set -Eeuo pipefail
 #   _ensure_user -> 0/7: 幂等创建运行身份
 #   _ensure_dirs -> 0/7: 幂等创建目录与权限
 #   _ensure_host_key -> 0/7: 缺密钥时生成, 已有则保留
-#   _ensure_authorized_keys -> 0/7: 缺白名单时写占位并告警
 #   _detect_arch -> 0/2: 输出发布包架构后缀
 #   _fetch <url> <dest> -> 0/5: 带次数上限下载
 #   _resolve_sha256 <asset> <dir> -> 0/5: 取期望哈希
@@ -53,7 +55,12 @@ set -Eeuo pipefail
 #   _apply_file <src> <dst> <mode> <owner> <group> -> 0/7: 内容有差异才写入
 #   _apply_journald_limits -> 0/8: 写入并生效 journald 上限
 #   _port_in_use <addr> -> 0/1: 判断监听端口是否已被占用
-#   _restart_service -> 0/8: 按变更情况启停并等待就绪
+#   _metrics_url -> 0: 由指标监听地址生成环回访问地址
+#   _metric_value <name> -> 0/1: 读取单个指标值
+#   _restart_service -> 0/8/9: 按变更情况启停并等待监听就绪
+#   _verify_empty_routes -> 0/10: 重启后确认内存路由为空
+#   _verify_no_disk_write -> 0/10: 确认运行期未落盘会话文件
+#   _verify_limits -> 0/11: 确认单元资源上限已生效
 #   _summary -> 0: 输出部署结果摘要
 #   _cleanup -> 0: 删除临时目录, 幂等
 
@@ -66,14 +73,17 @@ SVC_USER="${UPTERMD_USER:-upterm}"
 STATE_DIR="${UPTERMD_STATE_DIR:-/var/lib/uptermd}"
 CONF_DIR="${UPTERMD_CONF_DIR:-/etc/uptermd}"
 SSH_ADDR="${UPTERMD_SSH_ADDR:-0.0.0.0:22}"
+WS_ADDR="${UPTERMD_WS_ADDR:-127.0.0.1:8443}"
 SSH_NETWORK="${UPTERMD_SSH_NETWORK:-tcp4}"
 METRIC_ADDR="${UPTERMD_METRIC_ADDR:-127.0.0.1:9100}"
+RUNTIME_DIR="${UPTERMD_RUNTIME_DIR:-/run/uptermd}"
 HANDSHAKE_TIMEOUT="${UPTERMD_HANDSHAKE_TIMEOUT:-60s}"
 UNIT_PATH="${UPTERMD_UNIT_PATH:-/etc/systemd/system/uptermd.service}"
 LOG_DIR="${UPTERMD_DEPLOY_LOG_DIR:-/var/log/uptermd-deploy/logs}"
 FETCH_ATTEMPTS="${UPTERMD_FETCH_ATTEMPTS:-3}"
 START_WAIT_ATTEMPTS="${UPTERMD_START_WAIT_ATTEMPTS:-15}"
 START_WAIT_INTERVAL_S="${UPTERMD_START_WAIT_INTERVAL_S:-1}"
+CHECK_WAIT_ATTEMPTS="${UPTERMD_CHECK_WAIT_ATTEMPTS:-10}"
 
 # 单元模板默认取脚本同目录, 不依赖调用者工作目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -81,7 +91,6 @@ UNIT_SRC="${UPTERMD_UNIT_SRC:-${SCRIPT_DIR}/uptermd.service}"
 
 SERVICE_NAME="uptermd.service"
 KEY_PATH="${STATE_DIR}/server_key"
-AUTH_KEYS="${CONF_DIR}/authorized_keys"
 ENV_FILE="${CONF_DIR}/uptermd.env"
 JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
 JOURNALD_DROPIN="${JOURNALD_DROPIN_DIR}/90-uptermd-limits.conf"
@@ -92,6 +101,7 @@ LOG_FILE=""
 DRY_RUN=0
 CHANGED=0
 WARNED=0
+RESTARTED=0
 TMP_DIR=""
 CLEANED=0
 
@@ -111,10 +121,11 @@ log_usage() {
   --bin-path <path>         二进制安装路径
   --user <name>             运行身份
   --state-dir <path>        状态与主机密钥目录
-  --conf-dir <path>         配置与白名单目录
-  --ssh-addr <addr:port>    relay 监听地址
+  --conf-dir <path>         配置目录
+  --ssh-addr <addr:port>    relay SSH 监听地址
+  --ws-addr <addr:port>     relay WS 监听地址, 公网 443 由 TLS 终止层转发
   --ssh-network <tcp4>      监听协议族
-  --metric-addr <addr:port> 指标监听地址
+  --metric-addr <addr:port> 指标监听地址, 只允许环回
   --handshake-timeout <dur> 握手超时, 取值 1s 到 120s
   --unit-path <path>        systemd 单元安装路径
   --unit-src <path>         单元模板路径
@@ -206,6 +217,7 @@ _parse_args() {
             --state-dir) STATE_DIR="${2:?缺少 --state-dir 取值}"; shift 2 ;;
             --conf-dir) CONF_DIR="${2:?缺少 --conf-dir 取值}"; shift 2 ;;
             --ssh-addr) SSH_ADDR="${2:?缺少 --ssh-addr 取值}"; shift 2 ;;
+            --ws-addr) WS_ADDR="${2:?缺少 --ws-addr 取值}"; shift 2 ;;
             --ssh-network) SSH_NETWORK="${2:?缺少 --ssh-network 取值}"; shift 2 ;;
             --metric-addr) METRIC_ADDR="${2:?缺少 --metric-addr 取值}"; shift 2 ;;
             --handshake-timeout) HANDSHAKE_TIMEOUT="${2:?缺少 --handshake-timeout 取值}"; shift 2 ;;
@@ -219,7 +231,6 @@ _parse_args() {
     done
     # 派生路径在解析后重算, 避免沿用默认目录
     KEY_PATH="${STATE_DIR}/server_key"
-    AUTH_KEYS="${CONF_DIR}/authorized_keys"
     ENV_FILE="${CONF_DIR}/uptermd.env"
     LOG_FILE="${LOG_DIR}/${RUN_ID}.jsonl"
 }
@@ -278,7 +289,7 @@ _ensure_dirs() {
     fi
     install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$STATE_DIR" \
         || _die 7 "deploy.dir.failed" "创建状态目录失败: path=${STATE_DIR}"
-    # 配置目录属主 root, 组为运行身份只读, 运行身份无法改写白名单
+    # 配置目录属主 root, 组为运行身份只读, 运行身份无法改写配置
     install -d -m 0750 -o root -g "$SVC_USER" "$CONF_DIR" \
         || _die 7 "deploy.dir.failed" "创建配置目录失败: path=${CONF_DIR}"
 }
@@ -307,29 +318,6 @@ _ensure_host_key() {
     CHANGED=1
     # 指纹属路由信息可公开; 私钥内容不打印
     _log INFO "deploy.hostkey.created" "已生成主机密钥" "{\"fingerprint\":$(jq -Rn --arg v "$fp" '$v')}"
-}
-
-_ensure_authorized_keys() {
-    # 用途: 白名单文件缺失时写占位, 并提示空名单会拒绝所有宿主注册
-    # 参数: 无
-    # 返回: 无; 退出码: 0 或 7
-    if [[ -s "$AUTH_KEYS" ]]; then
-        _log INFO "deploy.allowlist.exists" "宿主白名单已存在, 不覆盖" "{\"path\":$(jq -Rn --arg v "$AUTH_KEYS" '$v')}"
-        return 0
-    fi
-    if (( DRY_RUN == 1 )); then
-        _say "演练: 将写入白名单占位 ${AUTH_KEYS}"
-        return 0
-    fi
-    printf '%s\n' \
-        '# 宿主注册公钥白名单: 一行一把, 只放 GitHub Actions 宿主用的公钥, 不要放个人日常密钥' \
-        '# 填写后执行 systemctl restart uptermd.service 生效; 空名单会拒绝所有宿主注册' \
-        >"${AUTH_KEYS}.tmp" || _die 7 "deploy.allowlist.failed" "写白名单占位失败: path=${AUTH_KEYS}"
-    chown root:"$SVC_USER" "${AUTH_KEYS}.tmp"
-    chmod 0640 "${AUTH_KEYS}.tmp"
-    mv -f "${AUTH_KEYS}.tmp" "$AUTH_KEYS"
-    _log WARNING "deploy.allowlist.empty" "白名单为空, 当前不会接受任何宿主注册, 需人工填入公钥" \
-        "{\"path\":$(jq -Rn --arg v "$AUTH_KEYS" '$v')}"
 }
 
 _detect_arch() {
@@ -454,10 +442,11 @@ _render_env() {
     cat >"$1" <<EOF
 # 由 deploy/install-uptermd.sh 生成, 手工修改会被下次执行覆盖
 # 只放路由与密钥路径, 不放任何私钥内容
+# 不设置 UPTERMD_AUTHORIZED_KEYS: 宿主注册门禁关闭, 中转不做任何准入判定
 UPTERMD_SSH_ADDR=${SSH_ADDR}
+UPTERMD_WS_ADDR=${WS_ADDR}
 UPTERMD_SSH_NETWORK=${SSH_NETWORK}
 UPTERMD_PRIVATE_KEY=${KEY_PATH}
-UPTERMD_AUTHORIZED_KEYS=${AUTH_KEYS}
 UPTERMD_HANDSHAKE_TIMEOUT=${HANDSHAKE_TIMEOUT}
 UPTERMD_METRIC_ADDR=${METRIC_ADDR}
 EOF
@@ -523,11 +512,37 @@ _port_in_use() {
     return 1
 }
 
+_metrics_url() {
+    # 用途: 由指标监听地址生成环回访问地址, 避免把 0.0.0.0 当作可连接目标
+    # 参数: 无
+    # 返回: 标准输出 URL; 退出码: 0 或 2
+    local host="${METRIC_ADDR%:*}" port="${METRIC_ADDR##*:}"
+    if [[ -z "$host" || -z "$port" || "$host" == "$METRIC_ADDR" ]]; then
+        _die 2 "deploy.metric_addr.invalid" "指标监听地址需为 host:port 形式: addr=${METRIC_ADDR}"
+    fi
+    if [[ "$host" == "0.0.0.0" ]]; then
+        host="127.0.0.1"
+    fi
+    printf 'http://%s:%s/metrics' "$host" "$port"
+}
+
+_metric_value() {
+    # 用途: 从 Prometheus 指标中读取单个未带标签的指标值
+    # 参数: $1 指标名
+    # 返回: 标准输出指标值; 退出码: 0 成功; 1 指标不可用或缺失
+    local name="$1" url body
+    url="$(_metrics_url)"
+    if ! body="$(curl -fsS --connect-timeout 2 --max-time 5 "$url")"; then
+        return 1
+    fi
+    printf '%s\n' "$body" | awk -v n="$name" '$1 == n { v = $2 } END { if (v == "") exit 1; print v }'
+}
+
 _restart_service() {
-    # 用途: 按变更情况启停服务并等待就绪, 未变更时保持运行
+    # 用途: 按变更情况启停服务并等待 SSH 与 WS 监听就绪, 未变更时保持运行
     # 参数: 无
     # 返回: 无; 退出码: 0 或 8 或 9
-    local attempt
+    local attempt addr
     if (( DRY_RUN == 1 )); then
         _say "演练: 将执行 systemctl daemon-reload 并按变更情况 enable/restart ${SERVICE_NAME}"
         return 0
@@ -536,22 +551,119 @@ _restart_service() {
     # enable 的输出只是链接已存在的提示, 不承载判定信息
     systemctl enable "$SERVICE_NAME" >/dev/null || _die 8 "deploy.systemd.enable" "设置开机自启失败"
     if (( CHANGED == 1 )); then
-        if _port_in_use "$SSH_ADDR" && ! systemctl is-active --quiet "$SERVICE_NAME"; then
-            _die 9 "deploy.port.conflict" "监听地址已被占用: addr=${SSH_ADDR}; 请先迁移系统 sshd 或改用 --ssh-addr"
-        fi
+        for addr in "$SSH_ADDR" "$WS_ADDR"; do
+            if [[ -n "$addr" ]] && _port_in_use "$addr" && ! systemctl is-active --quiet "$SERVICE_NAME"; then
+                _die 9 "deploy.port.conflict" "监听地址已被占用: addr=${addr}; 请先迁移系统 sshd 或改用 --ssh-addr/--ws-addr"
+            fi
+        done
         systemctl restart "$SERVICE_NAME" || _die 8 "deploy.service.restart" "重启服务失败: unit=${SERVICE_NAME}"
-    else
+        RESTARTED=1
+    elif ! systemctl is-active --quiet "$SERVICE_NAME"; then
         systemctl start "$SERVICE_NAME" || _die 8 "deploy.service.start" "启动服务失败: unit=${SERVICE_NAME}"
+        RESTARTED=1
+    else
+        _log INFO "deploy.service.running" "服务已在运行且无变更, 不重启" "{}"
     fi
     for (( attempt = 1; attempt <= START_WAIT_ATTEMPTS; attempt++ )); do
-        if systemctl is-active --quiet "$SERVICE_NAME" && _port_in_use "$SSH_ADDR"; then
+        if systemctl is-active --quiet "$SERVICE_NAME" \
+            && _port_in_use "$SSH_ADDR" \
+            && { [[ -z "$WS_ADDR" ]] || _port_in_use "$WS_ADDR"; }; then
             _log INFO "deploy.service.ready" "服务已就绪" "{\"attempt\":${attempt}}"
             return 0
         fi
         _log WARNING "deploy.service.wait" "服务尚未就绪, 继续等待" "{\"attempt\":${attempt}}"
         sleep "$START_WAIT_INTERVAL_S"
     done
-    _die 8 "deploy.service.not_ready" "服务在等待上限内未就绪: attempts=${START_WAIT_ATTEMPTS} addr=${SSH_ADDR}"
+    _die 8 "deploy.service.not_ready" "服务在等待上限内未就绪: attempts=${START_WAIT_ATTEMPTS} ssh=${SSH_ADDR} ws=${WS_ADDR}"
+}
+
+_verify_empty_routes() {
+    # 用途: 重启后确认中转内存路由为空, 作为无状态自检
+    # 参数: 无
+    # 返回: 无; 退出码: 0 或 10
+    local attempt value
+    if (( DRY_RUN == 1 )); then
+        _say "演练: 重启后读取 routing_active_connections_count 并确认其为 0"
+        return 0
+    fi
+    if (( RESTARTED == 0 )); then
+        _log INFO "deploy.routes.skip" "本次未重启服务, 空路由自检由健康检查脚本负责" "{}"
+        return 0
+    fi
+    for (( attempt = 1; attempt <= CHECK_WAIT_ATTEMPTS; attempt++ )); do
+        if value="$(_metric_value routing_active_connections_count)"; then
+            if [[ "$value" == "0" ]]; then
+                _log INFO "deploy.routes.empty" "重启后路由为空" "{\"attempt\":${attempt}}"
+                return 0
+            fi
+            _log WARNING "deploy.routes.not_empty" "重启后仍有活动路由, 继续观察" \
+                "{\"attempt\":${attempt},\"active\":${value}}"
+        else
+            _log WARNING "deploy.routes.unavailable" "指标不可用, 继续观察" "{\"attempt\":${attempt}}"
+        fi
+        sleep "$START_WAIT_INTERVAL_S"
+    done
+    _die 10 "deploy.routes.not_empty" "重启后路由未清空或指标不可用, 不满足无状态判据: active=${value:-unknown}"
+}
+
+_verify_no_disk_write() {
+    # 用途: 确认运行期目录为空, 状态目录除主机密钥与轮换归档外没有新增文件
+    # 参数: 无
+    # 返回: 无; 退出码: 0 或 10
+    local extras=() path base
+    if (( DRY_RUN == 1 )); then
+        _say "演练: 检查 ${RUNTIME_DIR} 为空, 且 ${STATE_DIR} 只含主机密钥与轮换归档"
+        return 0
+    fi
+    if [[ -d "$RUNTIME_DIR" ]]; then
+        while read -r path; do
+            extras+=("$path")
+        done < <(find "$RUNTIME_DIR" -mindepth 1 -maxdepth 2 -print)
+    fi
+    if [[ -d "$STATE_DIR" ]]; then
+        while read -r path; do
+            base="${path#"${STATE_DIR}"/}"
+            case "$base" in
+                server_key|server_key.pub|archive|archive/*) ;;
+                *) extras+=("$path") ;;
+            esac
+        done < <(find "$STATE_DIR" -mindepth 1 -maxdepth 2 -type f)
+    fi
+    if (( ${#extras[@]} > 0 )); then
+        _log ERROR "deploy.disk_write.detected" "运行期出现预期外文件, 可能发生会话落盘" \
+            "{\"extra_count\":${#extras[@]},\"first_path\":$(jq -Rn --arg v "${extras[0]}" '$v')}"
+        _die 10 "deploy.disk_write.detected" "禁落盘校验未通过: extra_count=${#extras[@]} first=${extras[0]}"
+    fi
+    _log INFO "deploy.disk_write.clean" "运行期未发现会话文件" \
+        "{\"runtime_dir\":$(jq -Rn --arg v "$RUNTIME_DIR" '$v'),\"state_dir\":$(jq -Rn --arg v "$STATE_DIR" '$v')}"
+}
+
+_verify_limits() {
+    # 用途: 确认单元的内存, CPU 与任务数上限已由 systemd 生效
+    # 参数: 无
+    # 返回: 无; 退出码: 0 或 11
+    local mem cpu tasks
+    if (( DRY_RUN == 1 )); then
+        _say "演练: 核对 MemoryMax=1G, CPUQuota=150%, TasksMax=512 已生效"
+        return 0
+    fi
+    mem="$(systemctl show -p MemoryMax --value "$SERVICE_NAME")" \
+        || _die 11 "deploy.limits.read" "读取 MemoryMax 失败"
+    cpu="$(systemctl show -p CPUQuotaPerSecUSec --value "$SERVICE_NAME")" \
+        || _die 11 "deploy.limits.read" "读取 CPUQuota 失败"
+    tasks="$(systemctl show -p TasksMax --value "$SERVICE_NAME")" \
+        || _die 11 "deploy.limits.read" "读取 TasksMax 失败"
+    if [[ "$mem" != "1073741824" && "$mem" != "1G" ]]; then
+        _die 11 "deploy.limits.memory" "MemoryMax 与设计不符: actual=${mem}"
+    fi
+    if [[ "$cpu" != "1500000" && "$cpu" != "1.5s" ]]; then
+        _die 11 "deploy.limits.cpu" "CPUQuota 与设计不符: actual=${cpu}"
+    fi
+    if [[ "$tasks" != "512" ]]; then
+        _die 11 "deploy.limits.tasks" "TasksMax 与设计不符: actual=${tasks}"
+    fi
+    _log INFO "deploy.limits.ok" "资源上限已生效" \
+        "{\"memory_max\":$(jq -Rn --arg v "$mem" '$v'),\"cpu_quota\":$(jq -Rn --arg v "$cpu" '$v'),\"tasks_max\":${tasks}}"
 }
 
 _summary() {
@@ -571,10 +683,13 @@ _summary() {
     fi
     _say "----------------------------------------"
     _say "uptermd 版本     : ${ver}"
-    _say "监听地址         : ${SSH_ADDR} (${SSH_NETWORK})"
+    _say "SSH 监听地址     : ${SSH_ADDR} (${SSH_NETWORK})"
+    _say "WS 监听地址      : ${WS_ADDR}"
     _say "指标地址         : ${METRIC_ADDR}"
+    _say "运行期目录       : ${RUNTIME_DIR}"
     _say "主机密钥指纹     : ${fp}"
-    _say "宿主白名单       : ${AUTH_KEYS}"
+    _say "宿主注册门禁     : 关闭 (未设置 UPTERMD_AUTHORIZED_KEYS)"
+    _say "防火墙           : 需单独执行 deploy/firewall.sh --apply"
     _say "服务状态         : ${state}"
     _say "本次是否变更     : $(( CHANGED == 1 ? 1 : 0 ))"
     _say "部署日志         : ${LOG_FILE}"
@@ -625,7 +740,6 @@ _log INFO "deploy.run.started" "开始部署 uptermd" \
 _ensure_user
 _ensure_dirs
 _ensure_host_key
-_ensure_authorized_keys
 _install_binary "$TMP_DIR"
 
 ENV_TMP="${TMP_DIR}/uptermd.env"
@@ -639,4 +753,7 @@ _apply_file "$UNIT_SRC" "$UNIT_PATH" 0644 root root
 
 _apply_journald_limits
 _restart_service
+_verify_limits
+_verify_empty_routes
+_verify_no_disk_write
 _summary
