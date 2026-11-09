@@ -1,0 +1,8 @@
+# 文件: requirements-web-admission.txt
+# 所属目录: scripts/
+# 文件用途: runner 侧网页准入进程的依赖锁文件; 只锁版本, 不使用范围版本.
+# 运行环境: Python 3.10 以上, runner 为 Ubuntu; 安装命令: python -m pip install -r scripts/requirements-web-admission.txt
+fido2==2.2.1
+cryptography==50.0.2
+cffi==2.1.1
+pycparser==3.12
