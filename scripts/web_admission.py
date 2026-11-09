@@ -22,6 +22,9 @@
 
 允许清单文件只允许公钥与凭据标识, 格式为 JSON 数组:
   [{"credential_id": "<base64url>", "public_key": "<base64url CBOR COSE 公钥>", "transports": ["internal"]}]
+
+空数组([]) + --allow-registration 表示首次自举: 本会话只接受首个注册请求, 成功后立即绑定该凭据,
+同一会话内后续注册一律拒绝; 自举凭据只存在于本进程内存, 不写仓库变量、不落盘、不打印公钥.
 """
 
 from __future__ import annotations
@@ -98,6 +101,8 @@ REASON_CHALLENGE_REUSED = "CHALLENGE_REUSED"
 REASON_BAD_CLIENT_VERSION = "BAD_CLIENT_VERSION"
 REASON_REGISTRATION_CLOSED = "REGISTRATION_CLOSED"
 REASON_REGISTRATION_INVALID = "REGISTRATION_INVALID"
+# 空清单自举注册已用掉: 同一会话内不再受理任何注册请求.
+REASON_BOOTSTRAP_CONSUMED = "BOOTSTRAP_CONSUMED"
 REASON_TERMINAL_UNAVAILABLE = "TERMINAL_UNAVAILABLE"
 REASON_AUTH_TIMEOUT = "AUTH_TIMEOUT"
 REASON_PROTOCOL_ERROR = "PROTOCOL_ERROR"
@@ -328,13 +333,14 @@ def _parse_cose_public_key(cose_bytes: bytes) -> Any:
         raise ValueError("COSE 公钥无法解析") from exc
 
 
-def load_allowed_credentials(path: str) -> dict[bytes, AllowedCredential]:
+def load_allowed_credentials(path: str, allow_empty: bool = False) -> dict[bytes, AllowedCredential]:
     """
     读取允许清单文件; 文件只允许公钥与凭据标识.
 
     :param path: 允许清单路径, 由 runner 侧在作业内生成, 随作业销毁.
-    :return: 以凭据标识为键的允许清单.
-    :raises ConfigError: 文件不可读、JSON 非法、为空、条目非法或凭据重复时抛出.
+    :param allow_empty: 允许空数组; 只在同时开放注册时使用, 用于首次自举注册.
+    :return: 以凭据标识为键的允许清单; 空文件且 allow_empty 为真时返回空字典.
+    :raises ConfigError: 文件不可读、JSON 非法、为空且未允许、条目非法或凭据重复时抛出.
     """
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -345,7 +351,7 @@ def load_allowed_credentials(path: str) -> dict[bytes, AllowedCredential]:
         raise ConfigError(f"允许清单不是合法 JSON: {path}") from exc
     if not isinstance(raw, list):
         raise ConfigError("允许清单顶层必须是数组")
-    if not raw:
+    if not raw and not allow_empty:
         raise ConfigError("允许清单为空, 无法受理任何凭据")
 
     credentials: dict[bytes, AllowedCredential] = {}
@@ -837,6 +843,8 @@ class SessionOptions:
     rp_id: str = DEFAULT_RP_ID
     rp_name: str = DEFAULT_RP_NAME
     allow_registration: bool = False
+    # 空清单自举: 本会话最多接受一次注册, 成功即绑定, 后续注册一律拒绝.
+    bootstrap_registration: bool = False
     challenge_ttl_seconds: float = DEFAULT_CHALLENGE_TTL_SECONDS
     auth_timeout_seconds: float = DEFAULT_AUTH_TIMEOUT_SECONDS
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
@@ -871,6 +879,8 @@ class AdmissionSession:
         self._pending: _PendingChallenge | None = None
         self._consumed: dict[str, float] = {}
         self._failed_attempts = 0
+        # 空清单自举成功后绑定的凭据标识; 只在内存, 进程结束即消失.
+        self._bootstrap_credential_id: bytes | None = None
         self._terminal: Any = None
         self._started_at = clock()
 
@@ -1058,6 +1068,18 @@ class AdmissionSession:
             )
             return (self._send_auth_result(False, REASON_REGISTRATION_CLOSED),)
 
+        if intent == "register" and self._bootstrap_credential_id is not None:
+            # 自举窗口只开一次: 首个注册成功即绑定本会话, 不再签发注册挑战
+            self._logger.log(
+                "WARNING",
+                "admission.registration.rejected",
+                "自举注册已用掉, 本会话不再受理注册",
+                session_id=self.session_id,
+                reason=REASON_BOOTSTRAP_CONSUMED,
+                stage="registration",
+            )
+            return (self._send_auth_result(False, REASON_BOOTSTRAP_CONSUMED),)
+
         challenge = secrets.token_bytes(32)
         self._pending = _PendingChallenge(
             value=challenge,
@@ -1151,6 +1173,18 @@ class AdmissionSession:
             )
             return (self._send_auth_result(False, REASON_REGISTRATION_CLOSED),)
 
+        if self._bootstrap_credential_id is not None:
+            # 自举窗口只开一次; 即便客户端拿旧注册挑战重放也被拒
+            self._logger.log(
+                "WARNING",
+                "admission.registration.rejected",
+                "自举注册已用掉, 丢弃注册材料",
+                session_id=self.session_id,
+                reason=REASON_BOOTSTRAP_CONSUMED,
+                stage="registration",
+            )
+            return (self._send_auth_result(False, REASON_BOOTSTRAP_CONSUMED),)
+
         try:
             source = _parse_json_object(payload)
             challenge_text = _extract_challenge_text(source)
@@ -1170,14 +1204,26 @@ class AdmissionSession:
             return self._reject(exc.reason, exc.detail, now)
 
         self._verifier.credentials[credential.credential_id] = credential
-        self._logger.log(
-            "INFO",
-            "admission.registration.accepted",
-            "已登记新凭据公钥",
-            session_id=self.session_id,
-            credential_id=b64url_encode(credential.credential_id),
-            stage="registration",
-        )
+        if self._options.bootstrap_registration and self._bootstrap_credential_id is None:
+            # 空清单自举: 只绑定到本会话内存, 不写仓库变量、不落盘、不打印公钥
+            self._bootstrap_credential_id = credential.credential_id
+            self._logger.log(
+                "INFO",
+                "admission.bootstrap_registered",
+                "空清单自举注册成功, 本会话已绑定该凭据",
+                session_id=self.session_id,
+                credential_id_prefix=b64url_encode(credential.credential_id)[:8],
+                registered_at=round(time.time(), 3),
+            )
+        else:
+            self._logger.log(
+                "INFO",
+                "admission.registration.accepted",
+                "已登记新凭据公钥",
+                session_id=self.session_id,
+                credential_id=b64url_encode(credential.credential_id),
+                stage="registration",
+            )
         return self._admit(credential.credential_id, now)
 
     # ---------- 挑战消费 ----------
@@ -1584,7 +1630,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--session-id", required=True, help="本次会话标识, 挑战绑定该值")
     parser.add_argument("--tmux-session", default="actssh", help="目标 tmux 会话名")
-    parser.add_argument("--allowed-credentials", required=True, help="允许清单 JSON 路径, 仅含公钥与凭据标识")
+    parser.add_argument("--allowed-credentials", required=True, help="允许清单 JSON 路径, 仅含公钥与凭据标识; 空数组需配合 --allow-registration 走自举注册")
     parser.add_argument("--allow-registration", action="store_true", help="开放注册入口, 仅限受信通道使用")
     parser.add_argument("--rp-id", default=DEFAULT_RP_ID, help="WebAuthn 依赖方标识")
     parser.add_argument("--rp-name", default=DEFAULT_RP_NAME, help="依赖方展示名")
@@ -1641,7 +1687,9 @@ def run(args: argparse.Namespace, logger: JsonLogger) -> int:
     :return: 进程退出码; 0 正常结束, 2 配置或运行错误.
     """
     _validate_args(args)
-    credentials = load_allowed_credentials(args.allowed_credentials)
+    # 空清单只在同时开放注册时可读入, 用于首次自举注册; 其余情况仍按配置错误退出.
+    credentials = load_allowed_credentials(args.allowed_credentials, allow_empty=bool(args.allow_registration))
+    bootstrap_registration = bool(args.allow_registration) and not credentials
     logger.log(
         "INFO",
         "admission.credentials.loaded",
@@ -1650,6 +1698,14 @@ def run(args: argparse.Namespace, logger: JsonLogger) -> int:
         credential_count=len(credentials),
         stage="startup",
     )
+    if bootstrap_registration:
+        logger.log(
+            "WARNING",
+            "admission.bootstrap.enabled",
+            "允许清单为空且开放注册, 本次会话只接受首个注册请求",
+            session_id=args.session_id,
+            stage="startup",
+        )
     verifier = WebAuthnVerifier(
         rp_id=args.rp_id,
         credentials=credentials,
@@ -1660,6 +1716,7 @@ def run(args: argparse.Namespace, logger: JsonLogger) -> int:
         rp_id=args.rp_id,
         rp_name=args.rp_name,
         allow_registration=bool(args.allow_registration),
+        bootstrap_registration=bootstrap_registration,
         challenge_ttl_seconds=args.challenge_ttl,
         auth_timeout_seconds=args.auth_timeout,
         max_attempts=args.max_attempts,

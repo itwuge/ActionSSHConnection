@@ -146,6 +146,7 @@ class AdmissionTestCase(unittest.TestCase):
         *,
         credentials: list[AllowedCredential] | None = None,
         allow_registration: bool = False,
+        bootstrap_registration: bool = False,
         challenge_ttl: float = 60.0,
         auth_timeout: float = 120.0,
         max_attempts: int = 3,
@@ -157,6 +158,7 @@ class AdmissionTestCase(unittest.TestCase):
         options = SessionOptions(
             session_id="session-1",
             allow_registration=allow_registration,
+            bootstrap_registration=bootstrap_registration,
             challenge_ttl_seconds=challenge_ttl,
             auth_timeout_seconds=auth_timeout,
             max_attempts=max_attempts,
@@ -246,6 +248,15 @@ class AdmissionTestCase(unittest.TestCase):
         """发送 authAssertion 并返回动作序列."""
         payload = json.dumps(assertion, separators=(",", ":")).encode("utf-8")
         return session.handle(Frame(FRAME_AUTH_ASSERTION, payload), now=self.clock.value)
+
+    def submit_registration(
+        self,
+        session: AdmissionSession,
+        registration: dict[str, str],
+    ) -> tuple[Any, ...]:
+        """发送注册材料并返回动作序列."""
+        payload = json.dumps(registration, separators=(",", ":")).encode("utf-8")
+        return session.handle(Frame(FRAME_REGISTRATION, payload), now=self.clock.value)
 
     def build_registration(
         self,
@@ -479,6 +490,149 @@ class AdmissionTestCase(unittest.TestCase):
         actions = session.handle(Frame(FRAME_REGISTRATION, json.dumps(registration).encode("utf-8")), now=self.clock.value)
         self.assertEqual(self.result_from(actions)["reason"], "REGISTRATION_CLOSED")
 
+    # ---------- 空清单自举注册 ----------
+    def _bootstrap_register(
+        self,
+        session: AdmissionSession,
+        *,
+        credential_id: bytes = b"bootstrap-credential",
+        key: Any | None = None,
+    ) -> dict[str, Any]:
+        """走完一次注册: 取挑战 -> 提交材料 -> 返回 authResult."""
+        challenge = self.challenge_from(self.begin(session, intent="register"))
+        registration = self.build_registration(challenge, credential_id=credential_id, key=key)
+        return self.result_from(self.submit_registration(session, registration))
+
+    def test_bootstrap_registration_with_empty_allowlist(self) -> None:
+        """空清单 + 开放注册时, 首个注册请求应成功并放行."""
+        session = self.make_session(credentials=[], allow_registration=True, bootstrap_registration=True)
+        result = self._bootstrap_register(session, credential_id=b"bootstrap-1")
+        self.assertTrue(result["ok"])
+        self.assertTrue(session.authenticated)
+        self.assertEqual(len(self.terminals), 1)
+        # 白盒: 自举凭据只进本进程内存, 没有落盘路径
+        self.assertIn(b"bootstrap-1", session._verifier.credentials)
+
+    def test_bootstrap_second_registration_rejected(self) -> None:
+        """首个注册成功后, 同一会话不再签发注册挑战, 注册材料也被丢弃."""
+        session = self.make_session(credentials=[], allow_registration=True, bootstrap_registration=True)
+        self.assertTrue(self._bootstrap_register(session, credential_id=b"bootstrap-2")["ok"])
+
+        # 已准入后再次发起注册: 不产生任何注册挑战
+        self.assertEqual(self.begin(session, intent="register"), ())
+        self.assertEqual(session.handle(Frame(FRAME_REGISTRATION, b"{}"), now=self.clock.value), ())
+        self.assertEqual(len(session._verifier.credentials), 1)
+
+    def test_bootstrap_consumed_guard_rejects_late_registration(self) -> None:
+        """绑定已建立但尚未准入时, 迟到的注册材料按 BOOTSTRAP_CONSUMED 拒绝."""
+        session = self.make_session(credentials=[], allow_registration=True, bootstrap_registration=True)
+        challenge = self.challenge_from(self.begin(session, intent="register"))
+        # 模拟「首个注册已成功绑定」的中间态, 并清掉待消费挑战以保证走到自举守卫
+        session._bootstrap_credential_id = b"already-bound"
+        session._pending = None
+
+        actions = self.begin(session, intent="register")
+        self.assertEqual(self.result_from(actions)["reason"], "BOOTSTRAP_CONSUMED")
+
+        stale = self.submit_registration(session, self.build_registration(challenge))
+        self.assertEqual(self.result_from(stale)["reason"], "BOOTSTRAP_CONSUMED")
+        self.assertFalse(session.authenticated)
+
+    def test_bootstrap_disabled_when_allowlist_not_empty(self) -> None:
+        """清单非空时行为不变: 开放注册仍可用, 但不触发自举绑定与自举日志."""
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            logger = JsonLogger("run-bootstrap-off", level="INFO")
+            session = self.make_session(allow_registration=True, bootstrap_registration=False, logger=logger)
+            result = self._bootstrap_register(session, credential_id=b"listed-2")
+            logger.close()
+
+        self.assertTrue(result["ok"])
+        self.assertIsNone(session._bootstrap_credential_id)
+        output = buffer.getvalue()
+        self.assertIn("admission.registration.accepted", output)
+        self.assertNotIn("admission.bootstrap_registered", output)
+
+    def test_assertion_accepted_after_bootstrap_registration(self) -> None:
+        """自举登记的公钥应能用于后续断言验签."""
+        session = self.make_session(credentials=[], allow_registration=True, bootstrap_registration=True)
+        key = ec.generate_private_key(ec.SECP256R1())
+        result = self._bootstrap_register(session, credential_id=b"bootstrap-3", key=key)
+        self.assertTrue(result["ok"])
+
+        verifier = WebAuthnVerifier(DEFAULT_RP_ID, dict(session._verifier.credentials))
+        terminals: list[FakeTerminal] = []
+
+        def factory() -> FakeTerminal:
+            terminal = FakeTerminal()
+            terminals.append(terminal)
+            return terminal
+
+        follow_up = AdmissionSession(
+            options=SessionOptions(session_id="session-1"),
+            verifier=verifier,
+            logger=self.logger,
+            terminal_factory=factory,
+            clock=self.clock,
+        )
+        challenge = self.challenge_from(self.begin(follow_up))
+        actions = self.submit_assertion(
+            follow_up,
+            self.build_assertion(challenge, credential_id=b"bootstrap-3", signing_key=key),
+        )
+        self.assertTrue(self.result_from(actions)["ok"])
+        self.assertTrue(follow_up.authenticated)
+        self.assertEqual(len(terminals), 1)
+
+    def test_bootstrap_binding_disappears_with_process(self) -> None:
+        """绑定只在进程内: 新进程式的新会话回到空清单, 可重新自举."""
+        session = self.make_session(credentials=[], allow_registration=True, bootstrap_registration=True)
+        self.assertTrue(self._bootstrap_register(session, credential_id=b"bootstrap-4")["ok"])
+
+        terms: list[FakeTerminal] = []
+
+        def factory() -> FakeTerminal:
+            terminal = FakeTerminal()
+            terms.append(terminal)
+            return terminal
+
+        fresh_verifier = WebAuthnVerifier(DEFAULT_RP_ID, {})
+        fresh = AdmissionSession(
+            options=SessionOptions(session_id="session-1", allow_registration=True, bootstrap_registration=True),
+            verifier=fresh_verifier,
+            logger=self.logger,
+            terminal_factory=factory,
+            clock=self.clock,
+        )
+        self.assertEqual(fresh_verifier.credentials, {})
+        result = self._bootstrap_register(fresh, credential_id=b"bootstrap-5")
+        self.assertTrue(result["ok"])
+        self.assertIn(b"bootstrap-5", fresh_verifier.credentials)
+
+    def test_bootstrap_log_carries_only_allowed_fields(self) -> None:
+        """自举日志只含 session_id、凭据标识前 8 位与时间, 不含公钥与完整凭据标识."""
+        buffer = io.StringIO()
+        credential_id = b"bootstrap-credential-abcdef"
+        with contextlib.redirect_stderr(buffer):
+            logger = JsonLogger("run-bootstrap-log", level="INFO")
+            session = self.make_session(credentials=[], allow_registration=True, bootstrap_registration=True, logger=logger)
+            self.assertTrue(self._bootstrap_register(session, credential_id=credential_id)["ok"])
+            logger.close()
+
+        records = [json.loads(line) for line in buffer.getvalue().splitlines() if line.strip()]
+        bootstrap = [record for record in records if record["event"] == "admission.bootstrap_registered"]
+        self.assertEqual(len(bootstrap), 1)
+        record = bootstrap[0]
+        self.assertEqual(
+            set(record.keys()),
+            {"ts", "level", "logger", "event", "msg", "run_id", "session_id", "credential_id_prefix", "registered_at"},
+        )
+        self.assertEqual(record["session_id"], "session-1")
+        self.assertEqual(record["credential_id_prefix"], b64url_encode(credential_id)[:8])
+        self.assertIsInstance(record["registered_at"], float)
+        self.assertNotIn("public_key", json.dumps(record))
+        self.assertNotIn(b64url_encode(credential_id), json.dumps(record))
+
     # ---------- 日志 ----------
     def test_logs_follow_whitelist_and_carry_no_assertion_material(self) -> None:
         """日志必须是带基础字段的 JSON 行, 且不含断言原文、签名或挑战."""
@@ -583,6 +737,14 @@ class AllowedCredentialsTestCase(unittest.TestCase):
                 json.dump([], handle)
             with self.assertRaises(ConfigError):
                 load_allowed_credentials(path)
+
+    def test_empty_list_allowed_for_bootstrap(self) -> None:
+        """显式允许空清单时返回空字典, 供自举注册使用."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "allowed.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump([], handle)
+            self.assertEqual(load_allowed_credentials(path, allow_empty=True), {})
 
 
 if __name__ == "__main__":

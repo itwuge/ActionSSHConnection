@@ -244,6 +244,7 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
 | 日志 | 只记连接元数据（`session_id`、对端地址、字节数、关闭码/令牌）；不记帧内容、不记凭据；`session_id` 属路由信息可原样记录 |
 | runner 客户端 | `start_web_bridge <session_id> <bridge_ws_base> <admission_cmd>`；stdout 恰好一行五字段 JSON；日志写 stderr；`web_admission.py` 命令行契约不变 |
 | 退出码 | 0 正常结束；1 连不上、被拒（`ROUTE_CONFLICT`/`ROUTE_GONE`/`UNKNOWN_SESSION`）；2 参数错误、准入子进程启动失败或非零退出、转发异常 |
+| 空清单自举 | 允许清单为空数组 `[]` 且准入开放注册时，首个完成的注册被接受并立即绑定本次 `session_id`；同一会话后续注册一律以 `BOOTSTRAP_CONSUMED` 拒绝。非空清单行为不变（仍需 `--allow-registration`） |
 
 依赖锁定 `websockets==10.4`：`requires-python >=3.7`，Ubuntu 20.04 的 Python 3.8 可直接安装；纯 Python 无编译依赖；同时提供 `websockets.serve()` 与 `websockets.connect()` 两套稳定接口，满足中继与 runner 两侧，不引入更重的框架。
 
@@ -339,3 +340,12 @@ python3 -m venv .venv-bridge
 | 7 | 同会话第二个 runner 注册被拒、不静默顶替 | 两路 runner 客户端同时注册，观察 1008 `ROUTE_CONFLICT` |
 | 8 | 单元沙箱与真机内核兼容 | 重点看 `ProtectSystem=strict`、`SystemCallFilter=@system-service`、`IPAddressDeny=any` 是否导致启动失败；docker0 网段不是 172.17.0.0/16 时须改 `IPAddressAllow` |
 | 9 | WebAuthn 的 RP ID / origin 与 `https://wuge.fun` 一致 | 真实域名下完成一次注册与一次断言 |
+
+### 12.8 空清单自举注册（已知残余风险）
+
+首次使用没有可预置的公开凭据，按 tmate 语义允许自举：`WEBAUTHN_ALLOWED_CREDENTIALS` 为空数组 `[]` 且准入开放注册时，`web_admission.py` 接受**首个**完成的注册请求，并立即把本次 `session_id` 绑定到该凭据；同一会话后续注册一律以 `BOOTSTRAP_CONSUMED` 拒绝，非空清单行为不变。
+
+- 凭据只存在于准入进程内存与浏览器 localStorage，不写仓库变量、不落盘、不打印公钥；日志只多一条 `admission.bootstrap_registered`，字段为 `session_id`、`credential_id_prefix`（前 8 位）、`registered_at`。
+- **残余风险**：自举窗口期内，会话链接等同门票。任何人拿到 `https://wuge.fun/t/<session_id>` 都能完成这次注册并成为凭据持有者；此期间不具备「只有本人能进」的保证。
+- 窗口关闭时机：首个注册成功即关闭；会话结束、runner 断开或准入进程退出后绑定与凭据一并消失。进程重启不会恢复任何绑定。
+- 需要限定设备的场景不要用空数组，改为预置该设备的公开凭据；该风险同时记录在 `.team/records/设计更正-网页桥接落点-20261109.md` 的「已知残余风险」。
