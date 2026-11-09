@@ -29,6 +29,16 @@ if [ -n "$workdir" ] && [ -f "$workdir/direct.state" ] && [ -f "$workdir/path_ve
       echo "直连待验证，尚未确认是否经过 DERP"
       ;;
   esac
+  # 后台校验进程的输出只在会话期间的步骤日志里；最终值写进收尾步骤摘要，作业结束后可查
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+      echo ""
+      echo "直连路径最终判定（条件字段，不属于 9 个 outputs）："
+      echo '```text'
+      echo "path_verified=${final_verified:-unknown}"
+      echo '```'
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
 fi
 
 if [ -n "$workdir" ] && [ -f "$workdir/direct-verify.follow.pid" ]; then

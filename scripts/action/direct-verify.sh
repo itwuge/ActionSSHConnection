@@ -55,9 +55,6 @@ while [ -d "$workdir" ]; do
           echo "直连待验证，尚未确认是否经过 DERP"
           ;;
       esac
-      if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-        echo "path_verified=$value" >> "$GITHUB_STEP_SUMMARY"
-      fi
       last="$value"
     fi
   fi
