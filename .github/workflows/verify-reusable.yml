@@ -1,0 +1,41 @@
+name: 验证可复用工作流（临时）
+
+# 临时验证用：以 workflow_call 方式调用 reusable-session.yml，确认 9 个 outputs 传到调用方 job。
+# 验证完成后由 G01 删除本文件。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  session:
+    permissions:
+      contents: read
+    uses: itwuge/ActionSSHConnection/.github/workflows/reusable-session.yml@v1
+    with:
+      ssh: true
+      session-minutes: "45"
+
+  report:
+    needs: session
+    runs-on: ubuntu-latest
+    steps:
+      - name: 打印 workflow_call outputs
+        run: |
+          set -euo pipefail
+          {
+            echo '```text'
+            echo "session-id=${{ needs.session.outputs.session-id }}"
+            echo "ssh-user=${{ needs.session.outputs.ssh-user }}"
+            echo "relay-host=${{ needs.session.outputs.relay-host }}"
+            echo "relay-port=${{ needs.session.outputs.relay-port }}"
+            echo "web-url=${{ needs.session.outputs.web-url }}"
+            echo "pubkey-fingerprint=${{ needs.session.outputs.pubkey-fingerprint }}"
+            echo "expires-at=${{ needs.session.outputs.expires-at }}"
+            echo "pubkey-credential-id=${{ needs.session.outputs.pubkey-credential-id }}"
+            echo "path-mode=${{ needs.session.outputs.path-mode }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"

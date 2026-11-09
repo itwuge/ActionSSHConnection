@@ -1,0 +1,51 @@
+name: 验证 Composite Action（临时）
+
+# 临时验证用：与 examples/action-minimal.yml 等价的远程 Action 调用（只多了制品开关，用于核对 9 字段）。
+# 验证完成后由 G01 删除本文件。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: 建立调试会话
+        id: ssh
+        uses: itwuge/ActionSSHConnection@v1
+        with:
+          ssh: true
+          route-artifact-name: route-fields
+
+      - name: 打印 9 个 outputs
+        if: always()
+        env:
+          SESSION_ID: ${{ steps.ssh.outputs.session-id }}
+          SSH_USER: ${{ steps.ssh.outputs.ssh-user }}
+          RELAY_HOST: ${{ steps.ssh.outputs.relay-host }}
+          RELAY_PORT: ${{ steps.ssh.outputs.relay-port }}
+          WEB_URL: ${{ steps.ssh.outputs.web-url }}
+          FINGERPRINT: ${{ steps.ssh.outputs.pubkey-fingerprint }}
+          EXPIRES_AT: ${{ steps.ssh.outputs.expires-at }}
+          CREDENTIAL_ID: ${{ steps.ssh.outputs.pubkey-credential-id }}
+          PATH_MODE: ${{ steps.ssh.outputs.path-mode }}
+        run: |
+          set -euo pipefail
+          {
+            echo '```text'
+            echo "session_id=$SESSION_ID"
+            echo "ssh_user=$SSH_USER"
+            echo "relay_host=$RELAY_HOST"
+            echo "relay_port=$RELAY_PORT"
+            echo "web_url=$WEB_URL"
+            echo "pubkey_fingerprint=$FINGERPRINT"
+            echo "expires_at=$EXPIRES_AT"
+            echo "pubkey_credential_id=$CREDENTIAL_ID"
+            echo "path_mode=$PATH_MODE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
