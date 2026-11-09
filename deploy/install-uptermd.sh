@@ -339,7 +339,8 @@ _fetch() {
     # 返回: 无; 退出码: 0 或 5
     local url="$1" dest="$2" attempt
     for (( attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++ )); do
-        if curl -fsS --connect-timeout 10 --max-time 300 -o "$dest" "$url"; then
+        # GitHub Releases 先 302 跳转到对象存储, 必须 -L 跟随; 空文件视为失败
+        if curl -fsSL --connect-timeout 10 --max-time 300 -o "$dest" "$url" && [[ -s "$dest" ]]; then
             _log INFO "deploy.fetch.done" "下载完成" "{\"attempt\":${attempt}}"
             return 0
         fi
