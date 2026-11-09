@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =========** 文件头 =========**
 # 文件        : install-uptermd.sh
-# 所属目录    : deploy/
+# 所属目录    : relay/
 # 文件用途    : 在 Ubuntu 主机上幂等地部署或升级自托管 uptermd, 落地无状态字节转发所需的最小面: 系统用户, 目录权限, 主机密钥, 环境文件, systemd 单元, 可选 journald 上限, 禁落盘与空路由自检
 # 架构定位    : 运维部署层; 上游是运维人员手工执行, 下游是 systemd 托管的 uptermd 进程与 relay 客户端
 # 核心功能    : 依赖校验, 系统用户与目录准备, 主机密钥生成, 发布包下载与哈希校验, 二进制安装与版本核对, 环境文件与单元写入, 服务启停, 监听与资源上限核对, 重启后空路由自检, 禁落盘校验
 # 职责边界    : 不改系统 sshd 端口, 不改云安全组, 不登记任何宿主或访客公钥, 不写 authorized_keys, 不做密钥轮换, 不应用防火墙规则; 22 端口被占用时只报错并给出处置提示, 不自动迁移
 # 运行环境    : Ubuntu 20.04 及以上, bash 5.x, 以 root 执行, 需出网访问 GitHub Releases
-# 依赖关系    : 依赖 curl, tar, find, sha256sum, ssh-keygen, systemctl, jq, ss, install, id, getent, awk, cmp, mktemp; 由 deploy/README.md 的部署章节调用
+# 依赖关系    : 依赖 curl, tar, find, sha256sum, ssh-keygen, systemctl, jq, ss, install, id, getent, awk, cmp, mktemp; 由 relay/README.md 的部署章节调用
 #
 # 输入        : 以下均可用同名环境变量预置, 命令行参数优先于环境变量
 #               UPTERMD_VERSION          待安装版本, 默认 v0.41.1
@@ -28,7 +28,7 @@
 #                                        因为中继可能与其他服务共用一台机, 全局封顶会影响同机其它服务
 #               UPTERMD_UNIT_PATH        systemd 单元安装路径, 默认 /etc/systemd/system/uptermd.service
 #               UPTERMD_UNIT_SRC         单元模板路径, 默认与本脚本同目录的 uptermd.service
-#               UPTERMD_DEPLOY_LOG_DIR   部署日志根目录, 默认 /var/log/uptermd-deploy/logs
+#               UPTERMD_DEPLOY_LOG_DIR   部署日志根目录, 默认 /var/log/uptermd-relay/logs
 #               UPTERMD_FETCH_ATTEMPTS   下载重试次数, 默认 3
 # 退出码      : 0 成功或无需变更; 2 参数或环境非法; 3 依赖命令缺失; 4 非 root; 5 下载或哈希校验失败;
 #               6 二进制版本与请求不符; 7 目录或密钥准备失败; 8 systemd 写入或服务启动失败; 9 relay 端口被占用;
@@ -81,7 +81,7 @@ METRIC_ADDR="${UPTERMD_METRIC_ADDR:-127.0.0.1:9100}"
 RUNTIME_DIR="${UPTERMD_RUNTIME_DIR:-/run/uptermd}"
 HANDSHAKE_TIMEOUT="${UPTERMD_HANDSHAKE_TIMEOUT:-60s}"
 UNIT_PATH="${UPTERMD_UNIT_PATH:-/etc/systemd/system/uptermd.service}"
-LOG_DIR="${UPTERMD_DEPLOY_LOG_DIR:-/var/log/uptermd-deploy/logs}"
+LOG_DIR="${UPTERMD_DEPLOY_LOG_DIR:-/var/log/uptermd-relay/logs}"
 FETCH_ATTEMPTS="${UPTERMD_FETCH_ATTEMPTS:-3}"
 START_WAIT_ATTEMPTS="${UPTERMD_START_WAIT_ATTEMPTS:-15}"
 START_WAIT_INTERVAL_S="${UPTERMD_START_WAIT_INTERVAL_S:-1}"
@@ -97,7 +97,7 @@ KEY_PATH="${STATE_DIR}/server_key"
 ENV_FILE="${CONF_DIR}/uptermd.env"
 JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
 JOURNALD_DROPIN="${JOURNALD_DROPIN_DIR}/90-uptermd-limits.conf"
-LOGGER="deploy.install_uptermd"
+LOGGER="relay.install_uptermd"
 
 RUN_ID="$(date -u '+%Y%m%d_%H%M%S')_$$"
 LOG_FILE=""
@@ -202,7 +202,7 @@ _on_error() {
         trace+="${FUNCNAME[$i]}(${BASH_LINENO[$((i - 1))]}) "
     done
     set +e   # 钩子内不得再触发 ERR, 由各函数自行判定并记录
-    _log ERROR "deploy.command.failed" "命令执行失败" \
+    _log ERROR "relay.command.failed" "命令执行失败" \
         "{\"exc_type\":\"ShellCommandError\",\"exc_msg\":$(jq -Rn --arg v "exit=${code} line=${line} cmd=${cmd}" '$v'),\"stack\":$(jq -Rn --arg v "$trace" '$v')}"
     printf '[ERROR] 命令失败: exit=%s line=%s cmd=%s\n' "$code" "$line" "$cmd" >&2
     set -e   # 恢复失败即停, 交由 EXIT 钩子清理
@@ -245,7 +245,7 @@ _require_root() {
     # 参数: 无
     # 返回: 无; 退出码: 0 或 4
     if [[ "$(id -u)" -ne 0 ]]; then
-        _die 4 "deploy.not_root" "需要以 root 执行, 当前 uid=$(id -u)"
+        _die 4 "relay.not_root" "需要以 root 执行, 当前 uid=$(id -u)"
     fi
 }
 
@@ -261,7 +261,7 @@ _require_cmds() {
         fi
     done
     if (( ${#missing[@]} > 0 )); then
-        _die 3 "deploy.deps.missing" "依赖命令缺失: ${missing[*]}"
+        _die 3 "relay.deps.missing" "依赖命令缺失: ${missing[*]}"
     fi
 }
 
@@ -270,7 +270,7 @@ _ensure_user() {
     # 参数: 无
     # 返回: 无; 退出码: 0 或 7
     if getent passwd "$SVC_USER" >/dev/null 2>&1; then
-        _log INFO "deploy.user.exists" "运行身份已存在" "{\"user\":$(jq -Rn --arg v "$SVC_USER" '$v')}"
+        _log INFO "relay.user.exists" "运行身份已存在" "{\"user\":$(jq -Rn --arg v "$SVC_USER" '$v')}"
         return 0
     fi
     if (( DRY_RUN == 1 )); then
@@ -279,9 +279,9 @@ _ensure_user() {
         return 0
     fi
     useradd --system --home-dir "$STATE_DIR" --shell /usr/sbin/nologin "$SVC_USER" \
-        || _die 7 "deploy.user.failed" "创建用户失败: user=${SVC_USER}"
+        || _die 7 "relay.user.failed" "创建用户失败: user=${SVC_USER}"
     CHANGED=1
-    _log INFO "deploy.user.created" "已创建运行身份" "{\"user\":$(jq -Rn --arg v "$SVC_USER" '$v')}"
+    _log INFO "relay.user.created" "已创建运行身份" "{\"user\":$(jq -Rn --arg v "$SVC_USER" '$v')}"
 }
 
 _ensure_dirs() {
@@ -293,10 +293,10 @@ _ensure_dirs() {
         return 0
     fi
     install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$STATE_DIR" \
-        || _die 7 "deploy.dir.failed" "创建状态目录失败: path=${STATE_DIR}"
+        || _die 7 "relay.dir.failed" "创建状态目录失败: path=${STATE_DIR}"
     # 配置目录属主 root, 组为运行身份只读, 运行身份无法改写配置
     install -d -m 0750 -o root -g "$SVC_USER" "$CONF_DIR" \
-        || _die 7 "deploy.dir.failed" "创建配置目录失败: path=${CONF_DIR}"
+        || _die 7 "relay.dir.failed" "创建配置目录失败: path=${CONF_DIR}"
 }
 
 _ensure_host_key() {
@@ -305,7 +305,7 @@ _ensure_host_key() {
     # 返回: 无; 退出码: 0 或 7; 失败输出: 不含密钥内容的错误行
     local fp
     if [[ -f "$KEY_PATH" ]]; then
-        _log INFO "deploy.hostkey.exists" "主机密钥已存在, 保留不覆盖" "{\"path\":$(jq -Rn --arg v "$KEY_PATH" '$v')}"
+        _log INFO "relay.hostkey.exists" "主机密钥已存在, 保留不覆盖" "{\"path\":$(jq -Rn --arg v "$KEY_PATH" '$v')}"
         return 0
     fi
     if (( DRY_RUN == 1 )); then
@@ -314,15 +314,15 @@ _ensure_host_key() {
         return 0
     fi
     ssh-keygen -q -t ed25519 -N '' -C "uptermd-relay" -f "$KEY_PATH" \
-        || _die 7 "deploy.hostkey.failed" "生成主机密钥失败: path=${KEY_PATH}"
+        || _die 7 "relay.hostkey.failed" "生成主机密钥失败: path=${KEY_PATH}"
     chown "$SVC_USER:$SVC_USER" "$KEY_PATH" "$KEY_PATH.pub" \
-        || _die 7 "deploy.hostkey.failed" "设置主机密钥属主失败: path=${KEY_PATH}"
+        || _die 7 "relay.hostkey.failed" "设置主机密钥属主失败: path=${KEY_PATH}"
     chmod 0600 "$KEY_PATH"
     chmod 0644 "$KEY_PATH.pub"
     fp="$(ssh-keygen -lf "$KEY_PATH.pub" | awk '{print $2}')"
     CHANGED=1
     # 指纹属路由信息可公开; 私钥内容不打印
-    _log INFO "deploy.hostkey.created" "已生成主机密钥" "{\"fingerprint\":$(jq -Rn --arg v "$fp" '$v')}"
+    _log INFO "relay.hostkey.created" "已生成主机密钥" "{\"fingerprint\":$(jq -Rn --arg v "$fp" '$v')}"
 }
 
 _detect_arch() {
@@ -334,7 +334,7 @@ _detect_arch() {
         aarch64) printf 'arm64' ;;
         ppc64le) printf 'ppc64le' ;;
         s390x) printf 's390x' ;;
-        *) _die 2 "deploy.arch.unsupported" "不支持的 CPU 架构: $(uname -m)" ;;
+        *) _die 2 "relay.arch.unsupported" "不支持的 CPU 架构: $(uname -m)" ;;
     esac
 }
 
@@ -346,29 +346,30 @@ _fetch() {
     for (( attempt = 1; attempt <= FETCH_ATTEMPTS; attempt++ )); do
         # GitHub Releases 先 302 跳转到对象存储, 必须 -L 跟随; 空文件视为失败
         if curl -fsSL --connect-timeout 10 --max-time 300 -o "$dest" "$url" && [[ -s "$dest" ]]; then
-            _log INFO "deploy.fetch.done" "下载完成" "{\"attempt\":${attempt}}"
+            _log INFO "relay.fetch.done" "下载完成" "{\"attempt\":${attempt}}"
             return 0
         fi
-        _log WARNING "deploy.fetch.retry" "下载失败, 准备重试" "{\"attempt\":${attempt}}"
+        _log WARNING "relay.fetch.retry" "下载失败, 准备重试" "{\"attempt\":${attempt}}"
     done
-    _die 5 "deploy.fetch.failed" "下载失败且重试耗尽: url=${url} attempts=${FETCH_ATTEMPTS}"
+    _die 5 "relay.fetch.failed" "下载失败且重试耗尽: url=${url} attempts=${FETCH_ATTEMPTS}"
 }
 
 _resolve_sha256() {
     # 用途: 取发布包期望哈希; 优先用显式传入值, 否则读 checksums.txt
     # 参数: $1 发布包文件名; $2 临时目录
     # 返回: 标准输出哈希值; 退出码: 0 或 5
-    local asset="$1" dir="$2" sums="$dir/checksums.txt" hash
+    local asset="$1" dir="$2" hash
+    local sums="$dir/checksums.txt"
     if [[ -n "$EXPECTED_SHA256" ]]; then
         printf '%s' "$EXPECTED_SHA256"
         return 0
     fi
     _fetch "${RELEASE_BASE}/${VERSION}/checksums.txt" "$sums"
     # 只做完整性校验: 来源与发布包同域, 不构成真实性证明, 故降级为 WARNING
-    _log WARNING "deploy.sha256.fallback" "未提供 --sha256, 回落到同版本 checksums.txt, 仅能发现传输损坏" "{}"
+    _log WARNING "relay.sha256.fallback" "未提供 --sha256, 回落到同版本 checksums.txt, 仅能发现传输损坏" "{}"
     hash="$(awk -v name="$asset" '$2 == name { print $1 }' "$sums")"
     if [[ -z "$hash" ]]; then
-        _die 5 "deploy.sha256.missing" "checksums.txt 中未找到发布包条目: asset=${asset}"
+        _die 5 "relay.sha256.missing" "checksums.txt 中未找到发布包条目: asset=${asset}"
     fi
     printf '%s' "$hash"
 }
@@ -408,24 +409,24 @@ _install_binary() {
     want="$(_resolve_sha256 "$asset" "$dir")"
     got="$(sha256sum "$tarball" | awk '{print $1}')"
     if [[ "$got" != "$want" ]]; then
-        _die 5 "deploy.sha256.mismatch" "发布包哈希不匹配: expect=${want} actual=${got}"
+        _die 5 "relay.sha256.mismatch" "发布包哈希不匹配: expect=${want} actual=${got}"
     fi
 
     mkdir -p "$extract"
     tar -xzf "$tarball" -C "$extract" \
-        || _die 5 "deploy.unpack.failed" "解包失败: asset=${asset}"
+        || _die 5 "relay.unpack.failed" "解包失败: asset=${asset}"
     newbin="$(find "$extract" -maxdepth 2 -type f -name uptermd -print -quit)"
     if [[ -z "$newbin" ]]; then
-        _die 5 "deploy.unpack.failed" "解包结果中未找到 uptermd: asset=${asset}"
+        _die 5 "relay.unpack.failed" "解包结果中未找到 uptermd: asset=${asset}"
     fi
     chmod 0755 "$newbin"
 
     detected=""
     if ! detected="$(_binary_version "$newbin")"; then
-        _die 6 "deploy.version.unknown" "无法识别新二进制版本: asset=${asset}"
+        _die 6 "relay.version.unknown" "无法识别新二进制版本: asset=${asset}"
     fi
     if [[ "$detected" != "$desired" ]]; then
-        _die 6 "deploy.version.mismatch" "二进制版本与请求不符: expect=${desired} actual=${detected}"
+        _die 6 "relay.version.mismatch" "二进制版本与请求不符: expect=${desired} actual=${detected}"
     fi
 
     if (( DRY_RUN == 1 )); then
@@ -434,10 +435,10 @@ _install_binary() {
         return 0
     fi
     install -m 0755 -o root -g root "$newbin" "${BIN_PATH}.new" \
-        || _die 7 "deploy.binary.install" "写入二进制失败: path=${BIN_PATH}.new"
+        || _die 7 "relay.binary.install" "写入二进制失败: path=${BIN_PATH}.new"
     mv -f "${BIN_PATH}.new" "$BIN_PATH"
     CHANGED=1
-    _log INFO "deploy.binary.installed" "二进制已更新" \
+    _log INFO "relay.binary.installed" "二进制已更新" \
         "{\"version\":$(jq -Rn --arg v "$detected" '$v'),\"path\":$(jq -Rn --arg v "$BIN_PATH" '$v')}"
 }
 
@@ -446,7 +447,7 @@ _render_env() {
     # 参数: $1 目标临时文件
     # 返回: 无; 退出码: 0
     cat >"$1" <<EOF
-# 由 deploy/install-uptermd.sh 生成, 手工修改会被下次执行覆盖
+# 由 relay/install-uptermd.sh 生成, 手工修改会被下次执行覆盖
 # 只放路由与密钥路径, 不放任何私钥内容
 # 不设置 UPTERMD_AUTHORIZED_KEYS: 宿主注册门禁关闭, 中转不做任何准入判定
 UPTERMD_SSH_ADDR=${SSH_ADDR}
@@ -465,7 +466,7 @@ _apply_file() {
     local src="$1" dst="$2" mode="$3" owner="$4" group="$5"
     local stage="${dst}.tmp.$$"
     if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
-        _log INFO "deploy.file.unchanged" "文件内容未变化, 跳过写入" "{\"path\":$(jq -Rn --arg v "$dst" '$v')}"
+        _log INFO "relay.file.unchanged" "文件内容未变化, 跳过写入" "{\"path\":$(jq -Rn --arg v "$dst" '$v')}"
         return 0
     fi
     if (( DRY_RUN == 1 )); then
@@ -475,10 +476,10 @@ _apply_file() {
     fi
     # 先写同目录暂存文件再改名, 避免进程读到半截内容
     install -m "$mode" -o "$owner" -g "$group" "$src" "$stage" \
-        || _die 7 "deploy.file.write_failed" "写入暂存文件失败: path=${stage}"
-    mv -f "$stage" "$dst" || _die 7 "deploy.file.write_failed" "替换文件失败: path=${dst}"
+        || _die 7 "relay.file.write_failed" "写入暂存文件失败: path=${stage}"
+    mv -f "$stage" "$dst" || _die 7 "relay.file.write_failed" "替换文件失败: path=${dst}"
     CHANGED=1
-    _log INFO "deploy.file.written" "文件已更新" "{\"path\":$(jq -Rn --arg v "$dst" '$v')}"
+    _log INFO "relay.file.written" "文件已更新" "{\"path\":$(jq -Rn --arg v "$dst" '$v')}"
 }
 
 _apply_journald_limits() {
@@ -488,7 +489,7 @@ _apply_journald_limits() {
     local tmp="${TMP_DIR}/journald.conf" before="$CHANGED"
     if [[ -z "$JOURNALD_MAX" ]]; then
         _say "跳过 journald 上限: 未指定 --journald-max, 保持系统原有日志策略"
-        _log INFO "deploy.journald.skipped" "未指定 journald 上限, 不写片段" "{}"
+        _log INFO "relay.journald.skipped" "未指定 journald 上限, 不写片段" "{}"
         return 0
     fi
     if [[ ! -d "$JOURNALD_DROPIN_DIR" ]]; then
@@ -500,14 +501,14 @@ _apply_journald_limits() {
     fi
     printf '%s\n' \
         '[Journal]' \
-        '# 由 deploy/install-uptermd.sh 按 --journald-max 生成, 全局生效' \
+        '# 由 relay/install-uptermd.sh 按 --journald-max 生成, 全局生效' \
         "SystemMaxUse=${JOURNALD_MAX}" \
         'SystemMaxFileSize=50M' \
         >"$tmp"
     _apply_file "$tmp" "$JOURNALD_DROPIN" 0644 root root
     if (( CHANGED != before && DRY_RUN == 0 )); then
         systemctl restart systemd-journald \
-            || _die 8 "deploy.journald.restart" "重启 systemd-journald 失败"
+            || _die 8 "relay.journald.restart" "重启 systemd-journald 失败"
     fi
 }
 
@@ -529,7 +530,7 @@ _metrics_url() {
     # 返回: 标准输出 URL; 退出码: 0 或 2
     local host="${METRIC_ADDR%:*}" port="${METRIC_ADDR##*:}"
     if [[ -z "$host" || -z "$port" || "$host" == "$METRIC_ADDR" ]]; then
-        _die 2 "deploy.metric_addr.invalid" "指标监听地址需为 host:port 形式: addr=${METRIC_ADDR}"
+        _die 2 "relay.metric_addr.invalid" "指标监听地址需为 host:port 形式: addr=${METRIC_ADDR}"
     fi
     if [[ "$host" == "0.0.0.0" ]]; then
         host="127.0.0.1"
@@ -579,34 +580,34 @@ _restart_service() {
         _say "演练: 将执行 systemctl daemon-reload 并按变更情况 enable/restart ${SERVICE_NAME}"
         return 0
     fi
-    systemctl daemon-reload || _die 8 "deploy.systemd.reload" "daemon-reload 失败"
+    systemctl daemon-reload || _die 8 "relay.systemd.reload" "daemon-reload 失败"
     # enable 的输出只是链接已存在的提示, 不承载判定信息
-    systemctl enable "$SERVICE_NAME" >/dev/null || _die 8 "deploy.systemd.enable" "设置开机自启失败"
+    systemctl enable "$SERVICE_NAME" >/dev/null || _die 8 "relay.systemd.enable" "设置开机自启失败"
     if (( CHANGED == 1 )); then
         for addr in "$SSH_ADDR" "$WS_ADDR"; do
             if [[ -n "$addr" ]] && _port_in_use "$addr" && ! systemctl is-active --quiet "$SERVICE_NAME"; then
-                _die 9 "deploy.port.conflict" "监听地址已被占用: addr=${addr}; 请先迁移系统 sshd 或改用 --ssh-addr/--ws-addr"
+                _die 9 "relay.port.conflict" "监听地址已被占用: addr=${addr}; 请先迁移系统 sshd 或改用 --ssh-addr/--ws-addr"
             fi
         done
-        systemctl restart "$SERVICE_NAME" || _die 8 "deploy.service.restart" "重启服务失败: unit=${SERVICE_NAME}"
+        systemctl restart "$SERVICE_NAME" || _die 8 "relay.service.restart" "重启服务失败: unit=${SERVICE_NAME}"
         RESTARTED=1
     elif ! systemctl is-active --quiet "$SERVICE_NAME"; then
-        systemctl start "$SERVICE_NAME" || _die 8 "deploy.service.start" "启动服务失败: unit=${SERVICE_NAME}"
+        systemctl start "$SERVICE_NAME" || _die 8 "relay.service.start" "启动服务失败: unit=${SERVICE_NAME}"
         RESTARTED=1
     else
-        _log INFO "deploy.service.running" "服务已在运行且无变更, 不重启" "{}"
+        _log INFO "relay.service.running" "服务已在运行且无变更, 不重启" "{}"
     fi
     for (( attempt = 1; attempt <= START_WAIT_ATTEMPTS; attempt++ )); do
         if systemctl is-active --quiet "$SERVICE_NAME" \
             && _port_in_use "$SSH_ADDR" \
             && { [[ -z "$WS_ADDR" ]] || _port_in_use "$WS_ADDR"; }; then
-            _log INFO "deploy.service.ready" "服务已就绪" "{\"attempt\":${attempt}}"
+            _log INFO "relay.service.ready" "服务已就绪" "{\"attempt\":${attempt}}"
             return 0
         fi
-        _log WARNING "deploy.service.wait" "服务尚未就绪, 继续等待" "{\"attempt\":${attempt}}"
+        _log WARNING "relay.service.wait" "服务尚未就绪, 继续等待" "{\"attempt\":${attempt}}"
         sleep "$START_WAIT_INTERVAL_S"
     done
-    _die 8 "deploy.service.not_ready" "服务在等待上限内未就绪: attempts=${START_WAIT_ATTEMPTS} ssh=${SSH_ADDR} ws=${WS_ADDR}"
+    _die 8 "relay.service.not_ready" "服务在等待上限内未就绪: attempts=${START_WAIT_ATTEMPTS} ssh=${SSH_ADDR} ws=${WS_ADDR}"
 }
 
 _verify_empty_routes() {
@@ -619,23 +620,23 @@ _verify_empty_routes() {
         return 0
     fi
     if (( RESTARTED == 0 )); then
-        _log INFO "deploy.routes.skip" "本次未重启服务, 空路由自检由健康检查脚本负责" "{}"
+        _log INFO "relay.routes.skip" "本次未重启服务, 空路由自检由健康检查脚本负责" "{}"
         return 0
     fi
     for (( attempt = 1; attempt <= CHECK_WAIT_ATTEMPTS; attempt++ )); do
         if value="$(_active_routes_value)"; then
             if [[ "$value" == "0" ]]; then
-                _log INFO "deploy.routes.empty" "重启后路由为空" "{\"attempt\":${attempt}}"
+                _log INFO "relay.routes.empty" "重启后路由为空" "{\"attempt\":${attempt}}"
                 return 0
             fi
-            _log WARNING "deploy.routes.not_empty" "重启后仍有活动路由, 继续观察" \
+            _log WARNING "relay.routes.not_empty" "重启后仍有活动路由, 继续观察" \
                 "{\"attempt\":${attempt},\"active\":${value}}"
         else
-            _log WARNING "deploy.routes.unavailable" "指标不可用, 继续观察" "{\"attempt\":${attempt}}"
+            _log WARNING "relay.routes.unavailable" "指标不可用, 继续观察" "{\"attempt\":${attempt}}"
         fi
         sleep "$START_WAIT_INTERVAL_S"
     done
-    _die 10 "deploy.routes.not_empty" "重启后路由未清空或指标不可用, 不满足无状态判据: active=${value:-unknown}"
+    _die 10 "relay.routes.not_empty" "重启后路由未清空或指标不可用, 不满足无状态判据: active=${value:-unknown}"
 }
 
 _verify_no_disk_write() {
@@ -662,11 +663,11 @@ _verify_no_disk_write() {
         done < <(find "$STATE_DIR" -mindepth 1 -maxdepth 2 -type f)
     fi
     if (( ${#extras[@]} > 0 )); then
-        _log ERROR "deploy.disk_write.detected" "运行期出现预期外文件, 可能发生会话落盘" \
+        _log ERROR "relay.disk_write.detected" "运行期出现预期外文件, 可能发生会话落盘" \
             "{\"extra_count\":${#extras[@]},\"first_path\":$(jq -Rn --arg v "${extras[0]}" '$v')}"
-        _die 10 "deploy.disk_write.detected" "禁落盘校验未通过: extra_count=${#extras[@]} first=${extras[0]}"
+        _die 10 "relay.disk_write.detected" "禁落盘校验未通过: extra_count=${#extras[@]} first=${extras[0]}"
     fi
-    _log INFO "deploy.disk_write.clean" "运行期未发现会话文件" \
+    _log INFO "relay.disk_write.clean" "运行期未发现会话文件" \
         "{\"runtime_dir\":$(jq -Rn --arg v "$RUNTIME_DIR" '$v'),\"state_dir\":$(jq -Rn --arg v "$STATE_DIR" '$v')}"
 }
 
@@ -680,22 +681,22 @@ _verify_limits() {
         return 0
     fi
     mem="$(systemctl show -p MemoryMax --value "$SERVICE_NAME")" \
-        || _die 11 "deploy.limits.read" "读取 MemoryMax 失败"
+        || _die 11 "relay.limits.read" "读取 MemoryMax 失败"
     cpu="$(systemctl show -p CPUQuotaPerSecUSec --value "$SERVICE_NAME")" \
-        || _die 11 "deploy.limits.read" "读取 CPUQuota 失败"
+        || _die 11 "relay.limits.read" "读取 CPUQuota 失败"
     tasks="$(systemctl show -p TasksMax --value "$SERVICE_NAME")" \
-        || _die 11 "deploy.limits.read" "读取 TasksMax 失败"
+        || _die 11 "relay.limits.read" "读取 TasksMax 失败"
     if [[ "$mem" != "1073741824" && "$mem" != "1G" ]]; then
-        _die 11 "deploy.limits.memory" "MemoryMax 与设计不符: actual=${mem}"
+        _die 11 "relay.limits.memory" "MemoryMax 与设计不符: actual=${mem}"
     fi
     cpu_usec="$(_cpu_quota_usec "$cpu")"
     if [[ "$cpu_usec" != "1500000" ]]; then
-        _die 11 "deploy.limits.cpu" "CPUQuota 与设计不符: actual=${cpu}"
+        _die 11 "relay.limits.cpu" "CPUQuota 与设计不符: actual=${cpu}"
     fi
     if [[ "$tasks" != "512" ]]; then
-        _die 11 "deploy.limits.tasks" "TasksMax 与设计不符: actual=${tasks}"
+        _die 11 "relay.limits.tasks" "TasksMax 与设计不符: actual=${tasks}"
     fi
-    _log INFO "deploy.limits.ok" "资源上限已生效" \
+    _log INFO "relay.limits.ok" "资源上限已生效" \
         "{\"memory_max\":$(jq -Rn --arg v "$mem" '$v'),\"cpu_quota\":$(jq -Rn --arg v "$cpu" '$v'),\"tasks_max\":${tasks}}"
 }
 
@@ -722,12 +723,12 @@ _summary() {
     _say "运行期目录       : ${RUNTIME_DIR}"
     _say "主机密钥指纹     : ${fp}"
     _say "宿主注册门禁     : 关闭 (未设置 UPTERMD_AUTHORIZED_KEYS)"
-    _say "防火墙           : 需单独执行 deploy/firewall.sh --apply"
+    _say "防火墙           : 需单独执行 relay/firewall.sh --apply"
     _say "服务状态         : ${state}"
     _say "本次是否变更     : $(( CHANGED == 1 ? 1 : 0 ))"
     _say "部署日志         : ${LOG_FILE}"
     _say "----------------------------------------"
-    _log INFO "deploy.run.finished" "部署流程结束" "{\"changed\":$(( CHANGED == 1 ? 1 : 0 ))}"
+    _log INFO "relay.run.finished" "部署流程结束" "{\"changed\":$(( CHANGED == 1 ? 1 : 0 ))}"
 }
 
 # =========** 清理 =========**
@@ -767,7 +768,7 @@ _require_root
 _require_cmds
 
 TMP_DIR="$(mktemp -d)"
-_log INFO "deploy.run.started" "开始部署 uptermd" \
+_log INFO "relay.run.started" "开始部署 uptermd" \
     "{\"version\":$(jq -Rn --arg v "$VERSION" '$v'),\"dry_run\":$(( DRY_RUN == 1 ? 1 : 0 ))}"
 
 _ensure_user
@@ -780,7 +781,7 @@ _render_env "$ENV_TMP"
 _apply_file "$ENV_TMP" "$ENV_FILE" 0640 root "$SVC_USER"
 
 if [[ ! -f "$UNIT_SRC" ]]; then
-    _die 8 "deploy.unit.missing" "单元模板不存在: path=${UNIT_SRC}"
+    _die 8 "relay.unit.missing" "单元模板不存在: path=${UNIT_SRC}"
 fi
 _apply_file "$UNIT_SRC" "$UNIT_PATH" 0644 root root
 

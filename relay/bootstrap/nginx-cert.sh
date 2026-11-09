@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =========** 文件头 =========**
 # 文件        : nginx-cert.sh
-# 所属目录    : deploy/bootstrap/
+# 所属目录    : relay/bootstrap/
 # 文件用途    : 在空机器上落地独立 nginx 实例与 HTTPS 入口, 用 certbot HTTP-01 签发并自动续期证书
-# 架构定位    : 部署脚本 TLS 层; 上游是 deploy/bootstrap.sh, 下游是 actssh-nginx.service 与 certbot 续期定时器
+# 架构定位    : 部署脚本 TLS 层; 上游是 relay/install.sh, 下游是 actssh-nginx.service 与 certbot 续期定时器
 # 核心功能    : 独立配置目录与单元安装, 80 端口占用判定, 两阶段配置(先 ACME 后 TLS), 证书签发与续期钩子, 配置校验与重载
 # 职责边界    : 不改 /etc/nginx/sites-enabled, 不接管发行版站点, 不迁移既有 80/443 占用, 不写云安全组, 不打印任何私钥
 # 运行环境    : Ubuntu 20.04 与 22.04, bash 5.x, 以 root 执行, 需可出网访问 ACME 目录
-# 依赖关系    : 依赖 nginx, certbot, openssl, systemctl, ss, curl, jq; 由 deploy/bootstrap.sh 调用
+# 依赖关系    : 依赖 nginx, certbot, openssl, systemctl, ss, curl, jq; 由 relay/install.sh 调用
 #
 # 输入        : 命令行参数优先, 未给出时读取同名环境变量
 #               --domain <fqdn>       证书域名, 必填
@@ -18,6 +18,8 @@
 #               --https-port <port>   默认 443
 #               --bridge-host <host>  WS 上游地址, 默认 127.0.0.1
 #               --bridge-port <port>  WS 上游端口, 默认 8081
+#               --ws-path <path>      浏览器 WS 入口路径, 默认 /ws/
+#               --runner-path <path>  runner 反连 WS 路径, 默认 /runner/
 #               --web-root <dir>      可选静态站点根目录; 缺省时根路径返回 404
 #               --acme-root <dir>     HTTP-01 校验目录, 默认 /var/www/actssh-acme
 #               --cert-dir <dir>      self-signed 证书目录, 默认 /etc/actssh/tls
@@ -31,7 +33,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=deploy/bootstrap/lib.sh
+# shellcheck source=relay/bootstrap/lib.sh
 source "${SCRIPT_DIR}/lib.sh"
 
 # =========** 方法一览 =========**
@@ -61,6 +63,8 @@ HTTP_PORT="${ACTSSH_HTTP_PORT:-80}"
 HTTPS_PORT="${ACTSSH_HTTPS_PORT:-443}"
 BRIDGE_HOST="${ACTSSH_BRIDGE_HOST:-127.0.0.1}"
 BRIDGE_PORT="${ACTSSH_BRIDGE_PORT:-8081}"
+WS_PATH="${ACTSSH_WS_PATH:-/ws/}"
+RUNNER_PATH="${ACTSSH_RUNNER_PATH:-/runner/}"
 WEB_ROOT="${ACTSSH_WEB_ROOT:-}"
 ACME_ROOT="${ACTSSH_ACME_ROOT:-/var/www/actssh-acme}"
 CERT_DIR="${ACTSSH_CERT_DIR:-/etc/actssh/tls}"
@@ -75,7 +79,7 @@ SERVICE="actssh-nginx.service"
 RUN_DIR="/run/actssh-nginx"
 APPLY=0
 
-LOGGER="deploy.bootstrap.nginx_cert"
+LOGGER="relay.bootstrap.nginx_cert"
 RUN_ID="${BS_RUN_ID:-$(date '+%Y%m%d_%H%M%S')_$$}"
 LOG_ROOT="${BS_LOG_DIR:-/var/log/actssh-bootstrap}"
 TMP_DIR=""
@@ -100,6 +104,8 @@ show_usage() {
   --https-port <port>      HTTPS 端口, 默认 443
   --bridge-host <host>     WS 上游地址, 默认 127.0.0.1
   --bridge-port <port>     WS 上游端口, 默认 8081
+  --ws-path <path>         浏览器 WS 入口路径, 默认 /ws/
+  --runner-path <path>     runner 反连 WS 路径, 默认 /runner/
   --web-root <dir>         静态站点根目录, 可省略
   --acme-root <dir>        HTTP-01 校验目录, 默认 /var/www/actssh-acme
   --cert-dir <dir>         自签证书目录, 默认 /etc/actssh/tls
@@ -157,6 +163,8 @@ _parse_args() {
             --https-port) HTTPS_PORT="${2:?缺少 --https-port 取值}"; shift 2 ;;
             --bridge-host) BRIDGE_HOST="${2:?缺少 --bridge-host 取值}"; shift 2 ;;
             --bridge-port) BRIDGE_PORT="${2:?缺少 --bridge-port 取值}"; shift 2 ;;
+            --ws-path) WS_PATH="${2:?缺少 --ws-path 取值}"; shift 2 ;;
+            --runner-path) RUNNER_PATH="${2:?缺少 --runner-path 取值}"; shift 2 ;;
             --web-root) WEB_ROOT="${2:?缺少 --web-root 取值}"; shift 2 ;;
             --acme-root) ACME_ROOT="${2:?缺少 --acme-root 取值}"; shift 2 ;;
             --cert-dir) CERT_DIR="${2:?缺少 --cert-dir 取值}"; shift 2 ;;
@@ -237,7 +245,7 @@ _guard_distro_sites() {
         base="$(basename "$site")"
         if [[ "$base" != "default" ]]; then
             _die 9 "nginx.distro.sites_present" \
-                "检测到既有 nginx 站点: /etc/nginx/sites-enabled/${base}; 本脚本不接管既有站点, 请按 deploy/README.md 迁移节处理"
+                "检测到既有 nginx 站点: /etc/nginx/sites-enabled/${base}; 本脚本不接管既有站点, 请按 relay/README.md 迁移节处理"
         fi
     done
     return 0
@@ -294,7 +302,7 @@ _render_conf() {
         acme_redirect='return 503 "TLS certificate is being issued\n";'
     fi
     cat >"$target" <<EOF
-# 由 deploy/bootstrap/nginx-cert.sh 生成, 请勿手工编辑
+# 由 relay/bootstrap/nginx-cert.sh 生成, 请勿手工编辑
 worker_processes auto;
 pid ${RUN_DIR}/nginx.pid;
 error_log ${LOG_DIR}/error.log warn;
@@ -358,7 +366,7 @@ EOF
         ssl_session_timeout 1h;
         add_header X-Content-Type-Options nosniff always;
 
-        location /ws/ {
+        location ${WS_PATH} {
             proxy_pass http://${BRIDGE_HOST}:${BRIDGE_PORT};
             proxy_http_version 1.1;
             proxy_set_header Upgrade \$http_upgrade;
@@ -372,7 +380,7 @@ EOF
             proxy_buffering off;
         }
 
-        location /runner/ {
+        location ${RUNNER_PATH} {
             proxy_pass http://${BRIDGE_HOST}:${BRIDGE_PORT};
             proxy_http_version 1.1;
             proxy_set_header Upgrade \$http_upgrade;
@@ -585,7 +593,7 @@ _install_renewal() {
     tmp="$(mktemp "${TMP_DIR}/renew-hook.XXXXXX")"
     cat >"$tmp" <<'EOF'
 #!/bin/sh
-# 由 deploy/bootstrap/nginx-cert.sh 生成: 证书续期后重载独立 nginx 实例
+# 由 relay/bootstrap/nginx-cert.sh 生成: 证书续期后重载独立 nginx 实例
 # 钩子失败不得让 certbot 续期整体失败, 因此显式忽略返回码
 systemctl reload actssh-nginx.service || true
 EOF
@@ -619,7 +627,7 @@ _summary() {
         days="$(bs_cert_days_left "$CERT_FILE" || echo '未知')"
         _say "证书有效期: notAfter=$(bs_cert_not_after "$CERT_FILE") 剩余天数=${days}"
     fi
-    _say "入口: https://${DOMAIN}:${HTTPS_PORT}/ws/ 与 /runner/ 反代到 ${BRIDGE_HOST}:${BRIDGE_PORT}"
+    _say "入口: https://${DOMAIN}:${HTTPS_PORT}${WS_PATH} 与 ${RUNNER_PATH} 反代到 ${BRIDGE_HOST}:${BRIDGE_PORT}"
 }
 
 _cleanup() {

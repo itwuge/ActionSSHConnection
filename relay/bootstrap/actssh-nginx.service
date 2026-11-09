@@ -1,12 +1,12 @@
 # =========** 文件头 =========**
 # 文件        : actssh-nginx.service
-# 所属目录    : deploy/bootstrap/
+# 所属目录    : relay/bootstrap/
 # 文件用途    : 以独立 systemd 单元运行 bootstrap 自装的 nginx 实例, 与发行版 nginx 的站点约定完全隔离
 # 架构定位    : TLS 终止层进程托管; 上游是 /etc/actssh/nginx/nginx.conf, 下游是 nginx 主进程
 # 核心功能    : 只加载独立配置目录, 独立运行目录与日志目录, 施加内存与 CPU 与任务数上限, 崩溃自动重启
 # 职责边界    : 不生成配置, 不申请证书, 不接管发行版 nginx 的 sites-enabled; 不监听 unit 中未声明的端口
 # 运行环境    : Ubuntu 20.04 与 22.04, systemd 245 及以上, nginx 1.18 及以上
-# 依赖关系    : 依赖 /etc/actssh/nginx/nginx.conf 与 /var/log/actssh/nginx; 由 deploy/bootstrap/nginx-cert.sh 安装
+# 依赖关系    : 依赖 /etc/actssh/nginx/nginx.conf 与 /var/log/actssh/nginx; 由 relay/bootstrap/nginx-cert.sh 安装
 #
 # 回滚
 #   systemctl disable --now actssh-nginx.service

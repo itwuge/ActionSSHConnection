@@ -73,7 +73,7 @@ SSH 访客 ──ssh──▶ 中继 ssh.wuge.fun:2222 (uptermd) ◀──反连
 ## 前置条件与安全边界（摘要）
 
 - 运行器必须是 Linux（`ubuntu-latest`），自带 `bash`、`jq`、`python3`、`gh`、`tmux`、`ssh-keygen`。
-- 需要一台已部署的 uptermd 中继（`deploy/` 下有 nginx 与桥接资产），以及可达 `github.com`、中继 `2222`、`443` 的出网。
+- 需要一台已部署的 uptermd 中继（`relay/` 下有 nginx 与桥接资产，可独立部署），以及可达 `github.com`、中继 `2222`、`443` 的出网。
 - 访客公钥只从 `ssh-user` 账号的公开公钥接口拉取；`repository_dispatch` 入口还校验发起者与 `ssh-user` 一致。
 - 凭据不落四类载体：仓库变量、日志、制品、提交。仓库里只存公开标识（公钥指纹、凭据标识、known_hosts 公钥）。
 - `allowed-credentials: "[]"` 的自举模式下，第一个完成注册的人获得终端；生产应预置凭据条目。
@@ -104,10 +104,9 @@ SSH 访客 ──ssh──▶ 中继 ssh.wuge.fun:2222 (uptermd) ◀──反连
 │   ├── action/                      # Action 步骤脚本：precheck/install/start/direct/route/bridge/wait/cleanup
 │   ├── start_web_bridge.py          # runner 反连中继 /runner/<id>
 │   ├── web_admission.py             # WebAuthn 准入与 tmux 桥接
-│   ├── bridge/                      # 中继侧桥接服务与 JSONL 日志器
-│   └── requirements-web-*.txt       # 网页通道依赖
+│   └── requirements-web-admission.txt # 网页通道依赖
 ├── web/                             # 浏览器终端前端
-├── deploy/                          # nginx 与中继部署资产（生产资产，只读）
+├── relay/                           # 中继独立部署组件（自带 README、安装/卸载、版本号）
 ├── docs/                            # 使用说明 / 接入指南
 ├── examples/                        # 四种调用样式与对比说明
 └── .team/                           # 设计书、需求条目与裁决记录

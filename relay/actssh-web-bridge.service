@@ -1,6 +1,6 @@
 # =========** 文件头 =========**
 # 文件        : actssh-web-bridge.service
-# 所属目录    : deploy/
+# 所属目录    : relay/
 # 文件用途    : 以 systemd 常驻方式运行网页桥接进程 relay_bridge.py, 按 session_id 配对浏览器 WS 与 runner 反连 WS
 # 架构定位    : 中继端进程托管层; 上游是 /etc/actssh/bridge.env, 下游是 /opt/actssh-web-bridge/relay_bridge.py
 # 核心功能    : 非 root 运行, 整机只读沙箱, 不落盘, 施加内存/CPU/任务数上限, 崩溃自动重启
@@ -11,11 +11,13 @@
 # 部署前提（详见 README 第 12 节）
 #   1. 专用系统用户: useradd --system --no-create-home --shell /usr/sbin/nologin actssh-bridge
 #   2. 代码与依赖: /opt/actssh-web-bridge/ 下放 relay_bridge.py 与 jsonl_logger.py,
-#      并用该目录内 venv 安装 scripts/requirements-web-bridge.txt
+#      并用该目录内 venv 安装 relay/bridge/requirements-web-bridge.txt
 #   3. 参数文件 /etc/actssh/bridge.env（本单元不写死端口, 环境文件是唯一参数来源）:
-#        BRIDGE_LISTEN_HOST=127.0.0.1     # 或 172.17.0.1, 取决于 nginx 是否在容器内
+#        BRIDGE_LISTEN_HOST=127.0.0.1     # 宿主 nginx 反代到本地址
 #        BRIDGE_LISTEN_PORT=8081
-#   4. 不要把 --host 写成 0.0.0.0: 进程自身会拒绝通配地址, 只允许回环或 docker 网桥.
+#        BRIDGE_BROWSER_PREFIX=/ws        # 浏览器 WS 前缀
+#        BRIDGE_RUNNER_PREFIX=/runner     # runner 反连前缀
+#   4. 不要把 --host 写成 0.0.0.0: 进程自身会拒绝通配地址, 只允许回环.
 #
 # 回滚
 #   systemctl disable --now actssh-web-bridge.service
@@ -33,10 +35,12 @@ User=actssh-bridge
 Group=actssh-bridge
 
 # 环境文件是唯一参数来源; 不加 "-" 前缀, 文件缺失时启动直接失败, 避免裸跑默认值.
+Environment=BRIDGE_BROWSER_PREFIX=/ws
+Environment=BRIDGE_RUNNER_PREFIX=/runner
 EnvironmentFile=/etc/actssh/bridge.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/actssh-web-bridge/venv/bin/python /opt/actssh-web-bridge/relay_bridge.py --host ${BRIDGE_LISTEN_HOST} --port ${BRIDGE_LISTEN_PORT}
+ExecStart=/opt/actssh-web-bridge/venv/bin/python /opt/actssh-web-bridge/relay_bridge.py --host ${BRIDGE_LISTEN_HOST} --port ${BRIDGE_LISTEN_PORT} --browser-prefix ${BRIDGE_BROWSER_PREFIX} --runner-prefix ${BRIDGE_RUNNER_PREFIX}
 
 Restart=on-failure
 RestartSec=5s
@@ -71,10 +75,9 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 UMask=0077
 
-# 只允许回环与 docker 网桥通信; 若该机 docker0 不是 172.17.0.0/16
-# 或内核未启用 cgroup BPF, 单元会启动失败, 需改网段或注释下面两行.
+# 只允许回环通信: nginx 与桥接同机部署, 不依赖任何容器网桥.
 IPAddressDeny=any
-IPAddressAllow=localhost 172.17.0.0/16
+IPAddressAllow=localhost
 
 StandardOutput=journal
 StandardError=journal

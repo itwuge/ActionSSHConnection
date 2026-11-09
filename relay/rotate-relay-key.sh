@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =========** 文件头 =========**
 # 文件        : rotate-relay-key.sh
-# 所属目录    : deploy/
+# 所属目录    : relay/
 # 文件用途    : 轮换中转端 uptermd 的反连注册标识, 即服务身份密钥; 产出可写入仓库变量 UPTERM_RELAY_KNOWN_HOST 的主机公钥行, 并支持回滚
 # 架构定位    : 运维密钥生命周期层; 上游是运维人员手工执行, 下游是 uptermd 服务与仓库变量
 # 核心功能    : 活动会话检查, 新密钥生成与校验, 旧密钥归档, 原子替换, 服务重启与就绪核对, 失败自动回滚, 公钥行与指纹输出
 # 职责边界    : 不登记任何宿主或访客公钥, 不改白名单文件, 不改防火墙, 不推送仓库变量; 只处理服务身份密钥本身
 # 运行环境    : Ubuntu 20.04 及以上, bash 5.x, 以 root 执行, uptermd 由 systemd 托管
-# 依赖关系    : 依赖 ssh-keygen, systemctl, curl, jq, install, awk, id; 由 deploy/README.md 的轮换章节调用
+# 依赖关系    : 依赖 ssh-keygen, systemctl, curl, jq, install, awk, id; 由 relay/README.md 的轮换章节调用
 #
 # 说明        : 该密钥只用于中转服务身份与 known_hosts 防中间人; 中转不校验访客公钥, 门禁默认关闭,
 #               因此轮换它不会改变任何准入范围, 只会改变用户侧 known_hosts 需要匹配的公钥行.
@@ -20,7 +20,7 @@
 #               RK_METRICS_URL   指标地址, 默认 http://127.0.0.1:9100/metrics
 #               RK_UNIT          systemd 单元名, 默认 uptermd.service
 #               RK_USER          密钥属主, 默认 upterm
-#               RK_DEPLOY_LOG_DIR 日志根目录, 默认 /var/log/uptermd-deploy/logs
+#               RK_DEPLOY_LOG_DIR 日志根目录, 默认 /var/log/uptermd-relay/logs
 #               RK_START_WAIT_ATTEMPTS 就绪等待次数, 默认 15
 # 退出码      : 0 成功或演练完成; 2 参数非法; 3 依赖缺失; 4 存在活动会话或指标不可用而拒绝轮换;
 #               5 密钥生成或校验失败; 6 重启失败但已自动回滚; 7 回滚失败需人工介入; 130/143 中断
@@ -49,11 +49,11 @@ RELAY_PORT="${RK_RELAY_PORT:-22}"
 METRICS_URL="${RK_METRICS_URL:-http://127.0.0.1:9100/metrics}"
 UNIT_NAME="${RK_UNIT:-uptermd.service}"
 KEY_USER="${RK_USER:-upterm}"
-LOG_DIR="${RK_DEPLOY_LOG_DIR:-/var/log/uptermd-deploy/logs}"
+LOG_DIR="${RK_DEPLOY_LOG_DIR:-/var/log/uptermd-relay/logs}"
 WAIT_ATTEMPTS="${RK_START_WAIT_ATTEMPTS:-15}"
 WAIT_INTERVAL_S="${RK_START_WAIT_INTERVAL_S:-1}"
 
-LOGGER="deploy.rotate_relay_key"
+LOGGER="relay.rotate_relay_key"
 RUN_ID="$(date -u '+%Y%m%d_%H%M%S')_$$"
 TS="$(date -u '+%Y%m%dT%H%M%SZ')"
 LOG_FILE=""
@@ -204,7 +204,8 @@ _new_key() {
     # 用途: 在临时目录生成新密钥并校验可用性
     # 参数: $1 临时目录
     # 返回: 无; 退出码: 0 或 5
-    local dir="$1" path="${dir}/${KEY_NAME}" fp
+    local dir="$1" fp
+    local path="${dir}/${KEY_NAME}"
     ssh-keygen -q -t ed25519 -N '' -C "uptermd-registration-${TS}" -f "$path" \
         || _die 5 "rotate.keygen.failed" "生成新密钥失败"
     if ! fp="$(ssh-keygen -lf "${path}.pub" | awk '{print $2}')"; then

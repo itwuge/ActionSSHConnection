@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 文件: test_relay_bridge.py
-所属目录: scripts/bridge/
+所属目录: relay/bridge/
 文件用途: 中继桥接服务的本地自测; 用真实 WS 客户端模拟 runner 与浏览器.
 架构定位: 单元测试; 只验证配对、透传、拒绝、清理、帧上限与日志白名单, 不验证真机 nginx 与 wss.
 核心功能: 未知会话拒绝、配对双向透传、重复 runner 拒绝、第三路浏览器拒绝、双浏览器广播、
           runner 断开清理、重启清空映射、1 MiB 边界、文本帧拒绝、日志无负载.
 职责边界: 不启动 systemd, 不访问网络, 不读取任何凭据文件.
-运行环境: Python 3.8 及以上; 需先安装 scripts/requirements-web-bridge.txt.
+运行环境: Python 3.8 及以上; 需先安装 relay/bridge/requirements-web-bridge.txt.
 依赖关系: 被测对象为同目录 relay_bridge.py; 客户端使用 websockets.
 """
 

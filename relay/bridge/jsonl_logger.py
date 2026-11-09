@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 文件: jsonl_logger.py
-所属目录: scripts/bridge/
+所属目录: relay/bridge/
 文件用途: 桥接服务与 runner 侧桥接客户端共用的 JSON Lines 日志器; 只允许元数据字段, 不落盘, 不打印帧内容.
 架构定位: 桥接进程内部基础设施; 上游是连接事件与字节计数, 下游是 journal 或 stderr.
 核心功能: 按 10_日志 的基础字段输出单行 JSON; 提供异常三字段; 字段采用 snake_case; 不写文件.

@@ -2,17 +2,18 @@
 # =========** 文件头 =========**
 # 文件        : uninstall.sh
 # 文件用途    : 可逆卸载 ActSSH 中继与网页桥接: 停单元, 删配置与程序, 按开关保留或删除数据
-# 架构定位    : 运维回收入口; 上游是运维人员, 下游是 bootstrap.sh 安装的全部落地物
+# 架构定位    : 运维回收入口; 上游是运维人员, 下游是 install.sh 安装的全部落地物
 # 核心功能    : 逐项演练或删除, 单元停用, 防火墙规则可选回收, 数据保留与清理开关, 删除清单输出
 # 职责边界    : 不卸载 apt 软件包, 不改系统 sshd, 不动发行版 nginx 站点, 不删除非本方案创建的路径
 # 运行环境    : Ubuntu 20.04 与 22.04, bash 5.x, 以 root 执行
-# 依赖关系    : 依赖 systemctl, install, rm, jq; 复用 deploy/bootstrap/lib.sh 的日志函数
+# 依赖关系    : 依赖 systemctl, install, rm, jq; 复用 relay/bootstrap/lib.sh 的日志函数
 #
 # 输入        : 命令行参数优先, 未给出时读取同名环境变量
 #               --domain <fqdn>     可选; 给出时一并清理该域名的证书与续期配置
 #               --keep-data         保留数据, 默认; 不删状态目录与中继状态
 #               --purge-data        删除数据: /var/lib/uptermd, /etc/uptermd, /var/lib/actssh-bootstrap
 #               --remove-firewall   回收本方案写入的 ufw 规则与 nftables 规则文件
+#               --force-firewall    连当前 SSH 连接所依赖的管理面放行规则一并删除, 远程执行会锁死, 仅限带外控制台
 #               --state-dir <dir>   状态目录, 默认 /var/lib/actssh-bootstrap
 #               --relay-port <p>    uptermd SSH 端口, 默认 2222
 #               --admin-ssh-port <p> 管理面 SSH 端口, 默认 22
@@ -27,7 +28,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=deploy/bootstrap/lib.sh
+# shellcheck source=relay/bootstrap/lib.sh
 source "${SCRIPT_DIR}/bootstrap/lib.sh"
 
 # =========** 方法一览 =========**
@@ -51,6 +52,7 @@ HTTPS_PORT="${ACTSSH_HTTPS_PORT:-443}"
 METRICS_PORT="${ACTSSH_METRICS_PORT:-9100}"
 PURGE_DATA=0
 REMOVE_FIREWALL=0
+FORCE_FIREWALL=0
 APPLY=0
 
 UNITS=(
@@ -79,7 +81,7 @@ DATA_PATHS=(
     "${STATE_DIR}"
 )
 
-LOGGER="deploy.uninstall"
+LOGGER="relay.uninstall"
 RUN_ID="${BS_RUN_ID:-$(date '+%Y%m%d_%H%M%S')_$$}"
 LOG_ROOT="${STATE_DIR}/logs"
 REMOVED=0
@@ -98,6 +100,7 @@ show_usage() {
   --keep-data          保留数据, 默认
   --purge-data         删除 /var/lib/uptermd, /etc/uptermd, /var/www/actssh-acme, 状态目录
   --remove-firewall    回收本方案写入的 ufw 规则与 nftables 规则文件
+  --force-firewall     连当前 SSH 连接依赖的管理面放行规则也删; 远程执行会锁死, 仅限带外控制台
   --state-dir <dir>    状态目录, 默认 /var/lib/actssh-bootstrap
   --relay-port <p>     uptermd SSH 端口, 默认 2222
   --admin-ssh-port <p> 管理面 SSH 端口, 默认 22
@@ -127,6 +130,7 @@ _parse_args() {
             --keep-data) PURGE_DATA=0; shift ;;
             --purge-data) PURGE_DATA=1; shift ;;
             --remove-firewall) REMOVE_FIREWALL=1; shift ;;
+            --force-firewall) REMOVE_FIREWALL=1; FORCE_FIREWALL=1; shift ;;
             --state-dir) STATE_DIR="${2:?缺少 --state-dir 取值}"; shift 2 ;;
             --relay-port) RELAY_PORT="${2:?缺少 --relay-port 取值}"; shift 2 ;;
             --admin-ssh-port) ADMIN_SSH_PORT="${2:?缺少 --admin-ssh-port 取值}"; shift 2 ;;
@@ -274,14 +278,33 @@ _remove_firewall() {
     if command -v ufw >/dev/null 2>&1; then
         # 规则带 comment, 按规格删除匹配不上; 先按编号从大到小删带本方案注释的规则
         local -a nums=()
-        local n
-        mapfile -t nums < <(ufw status numbered 2>/dev/null \
-            | grep -E '# (uptermd admin ssh|uptermd ssh entry|uptermd ws entry|actssh http acme/redirect|uptermd metrics loopback only)' \
-            | sed -n 's/^\[ *\([0-9]\+\)\].*/\1/p' | sort -rn)
-        for n in "${nums[@]}"; do
-            ufw --force delete "$n" >/dev/null 2>&1 || true
-        done
-        # 兜底: 无注释或格式变化时按规格再删一次
+        local n line num ssh_port="" kept_admin=0
+        # 远程卸载时保护当前连接所依赖的管理面放行规则, 否则 ufw 默认拒绝会直接锁死
+        if [[ -n "${SSH_CONNECTION:-}" ]]; then
+            ssh_port="$(awk '{print $4}' <<<"$SSH_CONNECTION")"
+        fi
+        while IFS= read -r line; do
+            num="$(sed -n 's/^\[ *\([0-9]\+\)\].*/\1/p' <<<"$line")"
+            [[ -n "$num" ]] || continue
+            if [[ "$line" == *"# uptermd admin ssh"* && -n "$ssh_port" && "$line" == *"${ssh_port}/tcp"* && "$FORCE_FIREWALL" == "0" ]]; then
+                _say "保留管理面 SSH 放行规则 (${ssh_port}/tcp), 避免删除当前连接依赖的规则"
+                kept_admin=1
+                continue
+            fi
+            nums+=("$num")
+        done < <(ufw status numbered 2>/dev/null \
+            | grep -E '# (uptermd admin ssh|uptermd ssh entry|uptermd ws entry|actssh http acme/redirect|uptermd metrics loopback only)')
+        # 编号降序删除, 避免删前面的规则导致后面的编号前移
+        if (( ${#nums[@]} > 0 )); then
+            mapfile -t nums < <(printf '%s\n' "${nums[@]}" | sort -rn)
+            for n in "${nums[@]}"; do
+                ufw --force delete "$n" >/dev/null 2>&1 || true
+            done
+        fi
+        # 兜底: 无注释或格式变化时按规格再删一次; 当前连接端口对应的管理面规则仍跳过
+        if [[ "$FORCE_FIREWALL" == "1" || -z "$ssh_port" || "$ADMIN_SSH_PORT" != "$ssh_port" ]]; then
+            ufw --force delete allow "$ADMIN_SSH_PORT/tcp" >/dev/null 2>&1 || true
+        fi
         ufw --force delete allow "$RELAY_PORT/tcp" >/dev/null 2>&1 || true
         ufw --force delete allow "$HTTPS_PORT/tcp" >/dev/null 2>&1 || true
         ufw --force delete allow "$HTTP_PORT/tcp" >/dev/null 2>&1 || true
@@ -294,10 +317,14 @@ _remove_firewall() {
         fi
     fi
     if [[ -f "$nft_conf" ]]; then
-        sed -i '/# BEGIN uptermd-guard (managed by deploy\/firewall.sh)/,+1d' "$nft_conf" 2>/dev/null || true
+        sed -i '/# BEGIN uptermd-guard (managed by relay\/firewall.sh)/,+1d' "$nft_conf" 2>/dev/null || true
     fi
     _remove_path "$nft_ruleset" "nftables 规则文件"
-    _say "已回收防火墙规则 (含本方案写入的管理面来源限制)"
+    if (( kept_admin == 1 )); then
+        _say "已回收防火墙规则; 当前连接所用端口的放行规则按安全策略保留 (带外执行或 --force-firewall 可一并删除)"
+    else
+        _say "已回收防火墙规则"
+    fi
 }
 
 _purge_data() {

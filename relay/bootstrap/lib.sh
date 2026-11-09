@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =========** 文件头 =========**
 # 文件        : lib.sh
-# 所属目录    : deploy/bootstrap/
+# 所属目录    : relay/bootstrap/
 # 文件用途    : 为 bootstrap 系列脚本提供日志, 幂等写文件, 端口归属与证书有效期判定的公共函数
-# 架构定位    : 部署脚本公共层; 由 deploy/bootstrap.sh 与同目录子脚本 source, 不直接执行
+# 架构定位    : 部署脚本公共层; 由 relay/install.sh 与同目录子脚本 source, 不直接执行
 # 核心功能    : JSONL 日志与终端进度, 失败退出与 ERR 钩子, 幂等写文件与建目录, 监听端口与 cgroup 归属判定, 证书到期计算
 # 职责边界    : 不安装软件, 不改服务配置, 不定义业务端口默认值; 只提供可复用的判定与写入原语
 # 运行环境    : Ubuntu 20.04 与 22.04, bash 5.x, 以 root 执行

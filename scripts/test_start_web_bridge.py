@@ -6,8 +6,8 @@
 架构定位: 单元/集成测试; 不覆盖真机 wss、Actions 网络策略与真实 WebAuthn.
 核心功能: 地址拼接、参数校验、连接失败映射、注册被拒映射、准入子进程启动失败、端到端字节回环、子进程非零退出.
 职责边界: 不启动 systemd, 不访问公网, 不落盘凭据.
-运行环境: Python 3.8 及以上; 需先安装 scripts/requirements-web-bridge.txt.
-依赖关系: 被测对象为 start_web_bridge.py; 中继侧复用 scripts/bridge/relay_bridge.py.
+运行环境: Python 3.8 及以上; 需先安装 relay/bridge/requirements-web-bridge.txt.
+依赖关系: 被测对象为 start_web_bridge.py; 中继侧复用 relay/bridge/relay_bridge.py.
 """
 
 from __future__ import annotations
@@ -27,10 +27,12 @@ from typing import List
 import websockets
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_BRIDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relay", "bridge")
+sys.path.insert(0, _BRIDGE_DIR)
 
 import start_web_bridge as swb
-from bridge.jsonl_logger import JsonLogger
-from bridge.relay_bridge import Bridge, BridgeConfig
+from jsonl_logger import JsonLogger
+from relay_bridge import Bridge, BridgeConfig
 
 SESSION = "sess-runner-0001"
 

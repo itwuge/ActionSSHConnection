@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # =========** 文件头 =========**
 # 文件        : web-bridge.sh
-# 所属目录    : deploy/bootstrap/
+# 所属目录    : relay/bootstrap/
 # 文件用途    : 在空机器上落地网页桥接服务: 专用系统用户, 独立 venv, 固定版本依赖, 环境文件与 systemd 单元
-# 架构定位    : 部署脚本应用层; 上游是 deploy/bootstrap.sh, 下游是 actssh-web-bridge.service 与 relay_bridge.py
+# 架构定位    : 部署脚本应用层; 上游是 relay/install.sh, 下游是 actssh-web-bridge.service 与 relay_bridge.py
 # 核心功能    : 用户与目录权限, 代码与依赖安装, venv 复用与版本核对, 环境文件生成, 单元落地与启动等待
 # 职责边界    : 不改 nginx, 不签发证书, 不写防火墙, 不打印依赖凭据; 端口只从参数读取
 # 运行环境    : Ubuntu 20.04 与 22.04, bash 5.x, 以 root 执行, 需出网访问 PyPI
-# 依赖关系    : 依赖 python3, python3-venv, systemctl, install, ss, getent, sed; 由 deploy/bootstrap.sh 调用
+# 依赖关系    : 依赖 python3, python3-venv, systemctl, install, ss, getent, sed; 由 relay/install.sh 调用
 #
 # 输入        : 命令行参数优先
 #               --bridge-host <host>  监听地址, 默认 127.0.0.1
 #               --bridge-port <port>  监听端口, 默认 8081
 #               --install-dir <dir>   安装目录, 默认 /opt/actssh-web-bridge
-#               --source-dir <dir>    仓库代码目录, 默认 deploy 同级 scripts/bridge
-#               --requirements <file> 依赖清单, 默认 deploy 同级 scripts/requirements-web-bridge.txt
+#               --source-dir <dir>    桥接代码目录, 默认 relay 目录下的 bridge/
+#               --requirements <file> 依赖清单, 默认 relay/bridge/requirements-web-bridge.txt
 #               --env-file <file>     环境文件, 默认 /etc/actssh/bridge.env
-#               --unit-src <file>     单元模板, 默认 deploy/actssh-web-bridge.service
+#               --unit-src <file>     单元模板, 默认 relay/actssh-web-bridge.service
 #               --user <name>         运行用户, 默认 actssh-bridge
 #               --group <name>        运行组, 默认 actssh-bridge
 #               --ops-group <group>   运维只读组, 默认 actssh-ops
@@ -31,19 +31,20 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEPLOY_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REPO_DIR="$(cd "${DEPLOY_DIR}/.." && pwd)"
-# shellcheck source=deploy/bootstrap/lib.sh
+RELAY_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=relay/bootstrap/lib.sh
 source "${SCRIPT_DIR}/lib.sh"
 
 # =========** 常量与默认值 =========**
 BRIDGE_HOST="${ACTSSH_BRIDGE_HOST:-127.0.0.1}"
 BRIDGE_PORT="${ACTSSH_BRIDGE_PORT:-8081}"
+WS_PATH="${ACTSSH_WS_PATH:-/ws/}"
+RUNNER_PATH="${ACTSSH_RUNNER_PATH:-/runner/}"
 INSTALL_DIR="${ACTSSH_BRIDGE_DIR:-/opt/actssh-web-bridge}"
-SOURCE_DIR="${ACTSSH_BRIDGE_SOURCE:-${REPO_DIR}/scripts/bridge}"
-REQUIREMENTS="${ACTSSH_BRIDGE_REQUIREMENTS:-${REPO_DIR}/scripts/requirements-web-bridge.txt}"
+SOURCE_DIR="${ACTSSH_BRIDGE_SOURCE:-${RELAY_DIR}/bridge}"
+REQUIREMENTS="${ACTSSH_BRIDGE_REQUIREMENTS:-${RELAY_DIR}/bridge/requirements-web-bridge.txt}"
 ENV_FILE="${ACTSSH_BRIDGE_ENV:-/etc/actssh/bridge.env}"
-UNIT_SRC="${ACTSSH_BRIDGE_UNIT_SRC:-${DEPLOY_DIR}/actssh-web-bridge.service}"
+UNIT_SRC="${ACTSSH_BRIDGE_UNIT_SRC:-${RELAY_DIR}/actssh-web-bridge.service}"
 UNIT_PATH="/etc/systemd/system/actssh-web-bridge.service"
 SVC_USER="${ACTSSH_BRIDGE_USER:-actssh-bridge}"
 SVC_GROUP="${ACTSSH_BRIDGE_GROUP:-actssh-bridge}"
@@ -54,7 +55,7 @@ EXPECTED_WS_VERSION="10.4"
 SERVICE="actssh-web-bridge.service"
 APPLY=0
 
-LOGGER="deploy.bootstrap.web_bridge"
+LOGGER="relay.bootstrap.web_bridge"
 RUN_ID="${BS_RUN_ID:-$(date '+%Y%m%d_%H%M%S')_$$}"
 LOG_ROOT="${BS_LOG_DIR:-/var/log/actssh-bootstrap}"
 TMP_DIR=""
@@ -78,6 +79,8 @@ _parse_args() {
         case "$1" in
             --bridge-host) BRIDGE_HOST="${2:?缺少 --bridge-host 取值}"; shift 2 ;;
             --bridge-port) BRIDGE_PORT="${2:?缺少 --bridge-port 取值}"; shift 2 ;;
+            --ws-path) WS_PATH="${2:?缺少 --ws-path 取值}"; shift 2 ;;
+            --runner-path) RUNNER_PATH="${2:?缺少 --runner-path 取值}"; shift 2 ;;
             --install-dir) INSTALL_DIR="${2:?缺少 --install-dir 取值}"; shift 2 ;;
             --source-dir) SOURCE_DIR="${2:?缺少 --source-dir 取值}"; shift 2 ;;
             --requirements) REQUIREMENTS="${2:?缺少 --requirements 取值}"; shift 2 ;;
@@ -106,6 +109,8 @@ show_usage() {
 选项:
   --bridge-host <host>   监听地址, 默认 127.0.0.1
   --bridge-port <port>   监听端口, 默认 8081
+  --ws-path <path>       浏览器 WS 入口前缀, 默认 /ws/
+  --runner-path <path>   runner 反连关键前缀, 默认 /runner/
   --install-dir <dir>    安装目录, 默认 /opt/actssh-web-bridge
   --source-dir <dir>     桥接代码目录
   --requirements <file>  依赖清单
@@ -266,16 +271,18 @@ _install_venv() {
 }
 
 _write_env() {
-    # 用途: 生成桥接环境文件, 只包含监听地址与端口, 不含任何凭据
+    # 用途: 生成桥接环境文件, 只包含监听地址, 端口与两个 WS 前缀, 不含任何凭据
     # 参数: 无
     # 返回: 无; 退出码: 0 或 9
     local tmp
     tmp="$(mktemp "${TMP_DIR}/bridge.env.XXXXXX")"
     cat >"$tmp" <<EOF
-# 由 deploy/bootstrap/web-bridge.sh 生成
+# 由 relay/bootstrap/web-bridge.sh 生成
 # 桥接只允许回环或受控网桥地址, 不接受通配地址
 BRIDGE_LISTEN_HOST=${BRIDGE_HOST}
 BRIDGE_LISTEN_PORT=${BRIDGE_PORT}
+BRIDGE_BROWSER_PREFIX=${WS_PATH%/}
+BRIDGE_RUNNER_PREFIX=${RUNNER_PATH%/}
 EOF
     bs_apply_file "$tmp" "$ENV_FILE" 0640 root "$SVC_GROUP" "$APPLY" \
         || _die 9 "bridge.env.write" "写入环境文件失败: ${ENV_FILE}"

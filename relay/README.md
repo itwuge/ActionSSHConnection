@@ -1,6 +1,73 @@
-# 自托管中转部署（v3）
+# 自托管中继（relay 独立组件 v3）
 
-本目录是中转机的部署资产。v3 将中转定位为**无状态字节转发器**：只按 `session_id` 转发 SSH 或 WS 字节流，不做访客认证、不做访问判定、不落盘会话状态。访客认证完全在 runner 侧完成。
+本目录是**可独立复用的中继部署组件**：只依赖本目录内的脚本、单元与桥接代码，不读取 `.github/`、`scripts/action/`，也不要求目标机是 GitHub Actions 场景。解包本目录即可在任意干净的 Ubuntu 20.04/22.04 上安装、自检、升级与卸载。
+
+中继定位为**无状态字节转发器**：只按 `session_id` 转发 SSH 或 WS 字节流，不做访客认证、不做访问判定、不落盘会话状态。访客认证在调用方（例如 runner）完成。不装网页桥接时，它就是通用 SSH 反向隧道中继。
+
+## 0. 独立入口、形态与版本
+
+### 0.1 入口
+
+| 入口 | 用途 |
+|---|---|
+| `install.sh` | 安装/升级入口；默认演练，`--apply` 落地；`--version` 打印组件版本 |
+| `uninstall.sh` | 对称卸载；`--keep-data`（默认）/ `--purge-data`；`--remove-firewall` 回收规则 |
+| `make-bundle.sh` | 打成 `actssh-relay-<version>.tar.gz`，供无仓库场景交付 |
+| `VERSION` | 组件独立版本号，与 Action 的 `v1` 标签无关 |
+| `check-relay-health.sh` | 只读健康检查，输出单行 JSON |
+| `bridge/` | 网页桥接服务实现与依赖清单（仅完整形态使用） |
+
+### 0.2 两种形态
+
+```bash
+# 纯 SSH 反向隧道中继：不装 nginx/证书/网页桥接, 无域名依赖
+sudo ./install.sh --relay-only --no-direct --apply
+
+# 完整形态：宿主 nginx + 证书 + 网页桥接
+sudo ./install.sh --domain relay.example.com --email ops@example.com --apply
+```
+
+`--no-web-bridge` 与 `--relay-only` 等价；`--with-direct`/`--no-direct` 控制中继 SSH 是否对公网监听。
+
+### 0.3 与调用方的耦合点（全部参数化）
+
+| 耦合点 | 中继侧参数 | 默认 | 调用方需要同步改的地方 |
+|---|---|---|---|
+| 域名 | `--domain` | 无（纯 SSH 形态不需要） | 客户端连接的主机名 |
+| 中继 SSH 端口 | `--relay-port` | `2222` | 客户端注册/连接端口 |
+| SSH 直连面 | `--with-direct` / `--no-direct` | 直连开 | 无（关闭时只能本机或经前置网关访问） |
+| 浏览器 WS 路径 | `--ws-path` | `/ws/` | 浏览器前端拼接的 WS 地址 |
+| runner 反连路径 | `--runner-path` | `/runner/` | runner 侧反连地址 |
+| 桥接上游 | `--bridge-host` / `--bridge-port` | `127.0.0.1:8081` | 无（中继内部 nginx → 桥接） |
+| uptermd WS 上游 | `--ws-backend-port` | `8443` | 无（中继内部桥接/nginx → uptermd） |
+| 是否带网页桥接 | `--with-web-bridge`（默认）/ `--no-web-bridge` | 带 | 去掉网页入口时只保留 SSH 通道 |
+| 管理面来源 | `--admin-cidr` / `--allow-admin-anywhere` | 无（必填才落地防火墙） | 无需改客户端 |
+
+换成非 Actions 客户端时，只需保证：宿主用 `ssh://<域名>:<relay-port>` 注册，浏览器/终端用 `wss://<域名><ws-path><session_id>`，runner 用 `wss://<域名><runner-path><session_id>` 反连；中继本身不关心调用方身份。
+
+### 0.4 版本与升级
+
+- 版本号在 `VERSION`，安装与自检输出均带 `actssh-relay <version>`；仓库标签使用 `relay-v<version>` 前缀（如 `relay-v1.0.0`），与 Action 的 `v0.x`/`v1` 标签互不干扰。
+- 升级：在同一目录执行 `sudo ./install.sh --upgrade --apply`。安装器读取上次 `manifest.tsv` 参数，备份后重跑全部幂等步骤，失败自动回滚；不需要 Action 的标签或发布物。
+- 升级只替换中继自身资产；证书谱系与数据目录按 `--keep-data`/`--purge-data` 语义保留或清理。
+- 升级前置：中继必须处于空路由状态（无活动会话）。有活动会话时 uptermd 的无状态判据会失败并触发自动回滚，这是预期保护，不是升级缺陷。
+
+### 0.5 干净机实测记录（2026-11-10）
+
+环境：Ubuntu 22.04.5 x86_64 全新虚拟机（`192.168.37.132`，sshd 22022），无 Docker，无任何旧中继残留；uptermd 与 `upterm` 客户端用离线种子（v0.41.1），桥接依赖用离线 wheel（`websockets==10.4 cp310`）。
+
+| 形态 | 安装 | 自检 | 会话 | 卸载 | 残留复查 |
+|---|---|---|---|---|---|
+| 纯中继 `--relay-only --no-direct` | 10.3s，rc=0 | 6/6 | `upterm host` 建立会话，`ssh -tt` 登入并回显 `SESSION_LOGIN_OK` | 3.6s，rc=0 | 三单元 inactive、2222/8443/9100 无监听、10 条路径全部删除；ufw 只保留当前 SSH 连接所需的 `22022/tcp` 管理面放行（安全保留，见下） |
+| 完整形态（self-signed） | 91.8s，rc=0 | 17/17 | 同样建立会话并登入成功 | 7.7s，rc=0 | 三单元 inactive、80/443/2222/8081/8443/9100 无监听、11 条路径与证书谱系全部删除；ufw 同上 |
+
+补充验证：
+
+- 参数化 WS 路径：用 `--upgrade --ws-path /rws/ --runner-path /rrn/` 重装后自检 17/17，`/rws/selfcheck` 与 `/rrn/selfcheck` 均返回 101，证明路径参数同时贯通 nginx location 与桥接进程。
+- 升级回滚：存在活动会话时升级会在 uptermd 无状态判据处失败并自动回滚（25.4s）。首轮回滚暴露出「只恢复文件、不拉起单元」的问题，已修为按恢复后仍存在的单元 `systemctl enable && restart`，再次验证通过。
+- 远端卸载安全：`uninstall.sh --remove-firewall` 默认保留当前 SSH 连接所用端口的管理面放行规则，避免 ufw 默认拒绝把运维人员锁在门外；带外控制台或显式 `--force-firewall` 才会删除。
+
+未验证：公网域名 + 真实 ACME（webroot/standalone）未在干净机实跑，本轮用 self-signed 代替并如实标注；「宿主机已有 Docker 容器占用 80/443 → 退出码 8」是代码与主流程验证，未在干净机上复现该冲突现场。
 
 ## 1. 准入核实结论
 
@@ -26,16 +93,22 @@
 
 | 文件 | 用途 |
 |---|---|
+| `install.sh` | 安装/升级编排入口：预检、分步执行、备份、自检、回滚 |
+| `uninstall.sh` | 对称卸载：单元、配置、证书、防火墙、数据开关 |
+| `make-bundle.sh` | 打包本目录为可离线交付的压缩包 |
+| `VERSION` | 组件独立版本号 |
+| `bootstrap/` | 安装子步骤：nginx 与证书、uptermd、网页桥接、防火墙、自检、公共库 |
 | `install-uptermd.sh` | 幂等安装/升级 uptermd，写环境文件与 systemd 单元，执行监听、资源上限、空路由与禁落盘自检 |
 | `uptermd.service` | systemd 单元：只读系统与密钥、仅 `/run` 可写、资源上限、低端口能力 |
 | `firewall.sh` | ufw / nftables 双后端：SSH 与 WS 入口限速、管理面来源限制、指标端口仅环回 |
 | `rotate-relay-key.sh` | 反连注册标识轮换（服务身份密钥），输出 known_hosts 公钥行，支持回滚 |
 | `check-relay-health.sh` | 只读健康检查，输出单行 JSON，判据为监听齐备、路由为空、无会话文件、资源上限生效；journald 容量仅提示 |
-| `nginx/ssh.wuge.fun.conf` | 网页终端子域入口的 nginx 站点片段，仅落仓库不自动部署；文件头写明部署与回滚步骤 |
+| `nginx/ssh.wuge.fun.conf` | 网页终端子域入口的 nginx 站点片段示例，仅落仓库不自动部署；文件头写明部署与回滚步骤 |
 | `actssh-web-bridge.service` | 网页桥接进程的 systemd 单元：非 root、整机只读、无写路径、内存/CPU/任务数上限 |
-| `nginx/web-bridge-location.conf` | `/ws/` 与 `/runner/` 两个 location 片段，含 Upgrade 头、禁缓冲、长连接超时；仅落仓库不自动部署 |
-| `../scripts/bridge/relay_bridge.py` | 桥接服务实现（无状态配对与字节转发），由上面的单元拉起 |
-| `../scripts/start_web_bridge.py` | runner 侧桥接客户端，反连 `/runner/<session_id>` 并把字节流转给 `web_admission.py` |
+| `nginx/web-bridge-location.conf` | `/ws/` 与 `/runner/` 两个 location 片段示例，含 Upgrade 头、禁缓冲、长连接超时；仅落仓库不自动部署 |
+| `bridge/relay_bridge.py` | 桥接服务实现（无状态配对与字节转发），由上面的单元拉起 |
+| `bridge/jsonl_logger.py` | 桥接与 runner 侧共用的 JSONL 日志器 |
+| `bridge/requirements-web-bridge.txt` | 桥接依赖锁（`websockets==10.4`） |
 | `README.md` | 本文件 |
 
 ## 3. 中转与打洞的关系
@@ -87,8 +160,8 @@
 既有生产机上不要动 22 时，保持系统 sshd 原样，只给中继另开端口：
 
 ```bash
-sudo deploy/install-uptermd.sh --version v0.41.1 --ssh-addr 0.0.0.0:2222
-sudo deploy/check-relay-health.sh <中转地址> 2222
+sudo relay/install-uptermd.sh --version v0.41.1 --ssh-addr 0.0.0.0:2222
+sudo relay/check-relay-health.sh <中转地址> 2222
 ```
 
 监听地址只由 `/etc/uptermd/uptermd.env` 的 `UPTERMD_SSH_ADDR` 决定，单元文件不写死端口；`--ssh-addr` 是安装脚本既有参数，无需为端口改脚本。安全组需另行放行该端口，脚本不改云侧配置；未放行时机器内可自测，外部不可达属预期。
@@ -96,14 +169,14 @@ sudo deploy/check-relay-health.sh <中转地址> 2222
 ### 6.2 安装或升级 uptermd
 
 ```bash
-sudo deploy/install-uptermd.sh --dry-run
-sudo deploy/install-uptermd.sh --version v0.41.1
+sudo relay/install-uptermd.sh --dry-run
+sudo relay/install-uptermd.sh --version v0.41.1
 ```
 
 建议同时提供发布包哈希，避免依赖远端 `checksums.txt` 的可用性：
 
 ```bash
-sudo deploy/install-uptermd.sh --version v0.41.1 --sha256 <发布包 SHA256>
+sudo relay/install-uptermd.sh --version v0.41.1 --sha256 <发布包 SHA256>
 ```
 
 脚本会：
@@ -122,8 +195,8 @@ sudo deploy/install-uptermd.sh --version v0.41.1 --sha256 <发布包 SHA256>
 先演练，确认管理面来源无误后再应用：
 
 ```bash
-sudo deploy/firewall.sh --admin-cidr <管理来源网段> --dry-run
-sudo deploy/firewall.sh --admin-cidr <管理来源网段> --apply
+sudo relay/firewall.sh --admin-cidr <管理来源网段> --dry-run
+sudo relay/firewall.sh --admin-cidr <管理来源网段> --apply
 ```
 
 默认放行 SSH 22 与 WS 443，管理面 22022 只允许 `--admin-cidr` 来源，指标 9100 显式阻断。nftables 后端对 22 与 443 的新连接施加全局速率上限，阈值由 `FW_RELAY_RATE`、`FW_RELAY_BURST`、`FW_WS_RATE`、`FW_WS_BURST` 调整，默认值需按真机流量标定。
@@ -131,7 +204,7 @@ sudo deploy/firewall.sh --admin-cidr <管理来源网段> --apply
 ### 6.4 健康检查
 
 ```bash
-sudo deploy/check-relay-health.sh <中转地址> 22
+sudo relay/check-relay-health.sh <中转地址> 22
 ```
 
 stdout 恰好一行 JSON，字段为 `ok`、`message`、`error_code`、`data`、`confirm`；第二个参数是中继实际 SSH 端口（非 22 时如 `2222`），仅用于监听判定，检查在机器本机执行。`data` 至少包含：
@@ -161,8 +234,8 @@ stdout 恰好一行 JSON，字段为 `ok`、`message`、`error_code`、`data`、
 轮换对象是中转服务身份密钥，用途是 known_hosts 防中间人，不是准入凭据。中转不校验访客公钥，门禁默认关闭，因此轮换不会改变任何准入范围。
 
 ```bash
-sudo deploy/rotate-relay-key.sh --dry-run
-sudo deploy/rotate-relay-key.sh --apply
+sudo relay/rotate-relay-key.sh --dry-run
+sudo relay/rotate-relay-key.sh --apply
 ```
 
 - 存在活动会话或指标不可达时默认拒绝轮换；确认无影响才加 `--force`。
@@ -221,15 +294,15 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
 
 | 模块 | 路径 | 职责 |
 |---|---|---|
-| 中继桥接服务 | `scripts/bridge/relay_bridge.py` | 两条 WS 端点、内存配对、二进制原样转发；不解析业务帧、不验签、不落盘 |
-| 共用日志器 | `scripts/bridge/jsonl_logger.py` | 单行 JSON；基础字段 ts/level/logger/event/msg/run_id，异常附三字段；只写 journal 或 stderr |
+| 中继桥接服务 | `relay/bridge/relay_bridge.py` | 两条 WS 端点、内存配对、二进制原样转发；不解析业务帧、不验签、不落盘 |
+| 共用日志器 | `relay/bridge/jsonl_logger.py` | 单行 JSON；基础字段 ts/level/logger/event/msg/run_id，异常附三字段；只写 journal 或 stderr |
 | runner 桥接客户端 | `scripts/start_web_bridge.py` | 主动出站 `/runner/<session_id>`，把字节流接到准入子进程 stdin/stdout，按阶段非零退出 |
-| 依赖锁 | `scripts/requirements-web-bridge.txt` | `websockets==10.4` |
-| 单元文件 | `deploy/actssh-web-bridge.service` | 非 root、整机只读、无写路径、`MemoryMax=128M` / `CPUQuota=50%` / `TasksMax=64` |
-| nginx 片段 | `deploy/nginx/web-bridge-location.conf` | `/ws/` 与 `/runner/`，Upgrade 头、禁缓冲、3600s 读写超时；只落仓库不自动部署 |
-| 自测 | `scripts/bridge/test_relay_bridge.py`、`scripts/test_start_web_bridge.py` | 配对、透传、拒绝、清理、1 MiB 边界、退出码与五字段 |
+| 依赖锁 | `relay/bridge/requirements-web-bridge.txt` | `websockets==10.4` |
+| 单元文件 | `relay/actssh-web-bridge.service` | 非 root、整机只读、无写路径、`MemoryMax=128M` / `CPUQuota=50%` / `TasksMax=64` |
+| nginx 片段 | `relay/nginx/web-bridge-location.conf` | `/ws/` 与 `/runner/`，Upgrade 头、禁缓冲、3600s 读写超时；只落仓库不自动部署 |
+| 自测 | `relay/bridge/test_relay_bridge.py`、`scripts/test_start_web_bridge.py` | 配对、透传、拒绝、清理、1 MiB 边界、退出码与五字段 |
 
-桥接服务放在 `scripts/bridge/`：设计更正 5.2 明确指定该路径，且它与 `scripts/web_admission.py` 同属 runner/中继共用的 Python 交付面；`deploy/` 只放进程托管与反代资产，与现有 `uptermd.service`、`nginx/` 的口径一致。
+桥接服务放在 `relay/bridge/`：设计更正 5.2 明确指定该路径，且它与 `scripts/web_admission.py` 同属 runner/中继共用的 Python 交付面；`relay/` 只放进程托管与反代资产，与现有 `uptermd.service`、`nginx/` 的口径一致。
 
 ### 12.2 关键契约
 
@@ -250,15 +323,15 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
 
 ### 12.3 部署顺序与前提
 
-前提：中继已部署 uptermd（SSH 入口可用）；反向代理为宿主 nginx（第 13 节 `bootstrap.sh` 已一并安装桥接，通常不需要手工执行本节）。本节是手工等价步骤，只面向宿主 nginx；不使用容器。
+前提：中继已部署 uptermd（SSH 入口可用）；反向代理为宿主 nginx（第 13 节 `install.sh` 已一并安装桥接，通常不需要手工执行本节）。本节是手工等价步骤，只面向宿主 nginx；不使用容器。
 
 1. 建专用用户与目录（非 root，无 home 写权限）：
    ```bash
    sudo useradd --system --no-create-home --shell /usr/sbin/nologin actssh-bridge
    sudo install -d -m 0750 -o root -g actssh-bridge /opt/actssh-web-bridge
-   sudo install -m 0640 -o root -g actssh-bridge scripts/bridge/relay_bridge.py scripts/bridge/jsonl_logger.py /opt/actssh-web-bridge/
+   sudo install -m 0640 -o root -g actssh-bridge relay/bridge/relay_bridge.py relay/bridge/jsonl_logger.py /opt/actssh-web-bridge/
    sudo python3 -m venv /opt/actssh-web-bridge/venv
-   sudo /opt/actssh-web-bridge/venv/bin/pip install -r scripts/requirements-web-bridge.txt
+   sudo /opt/actssh-web-bridge/venv/bin/pip install -r relay/bridge/requirements-web-bridge.txt
    ```
 2. 写参数文件（唯一参数来源，单元不写死端口）：
    ```bash
@@ -269,13 +342,13 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
    nginx 与桥接同机部署，固定用 `127.0.0.1`。禁止 `0.0.0.0`，进程会拒绝启动。
 3. 安装并启动单元：
    ```bash
-   sudo install -m 0644 deploy/actssh-web-bridge.service /etc/systemd/system/
+   sudo install -m 0644 relay/actssh-web-bridge.service /etc/systemd/system/
    sudo systemctl daemon-reload && sudo systemctl enable --now actssh-web-bridge.service
    sudo systemctl status actssh-web-bridge.service
    ```
 4. 只 include nginx 片段，不改主配置：
    ```bash
-   sudo install -m 0644 deploy/nginx/web-bridge-location.conf /etc/actssh/nginx/conf.d/web-bridge-location.conf
+   sudo install -m 0644 relay/nginx/web-bridge-location.conf /etc/actssh/nginx/conf.d/web-bridge-location.conf
    # 在 443 server 块内加一行：include /etc/actssh/nginx/conf.d/web-bridge-location.conf;
    sudo nginx -t -c /etc/actssh/nginx/nginx.conf && sudo systemctl reload actssh-nginx.service
    ```
@@ -308,8 +381,8 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
 
 ```bash
 python3 -m venv .venv-bridge
-.venv-bridge/bin/pip install -r scripts/requirements-web-bridge.txt
-.venv-bridge/bin/python scripts/bridge/test_relay_bridge.py
+.venv-bridge/bin/pip install -r relay/bridge/requirements-web-bridge.txt
+.venv-bridge/bin/python relay/bridge/test_relay_bridge.py
 .venv-bridge/bin/python scripts/test_start_web_bridge.py
 ```
 
@@ -350,7 +423,7 @@ python3 -m venv .venv-bridge
 - 窗口关闭时机：首个注册成功即关闭；会话结束、runner 断开或准入进程退出后绑定与凭据一并消失。进程重启不会恢复任何绑定。
 - 需要限定设备的场景不要用空数组，改为预置该设备的公开凭据；该风险同时记录在 `.team/records/设计更正-网页桥接落点-20261109.md` 的「已知残余风险」。
 
-## 13. 从零部署（bootstrap.sh）
+## 13. 从零部署（install.sh）
 
 ### 13.1 设计前提
 
@@ -359,8 +432,8 @@ python3 -m venv .venv-bridge
 ### 13.2 脚本结构
 
 ```
-deploy/
-├── bootstrap.sh                    # 编排入口: 预检 → 备份 → 分步执行 → 自检 → 汇总
+relay/
+├── install.sh                      # 编排入口: 预检 → 备份 → 分步执行 → 自检 → 汇总
 ├── bootstrap/
 │   ├── lib.sh                      # 公共库: JSONL 日志, 原子写文件, 端口归属, 证书天数
 │   ├── nginx-cert.sh               # 独立 nginx 实例 + certbot HTTP-01 + 自动续期
@@ -387,11 +460,15 @@ deploy/
 | `--acme-staging` | 关 | 使用 ACME 预发布目录，避免打爆正式配额 |
 | `--cert-mode acme\|standalone\|self-signed` | `acme` | `acme`(别名 `webroot`) 用宿主 certbot webroot 签发，不停服；`standalone` 签发时临时停 `actssh-nginx` 独占 80；`self-signed` 仅无公网 DNS 的实验环境 |
 | `--web-root <dir>` | 空 | 网页终端静态目录；缺省时根路径 404 |
-| `--relay-only` | 关 | 只装中继，不装 nginx / 证书 / 桥接 |
+| `--relay-only` / `--no-web-bridge` | 关 | 只装中继，不装 nginx / 证书 / 桥接；纯 SSH 反向隧道形态 |
 | `--with-direct` / `--no-direct` | `with-direct` | 中继 SSH 是否对外直连；关闭时只监听 `127.0.0.1` |
+| `--bridge-host <host>` | `127.0.0.1` | 桥接监听地址，同时作为 nginx 上游地址 |
+| `--ws-path <path>` | `/ws/` | 浏览器 WS 入口路径，须以 `/` 开头和结尾 |
+| `--runner-path <path>` | `/runner/` | runner 反连路径，须以 `/` 开头和结尾 |
 | `--uptermd-version <v>` | `v0.41.1` | 中继版本 |
 | `--bridge-wheelhouse <dir>` | 空 | 离线 pip wheel 目录 |
 | `--upgrade` | 关 | 读取上次参数，备份后重跑，失败自动回滚 |
+| `--version` | 无 | 打印 `actssh-relay <version>` 后退出 |
 | `--admin-cidr <cidr>` | 空 | 管理面来源，可重复；防火墙落地时必填 |
 | `--allow-admin-anywhere` | 关 | 管理面不限来源，仅限临时排障 |
 | `--rate-limit-ssh` | 关 | SSH / WS 入口按源限速，仅 ufw 后端 |
@@ -400,7 +477,7 @@ deploy/
 | `--relay-port` / `--uptermd-port` | `2222` | uptermd SSH 端口 |
 | `--http-port` | `80` | HTTP 端口；`acme` 模式固定 80 |
 | `--https-port` | `443` | HTTPS 端口 |
-| `--bridge-port` | `8081` | 桥接监听端口 |
+| `--bridge-port` | `8081` | 桥接监听与 nginx 上游端口 |
 | `--ws-backend-port` | `8443` | uptermd 明文 WS 端口 |
 | `--metrics-port` | `9100` | Prometheus 指标端口 |
 | `--state-dir <dir>` | `/var/lib/actssh-bootstrap` | 状态、备份、日志根目录 |
@@ -485,7 +562,7 @@ deploy/
 
 - 所有配置文件用「先写同目录暂存文件再原子改名」，内容无差异时跳过；apt 安装前先 `dpkg-query` 判存；证书用 `--keep-until-expiring`，有效期内不重复签发。
 - `--apply` 会在 `/var/lib/actssh-bootstrap/backups/<run_id>/` 生成 `manifest.tsv`（本次参数与前置状态）和 `files.tsv`（每条为 `restore` / `remove` / `keep`）。私钥与证书目录只记录存在性，不复制第二份。
-- 回滚：`sudo ./deploy/bootstrap.sh --rollback --apply`，按清单逆序停止自有单元、恢复文件、恢复防火墙前态与发行版 nginx 启停状态。回滚不卸载 apt 包，不删除备份目录，便于二次排查。
+- 回滚：`sudo ./relay/install.sh --rollback --apply`，按清单逆序停止自有单元、恢复文件、恢复防火墙前态与发行版 nginx 启停状态。回滚不卸载 apt 包，不删除备份目录，便于二次排查。
 - 日志：`/var/lib/actssh-bootstrap/logs/<run_id>.jsonl`，一行一个 JSON。
 
 ### 13.8 结尾自检
@@ -504,8 +581,8 @@ deploy/
 ### 13.9 升级
 
 ```bash
-sudo ./deploy/bootstrap.sh --upgrade --apply
-sudo ./deploy/bootstrap.sh --upgrade --apply --uptermd-version v0.41.2
+sudo ./relay/install.sh --upgrade --apply
+sudo ./relay/install.sh --upgrade --apply --uptermd-version v0.41.2
 ```
 
 - `--upgrade` 从 `last_backup` 读回上次的域名、端口、形态、直连开关与管理面来源，命令行显式给出的参数优先；
@@ -517,13 +594,13 @@ sudo ./deploy/bootstrap.sh --upgrade --apply --uptermd-version v0.41.2
 
 ```bash
 # 语法
-for f in deploy/*.sh deploy/bootstrap/*.sh; do bash -n "$f" || echo "FAIL $f"; done
+for f in relay/*.sh relay/bootstrap/*.sh; do bash -n "$f" || echo "FAIL $f"; done
 
 # 静态检查 (warning 及以上必须为 0)
-shellcheck -x -S warning deploy/*.sh deploy/bootstrap/*.sh
+shellcheck -x -S warning relay/*.sh relay/bootstrap/*.sh
 ```
 
-本次实测（2026-11-09，Ubuntu 22.04.5 上的 `shellcheck 0.8.0`）：`deploy/` 与 `deploy/bootstrap/` 共 10 个脚本 `bash -n` 全部通过，`-x -S warning` 零发现（`check-relay-health.sh` 的 2 个 `SC2034` 已删除未使用变量修复）。以默认 severity 运行时只剩 `SC2317 (info)` 的误报——脚本通过 `trap` 与 `_die` 间接调用函数，shellcheck 的调用图判断不到；需要绝对干净时可加 `-e SC2317`。shellcheck 只在验收机上用于校验，不进入交付物，目标机不需要安装。
+本次实测（2026-11-09，Ubuntu 22.04.5 上的 `shellcheck 0.8.0`）：`relay/` 与 `relay/bootstrap/` 共 10 个脚本 `bash -n` 全部通过，`-x -S warning` 零发现（`check-relay-health.sh` 的 2 个 `SC2034` 已删除未使用变量修复）。以默认 severity 运行时只剩 `SC2317 (info)` 的误报——脚本通过 `trap` 与 `_die` 间接调用函数，shellcheck 的调用图判断不到；需要绝对干净时可加 `-e SC2317`。shellcheck 只在验收机上用于校验，不进入交付物，目标机不需要安装。
 
 ### 13.11 干净环境实测（2026-11-09，VM 192.168.37.132）
 
@@ -532,7 +609,7 @@ shellcheck -x -S warning deploy/*.sh deploy/bootstrap/*.sh
 | 动作 | 命令要点 | 结果 | 耗时 |
 | --- | --- | --- | --- |
 | 首次部署 | `--domain lab.actssh.test --cert-mode self-signed --admin-ssh-port 22022 --admin-cidr 192.168.37.0/24 --apply` | 退出 0，自检 17/17：3 个单元 active、7 个监听、nginx 语法、证书 89 天、ACME webroot、`/ws/` 与 `/runner/` 均 101、`relay:health ok=true` | 147.7s（packages 111s / nginx 6s / uptermd 5s / bridge 7s / firewall 4s / selfcheck 12s） |
-| 卸载（保留数据） | `./deploy/uninstall.sh --apply` | 退出 0；3 个单元 inactive、7 个端口全部释放、`/etc/actssh`、`/opt/actssh-web-bridge`、`/etc/logrotate.d/actssh` 已删；`/var/lib/uptermd`、`/var/www/actssh-acme` 保留 | 4.1s |
+| 卸载（保留数据） | `./relay/uninstall.sh --apply` | 退出 0；3 个单元 inactive、7 个端口全部释放、`/etc/actssh`、`/opt/actssh-web-bridge`、`/etc/logrotate.d/actssh` 已删；`/var/lib/uptermd`、`/var/www/actssh-acme` 保留 | 4.1s |
 | 换参重装 | `--relay-only --relay-port 2323 --admin-ssh-port 22022 --admin-cidr 192.168.37.0/24 --apply` | 退出 0，自检 6/6：`uptermd` active、2222 不再监听、2323 监听、WS 8443 与指标 9100 仅环回、`relay:health ok=true` | 15.9s（packages 0s 复用 / uptermd 4s / firewall 8s / selfcheck 1s） |
 | 升级路径 | `--upgrade --apply` | 退出 0，读回上次 relay-only 参数，自检 6/6，无副作用 | 15.4s |
 
@@ -543,9 +620,9 @@ shellcheck -x -S warning deploy/*.sh deploy/bootstrap/*.sh
 默认演练，`--apply` 才执行：
 
 ```bash
-sudo ./deploy/uninstall.sh                    # 打印将删除的清单
-sudo ./deploy/uninstall.sh --apply            # 停止并删除配置与程序, 保留数据
-sudo ./deploy/uninstall.sh --apply --purge-data --domain ssh.example.com
+sudo ./relay/uninstall.sh                    # 打印将删除的清单
+sudo ./relay/uninstall.sh --apply            # 停止并删除配置与程序, 保留数据
+sudo ./relay/uninstall.sh --apply --purge-data --domain ssh.example.com
 ```
 
 | 开关 | 行为 |
@@ -572,7 +649,7 @@ sudo ./deploy/uninstall.sh --apply --purge-data --domain ssh.example.com
 
 ### 15.3 Python 依赖
 
-`websockets==10.4`（见 `scripts/requirements-web-bridge.txt`），安装在 `/opt/actssh-web-bridge/venv`，不污染系统 Python。
+`websockets==10.4`（见 `relay/bridge/requirements-web-bridge.txt`），安装在 `/opt/actssh-web-bridge/venv`，不污染系统 Python。
 
 ### 15.4 离线或受限网络
 
@@ -609,29 +686,29 @@ git clone <repo-url> && cd ActionSSHConnection        # 有仓库
 tar -xzf actssh-deploy-<version>.tar.gz -C actssh     # 无仓库
 
 # 2) 演练，确认端口与参数
-sudo ./deploy/bootstrap.sh --domain ssh.example.com --email ops@example.com \
+sudo ./relay/install.sh --domain ssh.example.com --email ops@example.com \
   --admin-cidr 203.0.113.0/24
 
 # 3) 落地（自动备份 + 安装 + 自检）
-sudo ./deploy/bootstrap.sh --domain ssh.example.com --email ops@example.com \
+sudo ./relay/install.sh --domain ssh.example.com --email ops@example.com \
   --admin-cidr 203.0.113.0/24 --apply
 
 # 4) 只装中继（不要网页）
-sudo ./deploy/bootstrap.sh --relay-only --admin-cidr 203.0.113.0/24 --apply
+sudo ./relay/install.sh --relay-only --admin-cidr 203.0.113.0/24 --apply
 
 # 5) 出问题回滚
-sudo ./deploy/bootstrap.sh --rollback --apply
+sudo ./relay/install.sh --rollback --apply
 ```
 
-`make-bundle.sh` 的产物里已经包含 `deploy/` 与 `scripts/bridge/`，目标机不需要整仓。
+`make-bundle.sh` 的产物里已经包含 `relay/` 与 `relay/bridge/`，目标机不需要整仓。
 
 ### 16.4 装完怎么验证
 
 ```bash
 systemctl is-active actssh-nginx.service uptermd.service actssh-web-bridge.service
 ss -Hltn
-sudo ./deploy/bootstrap/selfcheck.sh --domain ssh.example.com --cert-mode acme
-sudo ./deploy/check-relay-health.sh 127.0.0.1 2222
+sudo ./relay/bootstrap/selfcheck.sh --domain ssh.example.com --cert-mode acme
+sudo ./relay/check-relay-health.sh 127.0.0.1 2222
 curl -sS -o /dev/null -w '%{http_code}\n' https://ssh.example.com/
 ```
 
@@ -655,7 +732,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://ssh.example.com/
 
 ### 17.1 检测与处置
 
-- `bootstrap.sh` 预检用 `ss -Hltnp` 取监听进程，再按 `/proc/<pid>/cgroup` 反查单元；`docker-proxy` 归属 `docker.service`，不在允许清单内，直接 **退出码 8**；
+- `install.sh` 预检用 `ss -Hltnp` 取监听进程，再按 `/proc/<pid>/cgroup` 反查单元；`docker-proxy` 归属 `docker.service`，不在允许清单内，直接 **退出码 8**；
 - 报错信息会给出占用端口、pid 与所属单元，需人工决定：停掉占用方把业务迁到本方案，或换一台机器；
 - 脚本不会改容器端口映射、不会停容器、不会写 docker 配置。
 
@@ -664,8 +741,8 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://ssh.example.com/
 1. **记录基线**（只读）：`docker ps --format '{{.Names}} {{.Ports}}'`、`ss -Hltnp`、`ufw status verbose`、`nft list ruleset`、`systemctl list-units --type=service --state=running`，存到 `/root/migration-baseline-<日期>.txt`。
 2. **先部署不碰 80/443 的部分**：
    ```bash
-   sudo ./deploy/bootstrap.sh --relay-only --admin-cidr <管理网段> --apply
-   ./deploy/check-relay-health.sh 127.0.0.1 2222     # 期望 ok:true
+   sudo ./relay/install.sh --relay-only --admin-cidr <管理网段> --apply
+   ./relay/check-relay-health.sh 127.0.0.1 2222     # 期望 ok:true
    ```
 3. **由人工停容器释放 80/443**（脚本不做）：
    ```bash
@@ -674,7 +751,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://ssh.example.com/
    ```
 4. **落地宿主 nginx 与证书**：
    ```bash
-   sudo ./deploy/bootstrap.sh --domain <域名> --email <邮箱> \
+   sudo ./relay/install.sh --domain <域名> --email <邮箱> \
      --cert-mode acme --admin-cidr <管理网段> --apply
    ```
    自检通过即完成切换；证书由宿主 certbot 用 webroot 签发，不需要停服。
@@ -682,9 +759,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://ssh.example.com/
 
 ### 17.3 回滚
 
-1. 停本方案：`sudo ./deploy/uninstall.sh --apply`（默认保留数据）。
+1. 停本方案：`sudo ./relay/uninstall.sh --apply`（默认保留数据）。
 2. 恢复旧容器：`docker start <容器名>`，确认 80/443 监听恢复。
-3. 若已改防火墙：`sudo ./deploy/uninstall.sh --apply --remove-firewall`，再按 17.2 第 1 步的基线恢复 `ufw` / `nft`。
+3. 若已改防火墙：`sudo ./relay/uninstall.sh --apply --remove-firewall`，再按 17.2 第 1 步的基线恢复 `ufw` / `nft`。
 4. 复查：`ss -Hltnp`、`docker ps`、`curl -I https://<域名>` 与基线一致。
 
 ### 17.4 不要做的事
@@ -729,16 +806,16 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://ssh.example.com/
 1. 精简镜像内可能没有系统 CA 包，`openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt` 会报文件不存在；链校验应把 `cert.pem`/`chain.pem` 取到有完整 CA 包的主机再做，或用 `openssl crl2pkcs7 | openssl pkcs7 -print_certs` 核对链结构；
 2. 直接复制 `live/` 下的符号链接会得到 `invalid symlink`，应按链接目标读取内容再落盘。
 
-**仍未验证的部分（不要扩大结论）**：本节验证的是 certbot + 公网 HTTP-01 的签发与续期链路，跑在既有容器布局上；`bootstrap.sh` 自带的 `nginx-cert.sh` 在**干净机**上用公网域名完成正式签发这一步仍未实跑（干净机实测走的是 `--cert-mode self-signed`）。要补齐时，在一台有公网 IPv4、80 端口可入站、且有 A 记录指向它的干净 Ubuntu 22.04 上执行：
+**仍未验证的部分（不要扩大结论）**：本节验证的是 certbot + 公网 HTTP-01 的签发与续期链路，跑在既有容器布局上；`install.sh` 自带的 `nginx-cert.sh` 在**干净机**上用公网域名完成正式签发这一步仍未实跑（干净机实测走的是 `--cert-mode self-signed`）。要补齐时，在一台有公网 IPv4、80 端口可入站、且有 A 记录指向它的干净 Ubuntu 22.04 上执行：
 
 ```bash
 dig +short A <子域>                                  # 必须返回该机公网 IP
-sudo ./deploy/bootstrap.sh --domain <子域> --email <邮箱> \
+sudo ./relay/install.sh --domain <子域> --email <邮箱> \
   --acme-staging --admin-cidr <管理网段> --apply      # 先 staging，避免消耗正式配额
-sudo ./deploy/bootstrap.sh --domain <子域> --email <邮箱> \
+sudo ./relay/install.sh --domain <子域> --email <邮箱> \
   --admin-cidr <管理网段> --apply                     # 正式签发
 sudo certbot renew --dry-run
-sudo ./deploy/bootstrap/selfcheck.sh --domain <子域>  # 期望 cert:expiry 约 90 天且非 self-signed
+sudo ./relay/bootstrap/selfcheck.sh --domain <子域>  # 期望 cert:expiry 约 90 天且非 self-signed
 ```
 
 ### 18.2 待实现：SSH 鉴权失败限速

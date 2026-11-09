@@ -8,7 +8,7 @@
           标准输出恰好一行五字段 JSON, 日志一律写 stderr.
 职责边界: 不监听任何入站端口, 不解析业务帧, 不做 WebAuthn 验签, 不改 web_admission.py 的命令行契约, 不落盘凭据.
 运行环境: Ubuntu 20.04 / Python 3.8 及以上; 依赖 websockets==10.4.
-依赖关系: 复用 scripts/bridge/jsonl_logger.py; 与 scripts/web_admission.py 通过管道协作.
+依赖关系: 复用 relay/bridge/jsonl_logger.py; 与 scripts/web_admission.py 通过管道协作.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidURI
 
-_BRIDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge")
+_BRIDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "relay", "bridge")
 if _BRIDGE_DIR not in sys.path:
     sys.path.insert(0, _BRIDGE_DIR)
 

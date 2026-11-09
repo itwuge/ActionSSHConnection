@@ -76,7 +76,7 @@ if ! python3 -m venv "$venv" >/dev/null 2>&1; then
   unavailable bridge-connect "无法创建 Python 虚拟环境"
 fi
 if ! "$venv/bin/pip" install --quiet --disable-pip-version-check \
-    -r "$scripts_dir/requirements-web-bridge.txt" \
+    -r "$action_root/relay/bridge/requirements-web-bridge.txt" \
     -r "$scripts_dir/requirements-web-admission.txt"; then
   unavailable bridge-connect "网页桥接或准入依赖安装失败（websockets/fido2）"
 fi

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =========** 文件头 =========**
 # 文件        : selfcheck.sh
-# 所属目录    : deploy/bootstrap/
+# 所属目录    : relay/bootstrap/
 # 文件用途    : bootstrap 收尾自检, 逐项验证单元状态, 端口监听, nginx 配置, 证书有效期, ACME 校验路径, WS 入口与中继健康检查
-# 架构定位    : 部署脚本验收层; 上游是 deploy/bootstrap.sh 的最后一步, 下游是运维人员与自动化巡检
+# 架构定位    : 部署脚本验收层; 上游是 relay/install.sh 的最后一步, 下游是运维人员与自动化巡检
 # 核心功能    : 八类只读判定与逐项输出, 汇总失败项数量, 以非零退出码阻断"部署成功"的错误结论
 # 职责边界    : 不重启服务, 不改配置, 不申请证书, 不读取任何私钥内容; 只做本机探测
 # 运行环境    : Ubuntu 20.04 与 22.04, bash 5.x, 以 root 执行
-# 依赖关系    : 依赖 systemctl, ss, curl, openssl, jq, nginx, check-relay-health.sh; 由 deploy/bootstrap.sh 调用
+# 依赖关系    : 依赖 systemctl, ss, curl, openssl, jq, nginx, check-relay-health.sh; 由 relay/install.sh 调用
 #
 # 输入        : 命令行参数优先
 #               --domain <fqdn>       证书域名
@@ -22,7 +22,7 @@
 #               --cert-file <file>    证书路径, 缺省按模式推导
 #               --acme-root <dir>     ACME 校验目录, 默认 /var/www/actssh-acme
 #               --nginx-conf <file>   nginx 配置, 默认 /etc/actssh/nginx/nginx.conf
-#               --health-script <f>   健康检查脚本, 默认 deploy/check-relay-health.sh
+#               --health-script <f>   健康检查脚本, 默认 relay/check-relay-health.sh
 #               --relay-only          只校验中继: 跳过 nginx, 证书, ACME 与 WS 入口
 #               --no-direct           中继 SSH 只监听环回, 监听地址按 127.0.0.1 校验
 # 退出码      : 0 全部通过; 1 存在失败项; 2 参数非法; 3 依赖缺失; 4 非 root; 130 收到 INT; 143 收到 TERM
@@ -31,8 +31,8 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEPLOY_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-# shellcheck source=deploy/bootstrap/lib.sh
+RELAY_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=relay/bootstrap/lib.sh
 source "${SCRIPT_DIR}/lib.sh"
 
 # =========** 常量与默认值 =========**
@@ -43,12 +43,14 @@ RELAY_PORT="${ACTSSH_RELAY_SSH_PORT:-2222}"
 HTTP_PORT="${ACTSSH_HTTP_PORT:-80}"
 HTTPS_PORT="${ACTSSH_HTTPS_PORT:-443}"
 BRIDGE_PORT="${ACTSSH_BRIDGE_PORT:-8081}"
+WS_PATH="${ACTSSH_WS_PATH:-/ws/}"
+RUNNER_PATH="${ACTSSH_RUNNER_PATH:-/runner/}"
 WS_BACKEND_PORT="${ACTSSH_WS_BACKEND_PORT:-8443}"
 METRICS_PORT="${ACTSSH_METRICS_PORT:-9100}"
 CERT_FILE="${ACTSSH_CERT_FILE:-}"
 ACME_ROOT="${ACTSSH_ACME_ROOT:-/var/www/actssh-acme}"
 NGINX_CONF="${ACTSSH_NGINX_CONF_DIR:-/etc/actssh/nginx}/nginx.conf"
-HEALTH_SCRIPT="${ACTSSH_HEALTH_SCRIPT:-${DEPLOY_DIR}/check-relay-health.sh}"
+HEALTH_SCRIPT="${ACTSSH_HEALTH_SCRIPT:-${RELAY_DIR}/check-relay-health.sh}"
 NGINX_BIN="${ACTSSH_NGINX_BIN:-/usr/sbin/nginx}"
 TMP_DIR=""
 RELAY_ONLY=0
@@ -83,6 +85,8 @@ _parse_args() {
             --http-port) HTTP_PORT="${2:?缺少 --http-port 取值}"; shift 2 ;;
             --https-port) HTTPS_PORT="${2:?缺少 --https-port 取值}"; shift 2 ;;
             --bridge-port) BRIDGE_PORT="${2:?缺少 --bridge-port 取值}"; shift 2 ;;
+            --ws-path) WS_PATH="${2:?缺少 --ws-path 取值}"; shift 2 ;;
+            --runner-path) RUNNER_PATH="${2:?缺少 --runner-path 取值}"; shift 2 ;;
             --ws-backend-port) WS_BACKEND_PORT="${2:?缺少 --ws-backend-port 取值}"; shift 2 ;;
             --metrics-port) METRICS_PORT="${2:?缺少 --metrics-port 取值}"; shift 2 ;;
             --cert-file) CERT_FILE="${2:?缺少 --cert-file 取值}"; shift 2 ;;
@@ -112,6 +116,8 @@ show_usage() {
   --http-port <p>         HTTP 端口, 默认 80
   --https-port <p>        HTTPS 端口, 默认 443
   --bridge-port <p>       桥接端口, 默认 8081
+  --ws-path <path>        浏览器 WS 入口路径, 默认 /ws/
+  --runner-path <path>    runner 反连路径, 默认 /runner/
   --ws-backend-port <p>   uptermd WS 上游端口, 默认 8443
   --metrics-port <p>      指标端口, 默认 9100
   --cert-file <file>      证书路径
@@ -276,7 +282,7 @@ _check_ws() {
     if [[ "$CERT_MODE" == "self-signed" ]]; then
         extra=(-k)
     fi
-    for path in /ws/selfcheck /runner/selfcheck; do
+    for path in "${WS_PATH}selfcheck" "${RUNNER_PATH}selfcheck"; do
         code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 --http1.1 \
             "${extra[@]}" --resolve "${DOMAIN}:${HTTPS_PORT}:127.0.0.1" \
             -H 'Connection: Upgrade' -H 'Upgrade: websocket' \

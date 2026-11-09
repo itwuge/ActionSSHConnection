@@ -1,8 +1,8 @@
 # =========** 文件头 =========**
 # 文件        : uptermd.service
-# 所属目录    : deploy/
+# 所属目录    : relay/
 # 文件用途    : 以 systemd 常驻方式运行自托管 uptermd 中转服务, 作为无状态字节转发器承载 SSH 与 WS 监听
-# 架构定位    : 中转端进程托管层; 上游是 deploy/install-uptermd.sh 写入的 /etc/uptermd/uptermd.env, 下游是 uptermd 二进制
+# 架构定位    : 中转端进程托管层; 上游是 relay/install-uptermd.sh 写入的 /etc/uptermd/uptermd.env, 下游是 uptermd 二进制
 # 核心功能    : 以专用系统用户运行, 只读主机密钥, 只写 /run 内存目录, 施加内存与 CPU 与任务数上限, 崩溃自动重启
 # 职责边界    : 不负责安装二进制, 不负责生成密钥, 不负责防火墙, 不登记任何公钥; 参数一律来自环境文件, 本单元不写死端口
 # 运行环境    : Ubuntu 20.04 及以上 systemd 245 及以上, 二进制位于 /usr/local/bin/uptermd

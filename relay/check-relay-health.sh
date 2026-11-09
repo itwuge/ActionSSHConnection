@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =========** 文件头 =========**
 # 文件        : check-relay-health.sh
-# 所属目录    : deploy/
+# 所属目录    : relay/
 # 文件用途    : 检查中转机是否满足 v3 无状态判据: 重启后内存映射为空, 无会话文件落盘, 监听与资源上限生效
 # 架构定位    : 运维健康检查层; 上游是运维人员或自动化巡检, 下游是 systemd 单元与 uptermd 指标端点
 # 核心功能    : 单元状态, SSH/WS/指标监听, 活动路由数, 会话文件, 资源上限五类判定, journald 容量仅作提示, 汇总为单行 JSON
 # 职责边界    : 不重启服务, 不改配置, 不读取会话内容, 不判定访客身份; 只做只读探测
 # 运行环境    : Ubuntu 20.04 及以上, bash 5.x, 以 root 或有权限读取单元状态的账号执行
-# 依赖关系    : 依赖 systemctl, curl, jq, ss, find, awk; 由 deploy/README.md 的验证章节调用
+# 依赖关系    : 依赖 systemctl, curl, jq, ss, find, awk; 由 relay/README.md 的验证章节调用
 #
 # 输入        : 位置参数 <host> [port]; host 仅用于输出标识, 端口缺省取 CH_SSH_PORT
 #               CH_SSH_PORT        SSH 入口端口, 默认 22
@@ -19,7 +19,7 @@
 #               CH_UNIT            systemd 单元名, 默认 uptermd.service
 #               CH_JOURNAL_DROPIN  journald 上限片段, 默认 /etc/systemd/journald.conf.d/90-uptermd-limits.conf
 #               CH_JOURNAL_MAX     journald 占用提示阈值, 默认 200M; 只告警, 不影响 ok 判定
-#               CH_LOG_DIR         检查日志根目录, 默认 /var/log/uptermd-deploy/logs
+#               CH_LOG_DIR         检查日志根目录, 默认 /var/log/uptermd-relay/logs
 #               CH_BRIDGE_UNIT     网页桥接单元名, 默认 actssh-web-bridge.service; 未安装则该项跳过
 #               CH_BRIDGE_PORT     网页桥接监听端口, 默认 8081
 # 退出码      : 0 全部判据通过; 1 判据未通过或状态取不到; 2 参数或依赖错误; 130/143 中断
@@ -58,11 +58,11 @@ RUNTIME_DIR="${CH_RUNTIME_DIR:-/run/uptermd}"
 UNIT_NAME="${CH_UNIT:-uptermd.service}"
 JOURNAL_DROPIN="${CH_JOURNAL_DROPIN:-/etc/systemd/journald.conf.d/90-uptermd-limits.conf}"
 JOURNAL_MAX="${CH_JOURNAL_MAX:-200M}"
-LOG_DIR="${CH_LOG_DIR:-/var/log/uptermd-deploy/logs}"
+LOG_DIR="${CH_LOG_DIR:-/var/log/uptermd-relay/logs}"
 BRIDGE_UNIT="${CH_BRIDGE_UNIT:-actssh-web-bridge.service}"
 BRIDGE_PORT="${CH_BRIDGE_PORT:-8081}"
 
-LOGGER="deploy.check_relay_health"
+LOGGER="relay.check_relay_health"
 RUN_ID="$(date -u '+%Y%m%d_%H%M%S')_$$"
 LOG_FILE=""
 HOST=""

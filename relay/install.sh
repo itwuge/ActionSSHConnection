@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # =========** 文件头 =========**
-# 文件        : bootstrap.sh
-# 所属目录    : deploy/
-# 文件用途    : 在一台干净的 Ubuntu 20.04 / 22.04 x86_64 上, 用一条命令从零装完 ActSSH 中继与网页桥接, 并做收尾自检
-# 架构定位    : 部署编排层; 上游是运维人员, 下游是 nginx-cert.sh, install-uptermd.sh, web-bridge.sh, firewall.sh, selfcheck.sh
-# 核心功能    : 前置校验, 端口冲突判定, 分步执行与计时, 变更前备份, 防火墙演练或落地, 收尾自检, 失败回滚
-# 职责边界    : 不改系统 sshd 端口, 不改云安全组, 不迁移既有服务占用, 不接管发行版 nginx 站点, 不打印任何凭据
+# 文件        : install.sh
+# 所属目录    : relay/
+# 文件用途    : 在一台干净的 Ubuntu 20.04 / 22.04 x86_64 上, 用一条命令从零装完通用 SSH 反向隧道中继, 可选加网页桥接
+# 架构定位    : 中继安装入口; 上游是运维人员, 下游是 nginx-cert.sh, install-uptermd.sh, web-bridge.sh, firewall.sh, selfcheck.sh
+# 核心功能    : 前置校验, 端口冲突判定, 分步执行与计时, 变更前备份, 防火墙演练或落地, 收尾自检, 失败回滚, 版本与升级
+# 职责边界    : 不改系统 sshd 端口, 不改云安全组, 不迁移既有服务占用, 不接管发行版 nginx 站点, 不打印任何凭据, 不依赖 Actions
 # 运行环境    : Ubuntu 20.04 与 22.04, x86_64, bash 5.x, 以 root 执行, 需出网访问 apt, GitHub Releases, PyPI, ACME
 # 依赖关系    : 依赖 apt-get, systemctl, ss, jq, curl, nginx, certbot, python3-venv; 由本脚本自行安装
 #
@@ -22,14 +22,18 @@
 #               --admin-ssh-port <p>  系统 sshd 端口, 默认 22, 不修改; --ssh-port 为别名
 #               --relay-port <p>      uptermd SSH 端口, 默认 2222; --uptermd-port 为别名
 #               --uptermd-version <v> 待安装 uptermd 版本, 默认 v0.41.1
-#               --relay-only          只装中继: 不装 nginx, 证书, 网页桥接
+#               --relay-only / --no-web-bridge 只装中继: 不装 nginx, 证书, 网页桥接, 即通用 SSH 反向隧道中继
 #               --with-direct         中继 SSH 直连对外, 默认
 #               --no-direct           中继 SSH 只监听环回, 关闭直连
+#               --bridge-host <host>  桥接监听与 nginx 上游地址, 默认 127.0.0.1
+#               --bridge-port <p>     桥接监听端口, 默认 8081
+#               --ws-path <path>      浏览器 WS 入口路径, 默认 /ws/
+#               --runner-path <path>  runner 反连 WS 路径, 默认 /runner/
 #               --bridge-wheelhouse <dir> 离线 pip wheel 目录, 供无外网环境安装桥接依赖
 #               --upgrade             版本升级: 读取上次参数, 备份后重跑全部幂等步骤, 失败自动回滚
+#               --version             打印 relay 组件版本后退出
 #               --http-port <p>       HTTP 端口, 默认 80
 #               --https-port <p>      HTTPS 端口, 默认 443
-#               --bridge-port <p>     桥接监听端口, 默认 8081
 #               --ws-backend-port <p> uptermd WS 上游端口, 默认 8443
 #               --metrics-port <p>    指标端口, 默认 9100
 #               --state-dir <dir>     状态, 备份与日志根目录, 默认 /var/lib/actssh-bootstrap
@@ -45,7 +49,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=deploy/bootstrap/lib.sh
+# shellcheck source=relay/bootstrap/lib.sh
 source "${SCRIPT_DIR}/bootstrap/lib.sh"
 
 # =========** 方法一览 =========**
@@ -89,13 +93,18 @@ ADMIN_SSH_PORT="${ACTSSH_ADMIN_SSH_PORT:-22}"
 RELAY_PORT="${ACTSSH_RELAY_SSH_PORT:-2222}"
 HTTP_PORT="${ACTSSH_HTTP_PORT:-80}"
 HTTPS_PORT="${ACTSSH_HTTPS_PORT:-443}"
+BRIDGE_HOST="${ACTSSH_BRIDGE_HOST:-127.0.0.1}"
 BRIDGE_PORT="${ACTSSH_BRIDGE_PORT:-8081}"
+WS_PATH="${ACTSSH_WS_PATH:-/ws/}"
+RUNNER_PATH="${ACTSSH_RUNNER_PATH:-/runner/}"
 WS_BACKEND_PORT="${ACTSSH_WS_BACKEND_PORT:-8443}"
 METRICS_PORT="${ACTSSH_METRICS_PORT:-9100}"
 PUBLIC_BIND="${ACTSSH_PUBLIC_BIND:-0.0.0.0}"
 STATE_DIR="${ACTSSH_STATE_DIR:-/var/lib/actssh-bootstrap}"
 OPS_GROUP="${ACTSSH_OPS_GROUP:-actssh-ops}"
 ACME_ROOT="${ACTSSH_ACME_ROOT:-/var/www/actssh-acme}"
+RELAY_VERSION="$(cat "${SCRIPT_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]')"
+RELAY_VERSION="${RELAY_VERSION:-0.0.0}"
 
 APPLY=0
 ROLLBACK=0
@@ -121,7 +130,7 @@ WEB_PACKAGES=(
 )
 PACKAGES=()
 
-LOGGER="deploy.bootstrap"
+LOGGER="relay.bootstrap"
 RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
 LOG_ROOT=""
 BACKUP_DIR=""
@@ -168,10 +177,16 @@ show_usage() {
     # 参数: 无
     # 返回: 无; 退出码: 0
     cat <<'USAGE'
-用法: bootstrap.sh --domain <fqdn> [选项]
-      bootstrap.sh --rollback [--apply]
+用法: install.sh [--domain <fqdn>] [选项]
+      install.sh --version
+      install.sh --rollback [--apply]
 
 从零部署 (默认演练, --apply 才落地):
+  纯 SSH 反向隧道中继 (不带网页桥接, 无域名依赖):
+      install.sh --relay-only --no-direct --apply
+  完整形态 (nginx + 证书 + 网页桥接):
+      install.sh --domain <fqdn> --email <mail> --apply
+
   --domain <fqdn>          证书域名, full 形态必填
   --acme-email <mail>      ACME 注册邮箱, 可省略; 别名 --email
   --acme-staging           使用 ACME 预发布目录
@@ -181,11 +196,18 @@ show_usage() {
                            self-signed: 自签, 仅无公网环境使用
   --web-root <dir>         可选静态站点目录
   --relay-only             只装中继: 不装 nginx, 证书, 网页桥接
+  --no-web-bridge          同 --relay-only, 纯 SSH 转发形态
   --with-direct            中继 SSH 直连对外, 默认
   --no-direct              中继 SSH 只监听环回, 关闭直连
   --uptermd-version <v>    待安装 uptermd 版本, 默认 v0.41.1
+  --bridge-host <host>     桥接监听与 nginx 上游地址, 默认 127.0.0.1
+  --bridge-port <p>        桥接端口, 默认 8081
+  --ws-path <path>         浏览器 WS 入口路径, 默认 /ws/
+  --runner-path <path>     runner 反连路径, 默认 /runner/
+  --ws-backend-port <p>    uptermd WS 上游端口, 默认 8443
   --bridge-wheelhouse <d>  离线 pip wheel 目录
   --upgrade                升级: 读取上次参数, 备份后重跑, 失败自动回滚
+  --version                打印 relay 组件版本后退出
   --admin-cidr <cidr>      管理面 SSH 允许来源, 可重复; 防火墙落地时必填
   --allow-admin-anywhere   管理面不限来源, 仅限临时排障
   --rate-limit-ssh         对 SSH 与 WS 入口按源限速, 仅 ufw 有效
@@ -194,8 +216,6 @@ show_usage() {
   --relay-port <p>         uptermd SSH 端口, 默认 2222; 别名 --uptermd-port
   --http-port <p>          HTTP 端口, 默认 80
   --https-port <p>         HTTPS 端口, 默认 443
-  --bridge-port <p>        桥接端口, 默认 8081
-  --ws-backend-port <p>    uptermd WS 上游端口, 默认 8443
   --metrics-port <p>       指标端口, 默认 9100
   --state-dir <dir>        状态与备份目录, 默认 /var/lib/actssh-bootstrap
   --skip-firewall          本次不处理防火墙
@@ -221,9 +241,13 @@ _parse_args() {
             --acme-staging) ACME_STAGING=1; EXPLICIT[acme_staging]=1; shift ;;
             --cert-mode) CERT_MODE="${2:?缺少 --cert-mode 取值}"; EXPLICIT[cert_mode]=1; shift 2 ;;
             --web-root) WEB_ROOT="${2:?缺少 --web-root 取值}"; EXPLICIT[web_root]=1; shift 2 ;;
-            --relay-only) DEPLOY_MODE="relay-only"; EXPLICIT[deploy_mode]=1; shift ;;
+            --relay-only|--no-web-bridge) DEPLOY_MODE="relay-only"; EXPLICIT[deploy_mode]=1; shift ;;
             --with-direct) WITH_DIRECT=1; EXPLICIT[with_direct]=1; shift ;;
             --no-direct) WITH_DIRECT=0; EXPLICIT[with_direct]=1; shift ;;
+            --bridge-host) BRIDGE_HOST="${2:?缺少 --bridge-host 取值}"; EXPLICIT[bridge_host]=1; shift 2 ;;
+            --ws-path) WS_PATH="${2:?缺少 --ws-path 取值}"; EXPLICIT[ws_path]=1; shift 2 ;;
+            --runner-path) RUNNER_PATH="${2:?缺少 --runner-path 取值}"; EXPLICIT[runner_path]=1; shift 2 ;;
+            --version) printf 'actssh-relay %s\n' "$RELAY_VERSION"; exit 0 ;;
             --uptermd-version) UPTERMD_VERSION_ARG="${2:?缺少 --uptermd-version 取值}"; EXPLICIT[uptermd_version]=1; shift 2 ;;
             --bridge-wheelhouse) BRIDGE_WHEELHOUSE="${2:?缺少 --bridge-wheelhouse 取值}"; EXPLICIT[bridge_wheelhouse]=1; shift 2 ;;
             --upgrade) UPGRADE=1; shift ;;
@@ -274,6 +298,18 @@ _validate_args() {
     bs_require_port "bridge-port" "$BRIDGE_PORT"
     bs_require_port "ws-backend-port" "$WS_BACKEND_PORT"
     bs_require_port "metrics-port" "$METRICS_PORT"
+    if [[ -z "$BRIDGE_HOST" || "$BRIDGE_HOST" == *" "* ]]; then
+        _die 2 "bootstrap.args.bridge_host" "bridge-host 非法: ${BRIDGE_HOST}"
+    fi
+    local p
+    for p in "$WS_PATH" "$RUNNER_PATH"; do
+        if [[ ! "$p" =~ ^/[A-Za-z0-9._/-]+/$ || "$p" == *".."* ]]; then
+            _die 2 "bootstrap.args.ws_path" "WS 路径必须以 / 开头并以 / 结尾, 且只含字母数字与 ._/- : ${p}"
+        fi
+    done
+    if [[ "$WS_PATH" == "$RUNNER_PATH" ]]; then
+        _die 2 "bootstrap.args.ws_path_conflict" "ws-path 与 runner-path 不能相同: ${WS_PATH}"
+    fi
     if [[ "$ROLE" == "deploy" && "$DEPLOY_MODE" == "full" && -z "$DOMAIN" ]]; then
         _die 2 "bootstrap.args.domain" "缺少 --domain; relay-only 形态可省略; 回滚请显式使用 --rollback"
     fi
@@ -533,6 +569,9 @@ _load_previous() {
             HTTP_PORT) [[ -n "${EXPLICIT[http_port]:-}" ]] || HTTP_PORT="$val" ;;
             HTTPS_PORT) [[ -n "${EXPLICIT[https_port]:-}" ]] || HTTPS_PORT="$val" ;;
             BRIDGE_PORT) [[ -n "${EXPLICIT[bridge_port]:-}" ]] || BRIDGE_PORT="$val" ;;
+            BRIDGE_HOST) [[ -n "${EXPLICIT[bridge_host]:-}" ]] || BRIDGE_HOST="$val" ;;
+            WS_PATH) [[ -n "${EXPLICIT[ws_path]:-}" ]] || WS_PATH="$val" ;;
+            RUNNER_PATH) [[ -n "${EXPLICIT[runner_path]:-}" ]] || RUNNER_PATH="$val" ;;
             WS_BACKEND_PORT) [[ -n "${EXPLICIT[ws_backend_port]:-}" ]] || WS_BACKEND_PORT="$val" ;;
             METRICS_PORT) [[ -n "${EXPLICIT[metrics_port]:-}" ]] || METRICS_PORT="$val" ;;
             OPS_USER) [[ -n "${EXPLICIT[ops_user]:-}" ]] || OPS_USER="$val" ;;
@@ -600,6 +639,10 @@ _prepare_backup() {
     _manifest_set HTTP_PORT "$HTTP_PORT"
     _manifest_set HTTPS_PORT "$HTTPS_PORT"
     _manifest_set BRIDGE_PORT "$BRIDGE_PORT"
+    _manifest_set BRIDGE_HOST "$BRIDGE_HOST"
+    _manifest_set WS_PATH "$WS_PATH"
+    _manifest_set RUNNER_PATH "$RUNNER_PATH"
+    _manifest_set RELAY_VERSION "$RELAY_VERSION"
     _manifest_set WS_BACKEND_PORT "$WS_BACKEND_PORT"
     _manifest_set METRICS_PORT "$METRICS_PORT"
     _manifest_set OPS_USER "$OPS_USER"
@@ -726,7 +769,7 @@ _write_logrotate() {
     local tmp
     tmp="$(mktemp "${TMP_DIR}/logrotate.XXXXXX")"
     cat >"$tmp" <<'EOF'
-# 由 deploy/bootstrap.sh 生成: 只轮转独立 nginx 实例的日志
+# 由 relay/install.sh 生成: 只轮转独立 nginx 实例的日志
 /var/log/actssh/nginx/*.log {
     daily
     rotate 14
@@ -754,8 +797,10 @@ _step_nginx() {
         --cert-mode "$CERT_MODE"
         --http-port "$HTTP_PORT"
         --https-port "$HTTPS_PORT"
-        --bridge-host "127.0.0.1"
+        --bridge-host "$BRIDGE_HOST"
         --bridge-port "$BRIDGE_PORT"
+        --ws-path "$WS_PATH"
+        --runner-path "$RUNNER_PATH"
         --acme-root "$ACME_ROOT"
         --ops-group "$OPS_GROUP"
     )
@@ -808,12 +853,12 @@ _step_bridge() {
     # 参数: 无
     # 返回: 无; 退出码: 0 或 12
     local -a args=(
-        --bridge-host "127.0.0.1"
+        --bridge-host "$BRIDGE_HOST"
         --bridge-port "$BRIDGE_PORT"
         --ops-group "$OPS_GROUP"
         --install-dir /opt/actssh-web-bridge
-        --source-dir "${SCRIPT_DIR}/../scripts/bridge"
-        --requirements "${SCRIPT_DIR}/../scripts/requirements-web-bridge.txt"
+        --source-dir "${SCRIPT_DIR}/bridge"
+        --requirements "${SCRIPT_DIR}/bridge/requirements-web-bridge.txt"
         --unit-src "${SCRIPT_DIR}/actssh-web-bridge.service"
     )
     if [[ -n "$BRIDGE_WHEELHOUSE" ]]; then
@@ -887,6 +932,8 @@ _step_selfcheck() {
         --http-port "$HTTP_PORT"
         --https-port "$HTTPS_PORT"
         --bridge-port "$BRIDGE_PORT"
+        --ws-path "$WS_PATH"
+        --runner-path "$RUNNER_PATH"
         --ws-backend-port "$WS_BACKEND_PORT"
         --metrics-port "$METRICS_PORT"
         --acme-root "$ACME_ROOT"
@@ -993,15 +1040,17 @@ _summary() {
     _say "日志: ${LOG_ROOT}/${RUN_ID}.jsonl"
     if (( APPLY == 1 )); then
         _say "备份: ${BACKUP_DIR}"
-        _say "回滚: ${SCRIPT_DIR}/bootstrap.sh --rollback --apply"
+        _say "回滚: ${SCRIPT_DIR}/install.sh --rollback --apply"
     fi
     if (( APPLY == 0 )); then
         _say "当前为演练模式; 确认无误后追加 --apply 落地"
     fi
     if [[ "$DEPLOY_MODE" == "full" ]]; then
         _say "后续: 解析 ${DOMAIN} 到本机, 放行云安全组 ${HTTP_PORT}/${HTTPS_PORT}/${RELAY_PORT}; 网页静态资源用 --web-root 指定"
+    elif (( WITH_DIRECT == 1 )); then
+        _say "后续: 直连入口 ${RELAY_PORT} 需在云安全组放行; 升级用 ${SCRIPT_DIR}/install.sh --upgrade --apply"
     else
-        _say "后续: 放行云安全组 ${RELAY_PORT}; 升级用 ${SCRIPT_DIR}/bootstrap.sh --upgrade --apply"
+        _say "后续: 直连已关闭, ${RELAY_PORT} 只监听环回, 无需放行云安全组; 升级用 ${SCRIPT_DIR}/install.sh --upgrade --apply"
     fi
 }
 
@@ -1082,6 +1131,15 @@ _run_rollback() {
     else
         systemctl disable nginx.service >/dev/null 2>&1 || true
     fi
+    # 回滚只恢复文件; 把恢复后仍存在的本方案单元重新拉起, 恢复到本次操作前的可用状态
+    local unit
+    for unit in uptermd.service actssh-web-bridge.service actssh-nginx.service; do
+        if [[ -f "/etc/systemd/system/${unit}" ]]; then
+            systemctl enable "$unit" >/dev/null 2>&1 || true
+            systemctl restart "$unit" >/dev/null 2>&1 \
+                || _say "[WARN] 回滚后启动 ${unit} 失败, 请人工核对"
+        fi
+    done
     _say "回滚完成; apt 软件包保留不卸载, 备份目录保留: ${BACKUP_DIR}"
     return 0
 }
@@ -1127,7 +1185,7 @@ _check_os
 bs_require_cmds apt-get dpkg-query systemctl ss awk sed install cp rm mkdir date id getent
 TMP_DIR="$(mktemp -d)"
 
-_say "=== ActSSH bootstrap (apply=${APPLY} mode=${DEPLOY_MODE} domain=${DOMAIN:-无}) ==="
+_say "=== ActSSH relay ${RELAY_VERSION} (apply=${APPLY} mode=${DEPLOY_MODE} domain=${DOMAIN:-无} ws=${WS_PATH} runner=${RUNNER_PATH}) ==="
 _log INFO "bootstrap.start" "开始从零部署" \
     "{\"domain\":\"${DOMAIN}\",\"apply\":${APPLY},\"cert_mode\":\"${CERT_MODE}\",\"mode\":\"${DEPLOY_MODE}\",\"direct\":${WITH_DIRECT},\"upgrade\":${UPGRADE}}"
 _print_ports

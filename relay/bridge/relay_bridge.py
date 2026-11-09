@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 文件: relay_bridge.py
-所属目录: scripts/bridge/
+所属目录: relay/bridge/
 文件用途: 中继侧无状态网页桥接服务; 按 session_id 把浏览器 WS 与 runner 反连 WS 配对并原样转发二进制帧.
-架构定位: 中继端进程; 上游是 nginx 的 /ws/ 与 /runner/ 两个 location, 下游是 runner 主动反连的 WS.
+架构定位: 中继端进程; 上游是 nginx 的浏览器入口与 runner 反连两个 location(默认 /ws/ 与 /runner/), 下游是 runner 主动反连的 WS.
 核心功能: 两条 WS 端点, 内存配对, 单帧上限 1 MiB, 每会话浏览器上限 2, 重复 runner 注册拒绝,
           只透传帧字节, 不解析业务帧, 不打印负载, 不写任何帧内容到磁盘或日志.
 职责边界: 不做 WebAuthn 验签, 不做准入判定, 不持有用户私钥或口令, 不落盘会话状态, 不监听公网地址.
@@ -68,6 +68,8 @@ class BridgeConfig:
     ping_timeout: float = 20.0
     run_id: str = ""
     log_level: str = "INFO"
+    browser_prefix: str = "/ws"
+    runner_prefix: str = "/runner"
 
 
 @dataclass
@@ -88,22 +90,32 @@ def _is_valid_session_id(session_id: str) -> bool:
     return all(ch in _SESSION_ID_CHARS for ch in session_id)
 
 
-def _parse_route(path: str) -> Optional[Tuple[str, str]]:
+def _parse_route(
+    path: str,
+    browser_prefix: str = "/ws",
+    runner_prefix: str = "/runner",
+) -> Optional[Tuple[str, str]]:
     """
     解析 WS 请求路径.
 
+    :param path: 请求路径, 可带查询串.
+    :param browser_prefix: 浏览器入口前缀, 默认 /ws.
+    :param runner_prefix: runner 反连前缀, 默认 /runner.
     :return: (kind, session_id), kind 为 runner 或 browser; 非法路径返回 None.
     """
     raw = path.split("?", 1)[0]
-    parts = raw.split("/")
-    if len(parts) != 3 or parts[0] != "":
-        return None
-    kind_token, session_id = parts[1], parts[2]
-    if kind_token not in ("ws", "runner"):
+    parts = [p for p in raw.split("/") if p]
+    browser_parts = [p for p in browser_prefix.split("/") if p]
+    runner_parts = [p for p in runner_prefix.split("/") if p]
+    if len(parts) == len(browser_parts) + 1 and parts[: len(browser_parts)] == browser_parts:
+        kind_token, session_id = "browser", parts[-1]
+    elif len(parts) == len(runner_parts) + 1 and parts[: len(runner_parts)] == runner_parts:
+        kind_token, session_id = "runner", parts[-1]
+    else:
         return None
     if not _is_valid_session_id(session_id):
         return None
-    return ("browser" if kind_token == "ws" else "runner", session_id)
+    return (kind_token, session_id)
 
 
 def _peer(websocket: object) -> Optional[str]:
@@ -172,12 +184,12 @@ class Bridge:
 
     async def _dispatch(self, websocket: object, path: str) -> None:
         """按路径分流到 runner 注册或浏览器接入."""
-        parsed = _parse_route(path)
+        parsed = _parse_route(path, self._config.browser_prefix, self._config.runner_prefix)
         if parsed is None:
             self._logger.log(
                 "WARNING",
                 "bridge.protocol.rejected",
-                "WS 路径不是 /ws/<session_id> 或 /runner/<session_id>, 拒绝连接",
+                f"WS 路径不属于 {self._config.browser_prefix}/<session_id> 或 {self._config.runner_prefix}/<session_id>, 拒绝连接",
                 route_path_kind="invalid",
                 remote=_peer(websocket),
                 close_reason=REASON_UNKNOWN_SESSION,
@@ -355,6 +367,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=int(os.environ.get("BRIDGE_LISTEN_PORT", DEFAULT_PORT)), help="监听端口")
     parser.add_argument("--max-frame-bytes", type=int, default=MAX_FRAME_BYTES, help="单帧上限字节数")
     parser.add_argument("--max-browsers", type=int, default=MAX_BROWSERS_PER_SESSION, help="每会话浏览器上限")
+    parser.add_argument("--browser-prefix", default=os.environ.get("BRIDGE_BROWSER_PREFIX", "/ws"), help="浏览器 WS 入口前缀, 默认 /ws")
+    parser.add_argument("--runner-prefix", default=os.environ.get("BRIDGE_RUNNER_PREFIX", "/runner"), help="runner 反连 WS 前缀, 默认 /runner")
     parser.add_argument("--run-id", default=None, help="日志 run_id, 缺省取 GITHUB_RUN_ID 或时间戳")
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO", help="日志级别")
     return parser
@@ -392,6 +406,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_browsers=args.max_browsers,
         run_id=run_id,
         log_level=args.log_level,
+        browser_prefix=args.browser_prefix,
+        runner_prefix=args.runner_prefix,
     )
 
     async def _serve() -> None:

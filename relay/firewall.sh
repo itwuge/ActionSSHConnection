@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # =========** 文件头 =========**
 # 文件        : firewall.sh
-# 所属目录    : deploy/
+# 所属目录    : relay/
 # 文件用途    : 为中转机落地上网边界: 放行 SSH 与 WS 入口, 对新连接做速率上限, 把管理面 SSH 限到白名单来源, 阻断指标端口的非环回访问
-# 架构定位    : 运维网络层; 上游是 deploy/README.md 的防火墙章节, 下游是 ufw 或 nftables 的入站策略
+# 架构定位    : 运维网络层; 上游是 relay/README.md 的防火墙章节, 下游是 ufw 或 nftables 的入站策略
 # 核心功能    : 后端探测, 规则生成, 演练输出, 防锁死校验, 应用与持久化, 应用后核对
 # 职责边界    : 不改 sshd 配置, 不改云安全组, 不处理出站策略, 不做内容级审计; 后端冲突时只报错不做两种管理器的合并
 # 运行环境    : Ubuntu 20.04 及以上, bash 5.x, 以 root 执行, 需已装 ufw 或 nftables 之一
-# 依赖关系    : 依赖 ufw 或 nft, systemctl, jq, id, install; 由 deploy/README.md 的防火墙章节调用
+# 依赖关系    : 依赖 ufw 或 nft, systemctl, jq, id, install; 由 relay/README.md 的防火墙章节调用
 #
 # 输入        : 均可由同名环境变量预置, 命令行参数优先
 #               FW_BACKEND           auto 或 ufw 或 nftables, 默认 auto
@@ -24,7 +24,7 @@
 #               FW_WS_BURST          WS 新连接突发量, 默认 40
 #               FW_NFT_CONF          nftables 主配置路径, 默认 /etc/nftables.conf
 #               FW_NFT_RULESET       规则文件路径, 默认 /etc/uptermd/uptermd-guard.nft
-#               FW_DEPLOY_LOG_DIR    日志根目录, 默认 /var/log/uptermd-deploy/logs
+#               FW_DEPLOY_LOG_DIR    日志根目录, 默认 /var/log/uptermd-relay/logs
 # 退出码      : 0 成功或演练完成; 2 参数非法; 3 依赖缺失; 4 防锁死校验未通过; 5 规则应用或持久化失败;
 #               130 收到 INT; 143 收到 TERM
 # 运行平台    : Linux only
@@ -60,13 +60,13 @@ WS_RATE="${FW_WS_RATE:-20/second}"
 WS_BURST="${FW_WS_BURST:-40}"
 NFT_CONF="${FW_NFT_CONF:-/etc/nftables.conf}"
 NFT_RULESET="${FW_NFT_RULESET:-/etc/uptermd/uptermd-guard.nft}"
-LOG_DIR="${FW_DEPLOY_LOG_DIR:-/var/log/uptermd-deploy/logs}"
+LOG_DIR="${FW_DEPLOY_LOG_DIR:-/var/log/uptermd-relay/logs}"
 NFT_TABLE="uptermd_guard"
-MARK_BEGIN="# BEGIN uptermd-guard (managed by deploy/firewall.sh)"
+MARK_BEGIN="# BEGIN uptermd-guard (managed by relay/firewall.sh)"
 MARK_LINE="include \"${NFT_RULESET}\""
 STORAGE_DIR="${UPTERMD_CONF_DIR:-/etc/uptermd}"
 
-LOGGER="deploy.firewall"
+LOGGER="relay.firewall"
 RUN_ID="$(date -u '+%Y%m%d_%H%M%S')_$$"
 LOG_FILE=""
 APPLY=0
