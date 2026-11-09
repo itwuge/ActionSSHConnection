@@ -81,11 +81,11 @@ jobs:
 运行开始后，「输出路由字段」步骤打印九行 `key=value`，随后摘要里重复一次：
 
 ```text
-session_id=1VJ7lzzuZgx4sTKf0cfS
-ssh_user=1VJ7lzzuZgx4sTKf0cfS:MTI3LjAuMC4xOjIyMjI=
+session_id=tKJvWvuZSDdZMCl6dJ8l
+ssh_user=tKJvWvuZSDdZMCl6dJ8l:MC4wLjAuMDoyMjIy
 relay_host=ssh.wuge.fun
 relay_port=2222
-web_url=https://wuge.fun/t/1VJ7lzzuZgx4sTKf0cfS
+web_url=https://wuge.fun/t/tKJvWvuZSDdZMCl6dJ8l
 pubkey_fingerprint=SHA256:...
 expires_at=2026-11-09T18:49:00Z
 pubkey_credential_id=unset
@@ -298,8 +298,8 @@ jobs:
 | 网页静态入口 `https://wuge.fun/t/<session_id>` | 已验证 | 返回页面并回退 `index.html`；`/dist/app.js`、`app.css` 与本地构建产物 SHA-256 相同 |
 | `/ws/` 与 `/runner/` Upgrade | 已验证 | 生产 nginx 返回 101；runner 反连可持续保持（会话存续期内） |
 | 网页通行密钥注册 → 进入 tmux → 执行命令 | 虚拟认证器验证，真实设备未验 | Chrome CDP 虚拟认证器（ctap2 internal）完成注册与断言，终端执行 `echo` 有回显；**真实认证器未验** |
-| 刷新后免注册直接再进 | 虚拟认证器验证，真实设备未验 | 重载后复用已注册凭据可直接进入；终端重绘修复（新终端 fd 重登记）待复验 |
-| 会话结束后旧链接可读提示 | 已验证 | 会话结束后打开旧链接显示「会话不存在或已结束」 |
+| 刷新后免注册直接再进 | 虚拟认证器验证，真实设备未验 | 同一虚拟凭据重载后直接进入，终端继续执行 `echo` 有回显；旧屏幕内容只部分重绘（可见 tmux 状态行），未做完整回放 |
+| 会话结束后旧链接可读提示 | 已验证 | 打开旧链接先显示入口页，点击入口按钮后提示「会话不存在或已结束. 请向发起者索取新的连接串.」 |
 | 中继一键安装（纯中继形态） | 仅 VM 验证 | Ubuntu 22.04 干净机：安装 10.3s、自检 6/6、登入成功、卸载后无残留 |
 | 中继一键安装（完整形态，self-signed） | 仅 VM 验证 | 91.8s、自检 17/17；公网域名 + 真实 ACME 未在干净机复跑 |
 | 生产宿主接管（host nginx） | 已验证 | 6 个 conf 规范化后等价、证书序列号不变、nginx master PID 不变、`/t/` 200、`/ws/` `/runner/` 101 |
@@ -327,6 +327,8 @@ jobs:
 
 - **直连不是纯 P2P**：`path_mode=direct` 只说明 tailnet 路径可用；对称 NAT 下退到 DERP，只有 `path_verified=direct` 才是点对点。
 - **网页通道依赖中继侧桥接**：`/ws/`、`/runner/` 或 `actssh-web-bridge.service` 不可用时 SSH 仍可用，日志按 `bridge-connect` / `bridge-register` / `bridge-admission` 报阶段。
+- **刷新后屏幕历史不完整**：重连会重新 `tmux attach`，只重绘部分内容；新输出正常，历史滚动区不做回放。
+- **旧链接的失效提示要一次点击**：入口页先展示「注册/直接进入」，点击后才由 WebSocket 关闭原因给出「会话不存在或已结束」。
 - **自举注册的残余风险**：`allowed-credentials: "[]"` 时第一个完成注册的人拿到终端；生产应预置凭据条目。
 - **仅 Linux runner**：依赖 bash、tmux、jq、python3；Windows / macOS 未支持。
 - **upterm 客户端只内置 `v0.41.1` 校验和**，其他版本被拒绝。
