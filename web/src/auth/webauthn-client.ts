@@ -9,6 +9,8 @@
  * 依赖关系: 依赖 protocol/control.ts 的负载类型; 被 admission-client.ts 调用.
  */
 
+import { classifyPageHost, describePageHostNotice, WEB_RP_ID } from '../config'; // 项目内模块: 部署域名与依赖方标识
+
 import type {
   AuthChallengePayload,
   AuthAssertionPayload,
@@ -125,23 +127,34 @@ export function assertSecureContext(): void {
 }
 
 /**
- * 校验服务端下发的依赖方标识与当前页面主机兼容.
+ * 校验服务端下发的依赖方标识与页面部署口径.
  *
  * @param rpId 服务端下发的依赖方标识.
  * @returns 无.
- * @throws {WebAuthnClientError} 依赖方标识为空或与页面主机不匹配时抛出.
+ * @throws {WebAuthnClientError} 依赖方标识为空, 与 wuge.fun 不一致, 或页面不在 wuge.fun 域下时抛出.
  */
 export function assertRpIdCompatible(rpId: string): void {
-  const hostname = window.location.hostname;
   if (rpId.length === 0) {
     throw new WebAuthnClientError('INVALID_PAYLOAD', '服务端未给出依赖方标识');
   }
+  if (rpId !== WEB_RP_ID) {
+    throw new WebAuthnClientError(
+      'RP_ID_MISMATCH',
+      `服务端下发的依赖方标识 ${rpId} 与本项目固定的 ${WEB_RP_ID} 不一致; 请按部署口径修正 runner 侧配置`
+    );
+  }
+  const mode = classifyPageHost(window.location.hostname);
+  if (mode !== 'deployment') {
+    // 非部署域先给出域名层面提示, 比浏览器的 SecurityError 更能说明该改哪里
+    throw new WebAuthnClientError('RP_ID_MISMATCH', describePageHostNotice(mode, window.location.hostname));
+  }
+  const hostname = window.location.hostname.toLowerCase();
   if (hostname === rpId || hostname.endsWith(`.${rpId}`)) {
     return;
   }
   throw new WebAuthnClientError(
     'RP_ID_MISMATCH',
-    `依赖方标识 ${rpId} 与当前页面主机 ${hostname} 不匹配; 若前端托管在与中转不同域名下, 通行密钥无法绑定, 托管方式待确认`
+    `依赖方标识 ${rpId} 与当前页面主机 ${hostname} 不匹配; 页面必须部署在 wuge.fun 或其子域下`
   );
 }
 

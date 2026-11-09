@@ -10,39 +10,40 @@
 - 准入状态机：等待挑战、等待验签结果、未对接、被拒绝、出错。
 - 页面不保存任何凭据，不使用 URL 带 token 的做法，不展示密钥材料，不使用 `localStorage`、`sessionStorage`、Cookie 或 IndexedDB。
 
-不在本目录内：runner 侧验签、中继实现、静态托管发布、浏览器打洞。
+不在本目录内：runner 侧验签、中继实现、发布执行、浏览器打洞。
 
-## 2. 构建
+## 2. 构建（必须先构建）
+
+`index.html` 只引用 `dist/app.js` 与 `dist/app.css`，`dist/` 已 gitignore、不入仓库。拿到仓库后**必须先构建**，否则直接双击 `index.html` 只会看到空白页面，终端不会出现。
 
 要求 Node.js 18 以上。
 
 ```powershell
 cd web
 npm install
-npm run typecheck
-npm run build
+npm run check
 ```
 
-- `npm run build` 由 esbuild 打包 `src/main.ts`，产物为 `dist/app.js`、`dist/app.css` 与 sourcemap。
-- `dist/` 与 `node_modules/` 已列入 `.gitignore`，构建产物不进入仓库。
-- 页面入口是 [index.html](index.html)，固定引用 `dist/app.js` 与 `dist/app.css`。
+- `npm run check` 等于 `tsc --noEmit` 加 esbuild 打包，一条命令完成类型检查与构造。
+- 产物为 `dist/app.js`、`dist/app.css` 与 sourcemap。
+- 只打包不检查可用 `npm run build`，日常交付建议用 `npm run check`。
 
 ## 3. 本地运行
 
 ```powershell
 cd web
-npm run build
+npm run check
 npm run serve
 ```
 
-打开 `http://127.0.0.1:5173/`。`localhost` 属于安全上下文，WebAuthn 可用。
+打开 `http://127.0.0.1:5173/`。
 
-也可以直接双击 `index.html` 打开：终端界面可渲染，但 `file://` 不是安全上下文，通行密钥不可用，且页面无法读取同目录以外的资源；只建议用于查看布局。
+也可以直接双击 `index.html` 打开：终端界面可渲染，但 `file://` 不是安全上下文，通行密钥不可用，且页面只建议用于查看布局；真实准入必须在 `https://wuge.fun` 下进行。
 
 页面支持两个查询参数预填表单，二者都不属于凭据：
 
 ```text
-http://127.0.0.1:5173/?relay=wss%3A%2F%2Frelay.example&session=<session_id>
+http://127.0.0.1:5173/?relay=wss%3A%2F%2Fwuge.fun&session=<session_id>
 ```
 
 页面已声明 `referrer=no-referrer`，避免地址栏中的 `session_id` 通过 Referer 外泄。
@@ -73,21 +74,35 @@ http://127.0.0.1:5173/?relay=ws%3A%2F%2F127.0.0.1%3A8787&session=demo-local
 
 模拟中继只监听 `127.0.0.1`，`ws://` 明文仅对本机地址放行；其他地址必须使用 `wss://`。
 
-## 5. 连接与帧格式
+本地调试域只用于上述界面验证：通行密钥绑定 `wuge.fun`，`localhost` 与 `127.0.0.1` 无法完成真实准入，页面会常驻提示这一点。
 
-连接地址固定为：
+## 5. 部署口径
 
-```text
-wss://<中继主机>[:端口]/ws/<session_id>
-```
+- 依赖方标识（rpId）固定为 `wuge.fun`，配置位置：[config.ts](src/config.ts) 的 `WEB_RP_ID`。
+- 页面与中继同域部署，页面必须通过 `https://wuge.fun` 或其子域打开，例如 `https://wuge.fun/web/`；中继端点同域，例如 `wss://wuge.fun/ws/<session_id>`。
+- 页面在非 `wuge.fun` 域打开时，页面会立即显示明确提示并禁用注册按钮；即使强行连接，服务端下发挑战后也会因依赖方标识不符而失败，不会静默无响应。
+- 服务端下发的 `rpId` 必须等于 `wuge.fun`，否则前端拒绝发起认证并提示配置不一致。
+- 中继地址输入框允许填写任意合规的 `wss://` 主机，但真实准入仍受上面的 rpId 约束：页面域名与 rpId 不匹配时不能完成签名。
 
-- 路径只放 `session_id`，不追加 token、口令或公钥。
-- `session_id` 允许字符为字母、数字、下划线、连字符，长度 1 到 128。
-- 浏览器与中继之间只收发二进制帧；收到文本帧按协议错误处理。
-- 中继按设计不解析帧内容，只做字节转发；本节的帧格式只对浏览器与 runner 侧准入进程有意义。
-- 关闭原因中的 `UNKNOWN_SESSION` 与 `ROUTE_GONE` 会被页面识别为「会话不存在」与「会话路由已回收」；关闭码具体数值尚未确定，页面不依赖数值。
+## 6. 服务端对接清单（一页）
 
-帧头 8 字节，负载上限 1 MiB：
+本节是 runner 侧与中继侧实现时可以直接对照的完整接口页。前端只使用一个网络入口：`wss://<中继主机>/ws/<session_id>`。
+
+### 6.1 总览
+
+| 项 | 约定 |
+| --- | --- |
+| 传输 | WebSocket，只收发二进制帧；文本帧按协议错误提示 |
+| 路径 | `/ws/<session_id>`，只放会话标识，不带 token、口令、公钥 |
+| 会话标识 | 字母、数字、下划线、连字符，长度 1 到 128 |
+| 中继职责 | 无状态字节转发，不解析帧，不判准入，不存凭据 |
+| 认证位置 | runner 侧准入进程验签；中继只转发 `authChallenge` 与 `authAssertion` 的字节 |
+| 私钥位置 | 用户设备认证器内，任何服务端都拿不到 |
+| 终端开放条件 | `authResult.ok=true`；未准入前前端不发送也不显示终端数据 |
+
+### 6.2 帧格式
+
+帧头 8 字节，负载上限 1 MiB，大端序：
 
 | 偏移 | 长度 | 含义 |
 | --- | --- | --- |
@@ -95,120 +110,185 @@ wss://<中继主机>[:端口]/ws/<session_id>
 | 1 | 1 | 版本 `0x01` |
 | 2 | 1 | 帧类型 |
 | 3 | 1 | 保留位，固定 0 |
-| 4 | 4 | 负载长度，大端序 |
+| 4 | 4 | 负载长度 |
 | 8 | n | 负载 |
 
-帧类型与负载：
+中继若把 WS 帧转成字节流转发，允许合并或拆分边界，但不得改变字节顺序；runner 侧必须按 `魔数 + 版本 + 类型 + 长度` 重组完整帧后再处理。
 
-| 编号 | 名称 | 方向 | 负载 |
+帧类型总表：
+
+| 编号 | 名称 | 方向 | 用途 |
 | --- | --- | --- | --- |
-| `0x01` | `terminalData` | 双向 | 原始终端字节，UTF-8 或 ANSI 序列 |
-| `0x02` | `resize` | 浏览器到服务端 | JSON `{ cols, rows }` |
-| `0x10` | `authBegin` | 浏览器到服务端 | JSON `{ intent, clientVersion }` |
-| `0x11` | `authChallenge` | 服务端到浏览器 | JSON 挑战，见第 6 节 |
-| `0x12` | `authAssertion` | 浏览器到服务端 | JSON 断言，字段均为 base64url |
-| `0x13` | `authResult` | 服务端到浏览器 | JSON `{ ok, verifier, reason }` |
-| `0x14` | `registrationOptions` | 服务端到浏览器 | JSON 注册选项，见第 6 节 |
-| `0x15` | `registration` | 浏览器到服务端 | JSON `{ credentialId, clientDataJSON, attestationObject, transports }` |
+| `0x01` | `terminalData` | 双向 | 终端原始字节 |
+| `0x02` | `resize` | 浏览器到服务端 | 行列数变化 |
+| `0x10` | `authBegin` | 浏览器到服务端 | 发起准入 |
+| `0x11` | `authChallenge` | 服务端到浏览器 | 断言挑战 |
+| `0x12` | `authAssertion` | 浏览器到服务端 | 断言签名 |
+| `0x13` | `authResult` | 服务端到浏览器 | 准入结果 |
+| `0x14` | `registrationOptions` | 服务端到浏览器 | 注册选项 |
+| `0x15` | `registration` | 浏览器到服务端 | 注册材料 |
 
-准入通过前，页面不向服务端发送任何 `terminalData`，也不把服务端终端字节写入屏幕。
+### 6.3 逐帧字段
 
-## 6. 认证契约
+`0x01 terminalData`：负载为原始终端字节，UTF-8 或 ANSI 转义序列，不做 JSON 包装。服务端在准入通过前不得发送；前端在准入通过前不发送，也不显示。
 
-### 6.1 进入会话（断言）
+`0x02 resize`：浏览器到服务端。
 
-1. WS 打开后，浏览器发送 `authBegin`：`{ "intent": "assert", "clientVersion": "0.1.0" }`。
-2. runner 侧准入进程生成一次性挑战，发送 `authChallenge`：
+```json
+{ "cols": 120, "rows": 32 }
+```
 
-   ```json
-   {
-     "challenge": "<base64url，一次性随机数，不得复用>",
-     "rpId": "relay.wuge.fun",
-     "timeoutMs": 60000,
-     "userVerification": "preferred",
-     "allowCredentialIds": ["<base64url>"]
-   }
-   ```
+`cols`、`rows` 必须为正整数；服务端据此调整 PTY 尺寸，不需要回复。
 
-3. 浏览器校验 `rpId` 与页面主机兼容后调用 `navigator.credentials.get`，把断言以 `authAssertion` 发回：
+`0x10 authBegin`：浏览器到服务端。
 
-   ```json
-   {
-     "credentialId": "<base64url>",
-     "authenticatorData": "<base64url>",
-     "clientDataJSON": "<base64url>",
-     "signature": "<base64url>"
-   }
-   ```
+```json
+{ "intent": "assert", "clientVersion": "0.1.0" }
+```
 
-4. runner 侧按允许公钥清单验签，发送 `authResult`：
+`intent` 取 `assert`（进入）或 `register`（登记设备）；`clientVersion` 当前固定 `0.1.0`，服务端可据此拒绝过旧页面，拒绝时用 `BAD_CLIENT_VERSION` 回复。
 
-   ```json
-   { "ok": true, "verifier": "runner", "reason": "" }
-   ```
+`0x11 authChallenge`：服务端到浏览器。
 
-   `verifier` 必须为 `runner`。页面不对其他取值显示为真实准入，只显示未验签警告。
+```json
+{
+  "challenge": "<base64url，一次性随机数>",
+  "rpId": "wuge.fun",
+  "timeoutMs": 60000,
+  "userVerification": "preferred",
+  "allowCredentialIds": ["<base64url>"]
+}
+```
 
-### 6.2 注册通行密钥
+- `challenge` 必须非空且一次性，绑定当前 `session_id`，不得复用。
+- `rpId` 必须为 `wuge.fun`。
+- `timeoutMs` 前端会截断到 10000 到 300000 之间。
+- `userVerification` 取 `required`、`preferred`、`discouraged`，缺省 `preferred`。
+- `allowCredentialIds` 可省略或为空数组，表示不限定；建议只下发允许清单内的凭据标识。
 
-1. 浏览器发送 `authBegin`：`{ "intent": "register", "clientVersion": "0.1.0" }`。
-2. 服务端下发 `registrationOptions`：
+`0x12 authAssertion`：浏览器到服务端。
 
-   ```json
-   {
-     "challenge": "<base64url>",
-     "rpId": "relay.wuge.fun",
-     "rpName": "ActionSSHConnection",
-     "userId": "<base64url>",
-     "userName": "user",
-     "userDisplayName": "用户",
-     "timeoutMs": 60000,
-     "userVerification": "preferred",
-     "excludeCredentialIds": []
-   }
-   ```
+```json
+{
+  "credentialId": "<base64url>",
+  "authenticatorData": "<base64url>",
+  "clientDataJSON": "<base64url>",
+  "signature": "<base64url>",
+  "userHandle": "<base64url，可省略>"
+}
+```
 
-3. 浏览器调用 `navigator.credentials.create`，把 `credentialId`、`clientDataJSON`、`attestationObject` 与 `transports` 以 `registration` 发回；公钥包含在 `attestationObject` 内，私钥由认证器保管。
-4. 服务端验签与登记后返回 `authResult`。
+`userHandle` 为空时不发送该字段，不要传空字符串。
 
-### 6.3 占位与未对接行为
+`0x13 authResult`：服务端到浏览器。
 
-- runner 侧准入进程与 `verify_web_admission` 尚未实现。页面发送 `authBegin` 后若 8 秒内收不到 `authChallenge`，进入「未对接」状态，提示「runner 侧准入进程尚未对接，终端保持锁定」，并保持输入锁定，不会伪造通过。
-- 注册按钮同样依赖服务端下发 `registrationOptions`；服务端未实现时只显示未对接提示。
-- 页面不对 `authAssertion`、`registration` 的字节做展示、日志或持久化，只在内存中编码后经 WS 发送。
+```json
+{ "ok": true, "verifier": "runner", "reason": "" }
+```
 
-### 6.4 安全约束
+- 只有验签通过后 `ok` 才能为 `true`；此时 `verifier` 必须为 `runner`。
+- `verifier` 不是 `runner` 时，前端会显示「本地模拟器放行，服务端未验签」警告。
+- `reason` 面向界面展示，不得含凭据、公钥、内部路径或堆栈。
 
-- 私钥永不进入页面：WebAuthn 私钥由平台认证器或安全密钥保管，`navigator.credentials` 只返回公钥侧材料。
-- 页面不持有可复用凭据：没有 token、Cookie、登录态或长期 bearer。
-- 页面不读取或写入任何存储型凭据。
-- `session_id` 不是凭据，但页面仍避免将其写入历史记录以外的位置；地址栏参数由使用者自行决定是否使用。
+`0x14 registrationOptions`：服务端到浏览器。
 
-## 7. 依赖尚不存在的服务端
+```json
+{
+  "challenge": "<base64url>",
+  "rpId": "wuge.fun",
+  "rpName": "ActionSSHConnection",
+  "userId": "<base64url>",
+  "userName": "user",
+  "userDisplayName": "用户",
+  "timeoutMs": 60000,
+  "userVerification": "preferred",
+  "excludeCredentialIds": []
+}
+```
 
-以下事项在本仓库内没有实现，前端按契约留出接口并显式提示，不假装已连通：
+`userId` 必须非空；`rpId` 必须为 `wuge.fun`；`excludeCredentialIds` 用于避免同设备重复登记。
 
-| 项 | 现状 | 影响 |
+`0x15 registration`：浏览器到服务端。
+
+```json
+{
+  "credentialId": "<base64url>",
+  "clientDataJSON": "<base64url>",
+  "attestationObject": "<base64url>",
+  "transports": ["internal"]
+}
+```
+
+`attestationObject` 内含公钥；服务端解析后只保存公钥与凭据标识，私钥无法由该材料还原。
+
+### 6.4 错误码语义
+
+关闭原因：中继或 runner 关闭 WS 时，`reason` 文本必须包含下列令牌之一，前端按令牌识别，不依赖关闭码数值（数值未定）。
+
+| 令牌 | 含义 | 前端表现 |
 | --- | --- | --- |
-| runner 侧准入进程 | 未实现 | 收不到挑战，页面进入「未对接」并锁定终端 |
-| `verify_web_admission` | 未实现（设计书 5.1 第 5 项） | 断言无法验签，无法产生真实准入 |
-| 中继 WS 端点 `/ws/<session_id>` | 部署脚本已具备，实际端点未真机验证 | 连接可能以 `UNKNOWN_SESSION` 或网络错误失败 |
-| 中继原样转发二进制帧 | 设计书 3.6、5.2 标注待真机确认 | 若中继改写帧边界，帧解码会报错并提示 |
-| 关闭码数值 | 未确定 | 页面只按关闭原因文本识别，不按数值判断 |
-| 浏览器打洞 | 不实现 | 一期固定走中继，页面不显示直连路径 |
+| `UNKNOWN_SESSION` | 会话不存在，尚未建立或已结束 | 提示「会话不存在」，建议核对会话标识 |
+| `ROUTE_GONE` | 会话路由已回收，runner 侧连接已断开 | 提示「会话路由已回收」，建议重新获取会话信息 |
 
-## 8. 已知未验证项
+准入失败：用 `authResult.ok=false` 加 `reason` 原因码表达。前端已映射以下原因码为中文提示：
 
-- WebAuthn 的 `rpId` 必须是页面主机或其上级域。若前端托管在 `*.github.io`，则无法以 `relay.wuge.fun` 作为 `rpId`；客户端会拒绝并提示「依赖方标识与当前页面主机不匹配」。托管方式与 `rpId` 的最终取值需与设计书 3.6 节一并确认，当前未验证。
-- 设计书把 GitHub Pages 列为静态托管候选，属于对外发布，需按四类升级第 2 类放行；本目录未执行任何发布。
-- 中继是否允许仅按路径取 `session_id` 而完全不解析帧，待真机确认；本前端按「中继不解析帧」实现，帧格式只在浏览器与 runner 之间生效。
+| 原因码 | 含义 |
+| --- | --- |
+| `ASSERTION_INVALID` | 签名无效，或挑战与本次会话不符 |
+| `CREDENTIAL_NOT_ALLOWED` | 凭据不在允许清单内 |
+| `CHALLENGE_EXPIRED` | 挑战已过期 |
+| `CHALLENGE_REUSED` | 挑战已被使用 |
+| `BAD_CLIENT_VERSION` | 页面协议版本过旧 |
 
-## 9. 文件清单
+未登记的原因码按原文展示，因此服务端必须保证 `reason` 可展示且不含敏感信息。
+
+前端自身错误（不发往服务端，仅供排查对照）：
+
+| 错误 | 触发条件 | 前端表现 |
+| --- | --- | --- |
+| `RP_ID_MISMATCH` | 服务端 `rpId` 不是 `wuge.fun`，或页面不在 `wuge.fun` 域 | 明确提示域名或配置不一致，不发起签名 |
+| `NOT_SECURE_CONTEXT` | 页面非 HTTPS 且非 localhost | 提示通行密钥只能在安全上下文使用 |
+| `NOT_SUPPORTED` | 浏览器无 WebAuthn | 禁用注册入口并提示 |
+| `INVALID_PAYLOAD` | 挑战字段缺失或 base64url 非法 | 提示准入帧格式不符 |
+| `CREDENTIAL_FAILED` | 用户取消、超时或认证器异常 | 提示取消或认证器不可用 |
+
+帧解码失败：魔数、版本、类型或长度不符时，前端在页面提示协议错误，不把该帧交给上层处理。
+
+### 6.5 runner 侧实现清单
+
+- [ ] 生成一次性挑战，绑定 `session_id`，设置过期时间，拒绝复用。
+- [ ] 校验 `clientDataJSON` 的 `type`、`challenge`、`origin`；`origin` 必须是 `https://wuge.fun` 或其子域。
+- [ ] 校验 `rpIdHash` 等于 `SHA-256("wuge.fun")`。
+- [ ] 按允许清单中的公钥验签，支持 ES256 与 RS256。
+- [ ] 只有验签通过才发送 `authResult.ok=true`，且 `verifier` 填 `runner`。
+- [ ] 允许清单只存公钥与凭据标识，随作业销毁；不得写入日志或制品。
+- [ ] 准入通过前不发送 `terminalData`，并丢弃准入前的终端输入帧。
+- [ ] 收到 `resize` 后调整 PTY；不回复尺寸帧。
+- [ ] `reason` 只放原因码或可展示的中文，不放凭据与内部细节。
+- [ ] 注册入口的前置条件待定：注册必须发生在已认证通道（例如已通过 SSH 登录的会话）或 runner 本机，不得仅凭 `authBegin` 就接受新公钥；具体载体待 M03 确认后再开放。
+
+### 6.6 中继侧边界
+
+- 只按路径取 `session_id` 维持内存路由，进程重启即清空。
+- 不解析帧内容，不判断谁可进入，不保存挑战、断言或公钥。
+- 按字节顺序转发，允许边界合并或拆分；不得改写、压缩或重编码负载。
+- 会话不存在或路由回收时按 6.4 的令牌关闭连接。
+
+## 7. 已知未验证与待确认
+
+- 中继 WS 端点 `/ws/<session_id>` 实际部署与 TLS 证书未真机验证。
+- 中继是否严格原样转发二进制帧、是否会改变帧边界，待真机确认；前端按 6.2 的长度前缀可容忍合并与拆分。
+- 关闭码具体数值未确定；前端只识别 `reason` 中的 `UNKNOWN_SESSION` 与 `ROUTE_GONE`。
+- 注册通道的前置条件与载体未定，见 6.5 最后一项。
+- 网页通道不实现浏览器打洞，一期固定走中继。
+
+## 8. 文件清单
 
 | 文件 | 用途 |
 | --- | --- |
 | `index.html` | 入口页，固定节点与静态文案 |
 | `src/main.ts` | 入口脚本，节点校验与查询参数预填 |
+| `src/config.ts` | 部署域名与 rpId 配置，页面域名判定 |
 | `src/app-controller.ts` | 连接、帧分流、准入渲染、断线提示 |
 | `src/transport/relay-client.ts` | 中继 WS 连接与地址校验 |
 | `src/terminal/terminal-view.ts` | xterm 渲染、尺寸自适应、输入采集 |
@@ -220,7 +300,7 @@ wss://<中继主机>[:端口]/ws/<session_id>
 | `tools/serve.mjs` | 本地静态预览服务器 |
 | `tools/mock-relay.mjs` | 本地模拟中继，不验签 |
 
-## 10. 自检
+## 9. 自检
 
 在 `web/` 下执行：
 
@@ -229,4 +309,4 @@ npm run typecheck
 npm run build
 ```
 
-两条命令在 2026-11-09 的本地执行结果均为退出码 0。TypeScript 开启 `strict`、`noUncheckedIndexedAccess`、`verbatimModuleSyntax`，全仓未使用 `any` 兜底。
+TypeScript 开启 `strict`、`noUncheckedIndexedAccess`、`verbatimModuleSyntax`，全仓未使用 `any` 兜底。

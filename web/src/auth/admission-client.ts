@@ -32,6 +32,18 @@ const CHALLENGE_TIMEOUT_MS = 8_000;
 /** 前端协议版本, 随帧格式变化递增; 服务端可据此拒绝过旧页面. */
 const CLIENT_VERSION = '0.1.0';
 
+/**
+ * 准入失败原因码到中文提示的映射; 与 README 服务端对接清单中的错误码语义一一对应.
+ * 未列出的原因按服务端原文展示, 因此服务端不得在 reason 中放置凭据或内部细节.
+ */
+const AUTH_FAILURE_TEXT: Readonly<Record<string, string>> = {
+  ASSERTION_INVALID: '断言验签失败: 签名无效或挑战与本次会话不符, 请重新连接后重试.',
+  CREDENTIAL_NOT_ALLOWED: '该设备凭据不在允许清单内, 请使用已登记的设备或先行注册.',
+  CHALLENGE_EXPIRED: '准入挑战已过期, 请重新连接以获取新挑战.',
+  CHALLENGE_REUSED: '准入挑战已被使用, 请重新连接以获取新挑战.',
+  BAD_CLIENT_VERSION: '页面协议版本过旧, 请刷新页面或更新前端.'
+};
+
 // =========** 类型 =========**
 /**
  * 准入阶段; 每个阶段对应界面上一句明确状态, 不使用布尔值压缩状态.
@@ -238,7 +250,7 @@ export class AdmissionClient {
     }
     this.update({
       phase: 'denied',
-      detail: result.reason.length > 0 ? result.reason : '准入被拒绝',
+      detail: describeFailure(result.reason),
       verifier: result.verifier.length > 0 ? result.verifier : null
     });
   }
@@ -265,6 +277,19 @@ export class AdmissionClient {
       this.timer = null;
     }
   }
+}
+
+/**
+ * 把准入失败原因码转为中文提示; 未登记的原因原样返回, 由服务端保证内容可展示.
+ *
+ * @param reason 服务端返回的原因码或说明.
+ * @returns 面向界面的中文提示.
+ */
+function describeFailure(reason: string): string {
+  if (reason.length === 0) {
+    return '准入被拒绝.';
+  }
+  return AUTH_FAILURE_TEXT[reason] ?? reason;
 }
 
 /**

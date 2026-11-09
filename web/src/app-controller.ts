@@ -9,6 +9,7 @@
  * 依赖关系: 依赖 protocol/frames.ts, protocol/control.ts, transport/relay-client.ts, terminal/terminal-view.ts, auth/admission-client.ts; 被 main.ts 调用.
  */
 
+import { classifyPageHost, describePageHostNotice } from './config'; // 项目内模块: 部署域名判定与提示
 import { FRAME_TYPE } from './protocol/frames'; // 项目内模块: 帧类型编号
 import { encodeJson } from './protocol/control'; // 项目内模块: 负载编码
 import { normalizeRelayOrigin, RelayAddressError, RelayClient } from './transport/relay-client'; // 项目内模块: 中继连接与地址校验
@@ -16,6 +17,7 @@ import { TerminalView } from './terminal/terminal-view'; // 项目内模块: 终
 import { AdmissionClient } from './auth/admission-client'; // 项目内模块: 准入状态机
 import { isWebAuthnSupported } from './auth/webauthn-client'; // 项目内模块: 浏览器能力检测
 
+import type { PageHostMode } from './config'; // 项目内类型: 页面域名类别
 import type { Frame } from './protocol/frames'; // 项目内类型: 帧结构
 import type { AdmissionSnapshot } from './auth/admission-client'; // 项目内类型: 准入快照
 
@@ -85,6 +87,10 @@ export class AppController {
 
   private readonly admission: AdmissionClient;
 
+  private readonly hostMode: PageHostMode;
+
+  private readonly hostNotice: string;
+
   private relay: RelayClient | null = null;
 
   private userClosed = false;
@@ -94,6 +100,8 @@ export class AppController {
    */
   constructor(elements: AppElements) {
     this.elements = elements;
+    this.hostMode = classifyPageHost(window.location.hostname);
+    this.hostNotice = describePageHostNotice(this.hostMode, window.location.hostname);
     this.terminal = new TerminalView(elements.terminalContainer, {
       onInput: (bytes: Uint8Array) => {
         this.handleTerminalInput(bytes);
@@ -133,13 +141,16 @@ export class AppController {
       this.elements.notice.hidden = true;
       this.connect();
     });
-    this.elements.registerButton.disabled = !isWebAuthnSupported();
+    this.elements.registerButton.disabled = !isWebAuthnSupported() || this.hostMode !== 'deployment';
     this.elements.disconnectButton.disabled = true;
     this.elements.pathStatus.textContent = PATH_NONE_LABEL;
     this.elements.connectionStatus.textContent = '未连接';
     this.elements.admissionStatus.textContent = '未开始';
-    this.elements.warningLine.hidden = true;
+    this.renderWarning('');
     this.terminal.writeln('网页终端已就绪: 填写中转地址与会话标识后连接; 网页通道固定走中继.');
+    if (this.hostNotice.length > 0) {
+      this.showFormMessage(this.hostNotice);
+    }
   }
 
   /**
@@ -194,7 +205,7 @@ export class AppController {
     this.terminal.reset();
     this.terminal.setInputEnabled(false);
     this.elements.notice.hidden = true;
-    this.elements.warningLine.hidden = true;
+    this.renderWarning('');
     this.admission.reset();
     this.elements.connectionStatus.textContent = '连接中';
     this.elements.pathStatus.textContent = PATH_NONE_LABEL;
@@ -245,6 +256,10 @@ export class AppController {
    * @returns 无.
    */
   private beginRegistration(): void {
+    if (this.hostMode !== 'deployment') {
+      this.showFormMessage(this.hostNotice);
+      return;
+    }
     if (!isWebAuthnSupported()) {
       this.showFormMessage('当前浏览器不支持 WebAuthn, 无法注册通行密钥');
       return;
@@ -327,19 +342,19 @@ export class AppController {
    */
   private renderAdmission(snapshot: AdmissionSnapshot): void {
     this.elements.admissionStatus.textContent = snapshot.detail;
-    this.elements.warningLine.hidden = true;
     if (snapshot.phase === 'admitted') {
       this.terminal.setInputEnabled(true);
       this.terminal.focus();
       this.elements.notice.hidden = true;
       this.terminal.writeln('准入通过, 终端已开放.');
-      if (snapshot.verifier !== REAL_VERIFIER) {
-        this.elements.warningLine.hidden = false;
-        this.elements.warningLine.textContent =
-          '当前准入由本地模拟器放行, 服务端未验签; 该状态仅用于界面验证, 不代表真实准入.';
-      }
+      const verifierWarning =
+        snapshot.verifier === REAL_VERIFIER
+          ? ''
+          : '当前准入由本地模拟器放行, 服务端未验签; 该状态仅用于界面验证, 不代表真实准入.';
+      this.renderWarning(verifierWarning);
       return;
     }
+    this.renderWarning('');
     this.terminal.setInputEnabled(false);
     if (snapshot.phase === 'denied' || snapshot.phase === 'not-integrated' || snapshot.phase === 'error') {
       this.showNotice(snapshot.detail);
@@ -405,7 +420,20 @@ export class AppController {
   private setButtonsConnected(connected: boolean): void {
     this.elements.connectButton.disabled = false;
     this.elements.disconnectButton.disabled = !connected;
-    this.elements.registerButton.disabled = !connected || !isWebAuthnSupported();
+    this.elements.registerButton.disabled =
+      !connected || !isWebAuthnSupported() || this.hostMode !== 'deployment';
+  }
+
+  /**
+   * 渲染常驻提示行; 部署域名提示始终保留, 模拟环境提示按准入结果追加.
+   *
+   * @param extra 追加提示, 空串表示本次没有额外提示.
+   * @returns 无.
+   */
+  private renderWarning(extra: string): void {
+    const parts = [this.hostNotice, extra].filter((part) => part.length > 0);
+    this.elements.warningLine.hidden = parts.length === 0;
+    this.elements.warningLine.textContent = parts.join(' ');
   }
 
   /**
