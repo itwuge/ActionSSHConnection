@@ -9,7 +9,10 @@
 set -euo pipefail
 
 workdir="${ACTSSH_WORKDIR:?缺少 ACTSSH_WORKDIR}"
-scripts_dir="${ACTSSH_SCRIPTS_DIR:?缺少 ACTSSH_SCRIPTS_DIR}"
+# ACTSSH_SCRIPTS_DIR 是 Action 根目录（本地调用为仓库根，远程调用为 _actions/.../<ref>），
+# 桥接与准入脚本、依赖清单都在它下面的 scripts/ 里
+action_root="${ACTSSH_SCRIPTS_DIR:?缺少 ACTSSH_SCRIPTS_DIR}"
+scripts_dir="$action_root/scripts"
 session_id="${ACTSSH_SESSION_ID:-}"
 session_name="${ACTSSH_SESSION_NAME:-actssh}"
 allowed_json="${ACTSSH_ALLOWED_JSON:-}"
