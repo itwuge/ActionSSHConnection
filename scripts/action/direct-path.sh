@@ -132,12 +132,13 @@ unset auth_key
 hostname="actssh-$(printf '%s' "$run_id" | tr -cd 'a-z0-9-')"
 [ -n "$hostname" ] || hostname="actssh-${RANDOM}"
 
-echo "加入 tailnet：节点名 ${hostname}，tag ${tag}，ephemeral"
+echo "加入 tailnet：节点名 ${hostname}，tag ${tag}，auth key 为 ephemeral"
+# 注意：ephemeral 是 auth key 的属性（tailscale authkey --ephemeral），`tailscale up` 没有该参数；
+# 设计文档里写的 --ephemeral 在 CLI 上会以未知参数直接失败，这里按实际 CLI 去掉。
 if ! ts_timeout 30 up \
     --auth-key="file:$keyfile" \
     --hostname="$hostname" \
     --advertise-tags="$tag" \
-    --ephemeral \
     --ssh=false \
     --accept-routes=false \
     --accept-dns=false \
