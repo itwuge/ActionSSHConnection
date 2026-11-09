@@ -2,12 +2,15 @@
 # =========** 文件头 =========**
 # 文件        : rotate-relay-key.sh
 # 所属目录    : deploy/
-# 文件用途    : 轮换中转端 uptermd 的服务身份密钥, 产出可写入仓库变量 UPTERM_RELAY_KNOWN_HOST 的主机公钥行, 并支持回滚
+# 文件用途    : 轮换中转端 uptermd 的反连注册标识, 即服务身份密钥; 产出可写入仓库变量 UPTERM_RELAY_KNOWN_HOST 的主机公钥行, 并支持回滚
 # 架构定位    : 运维密钥生命周期层; 上游是运维人员手工执行, 下游是 uptermd 服务与仓库变量
 # 核心功能    : 活动会话检查, 新密钥生成与校验, 旧密钥归档, 原子替换, 服务重启与就绪核对, 失败自动回滚, 公钥行与指纹输出
-# 职责边界    : 不改白名单, 不改防火墙, 不推送仓库变量; 只处理服务身份密钥本身
+# 职责边界    : 不登记任何宿主或访客公钥, 不改白名单文件, 不改防火墙, 不推送仓库变量; 只处理服务身份密钥本身
 # 运行环境    : Ubuntu 20.04 及以上, bash 5.x, 以 root 执行, uptermd 由 systemd 托管
 # 依赖关系    : 依赖 ssh-keygen, systemctl, curl, jq, install, awk, id; 由 deploy/README.md 的轮换章节调用
+#
+# 说明        : 该密钥只用于中转服务身份与 known_hosts 防中间人; 中转不校验访客公钥, 门禁默认关闭,
+#               因此轮换它不会改变任何准入范围, 只会改变用户侧 known_hosts 需要匹配的公钥行.
 #
 # 输入        : 均可由同名环境变量预置, 命令行参数优先
 #               RK_STATE_DIR     密钥目录, 默认 /var/lib/uptermd
@@ -68,6 +71,8 @@ show_usage() {
     # 返回: 无; 退出码: 0
     cat <<'USAGE'
 用法: rotate-relay-key.sh [选项]
+
+反连注册标识轮换: 替换中转服务身份密钥, 并输出新的 known_hosts 公钥行.
 
 选项:
   --host <name>          对外域名或地址, 用于生成公钥行
@@ -200,7 +205,7 @@ _new_key() {
     # 参数: $1 临时目录
     # 返回: 无; 退出码: 0 或 5
     local dir="$1" path="${dir}/${KEY_NAME}" fp
-    ssh-keygen -q -t ed25519 -N '' -C "uptermd-relay-${TS}" -f "$path" \
+    ssh-keygen -q -t ed25519 -N '' -C "uptermd-registration-${TS}" -f "$path" \
         || _die 5 "rotate.keygen.failed" "生成新密钥失败"
     if ! fp="$(ssh-keygen -lf "${path}.pub" | awk '{print $2}')"; then
         _die 5 "rotate.keygen.invalid" "新公钥无法解析"
@@ -382,6 +387,6 @@ if ! _restart_and_wait; then
 fi
 
 _print_known_hosts "${STATE_DIR}/${KEY_NAME}.pub"
-_say "轮换完成; 请把上面的公钥行写入仓库变量后, 再更新本机与各 runner 的 known_hosts"
+_say "轮换完成; 该公钥行只用于 known_hosts 防中间人, 不改变任何准入范围; 写入仓库变量后同步更新本机与各 runner 的 known_hosts"
 _say "旧密钥归档: ${archive_base}"
-_log INFO "rotate.run.finished" "轮换完成" "{\"archive\":$(jq -Rn --arg v "$archive_base" '$v')}"
+_log INFO "rotate.run.finished" "反连注册标识轮换完成" "{\"archive\":$(jq -Rn --arg v "$archive_base" '$v')}"
