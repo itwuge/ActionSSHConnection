@@ -32,6 +32,10 @@
 | `rotate-relay-key.sh` | 反连注册标识轮换（服务身份密钥），输出 known_hosts 公钥行，支持回滚 |
 | `check-relay-health.sh` | 只读健康检查，输出单行 JSON，判据为监听齐备、路由为空、无会话文件、资源上限生效；journald 容量仅提示 |
 | `nginx/ssh.wuge.fun.conf` | 网页终端子域入口的 nginx 站点片段，仅落仓库不自动部署；文件头写明部署与回滚步骤 |
+| `actssh-web-bridge.service` | 网页桥接进程的 systemd 单元：非 root、整机只读、无写路径、内存/CPU/任务数上限 |
+| `nginx/web-bridge-location.conf` | `/ws/` 与 `/runner/` 两个 location 片段，含 Upgrade 头、禁缓冲、长连接超时；仅落仓库不自动部署 |
+| `../scripts/bridge/relay_bridge.py` | 桥接服务实现（无状态配对与字节转发），由上面的单元拉起 |
+| `../scripts/start_web_bridge.py` | runner 侧桥接客户端，反连 `/runner/<session_id>` 并把字节流转给 `web_admission.py` |
 | `README.md` | 本文件 |
 
 ## 3. 中转与打洞的关系
@@ -207,3 +211,130 @@ sudo deploy/rotate-relay-key.sh --apply
 补充实测条件：Ubuntu 22.04.5 的 `journalctl --disk-usage` 在部署前为 416.1M，写入 `SystemMaxUse=200M` 并重启 journald 后不会立即压到上限，需按第 9 节执行一次 `journalctl --vacuum-size`；本机压到 144.0M 后健康检查通过。同日做了同机端到端会话（upterm host + ssh 访客）：建会话、访客执行命令、回收均成功；访客在共享 shell 内 `exit` 会结束宿主命令并立即回收会话（2026-11-09 生产机复测：`session wait` 0.040s 返回，指标 0.053s 归零；走 exec 通道执行单条命令不影响会话，需显式 stop）。全程 `/run/uptermd` 与 `/var/lib/uptermd` 无新增文件，监听端口不变，停后 `sessions_active_count` 归零。另：中继只接受 publickey 认证，runner 未设闸门时访客也必须提供任意一把私钥，无密钥连接被拒（exit 255，`Permission denied`）。2026-11-09 阿里云成都 ECS（Ubuntu 20.04.6，2 vCPU/2 GiB/40 GiB）以 `--ssh-addr 0.0.0.0:2222` 部署，系统 sshd 保持 22 未改，22 上的连接未中断。闸门与时延实测：中继白名单只拦宿主注册，清单外宿主 exit 1（`Permission denied`），清单内 exit 0；中继白名单外的访客仍可登录，runner 侧清单外访客 exit 255（`Permission denied`）。访客 `exit` 后会话立即结束：从访客 ssh 返回计，`upterm session wait` 0.160s 返回（exit 0），10ms 粒度下活动会话指标 0.045s 归零；原连接串立即重连失败（exit 255，`Permission denied`）。
 
 journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、Nuxt 与其它服务，部署时写入的全局 `SystemMaxUse=200M` 会改变同机所有服务的日志保留，已删除 `/etc/systemd/journald.conf.d/90-uptermd-limits.conf` 并重启 `systemd-journald`，既有 1.4G 历史日志保留未动。安装脚本相应改为默认不写 journald 片段（需显式 `--journald-max`），健康检查把 `journal_cap` 降为提示项、`advisory:true`、不参与 `ok` 判定。
+
+## 12. 网页桥接（中继侧无状态配对 + runner 第二条反连 WS）
+
+背景见 `.team/records/设计更正-网页桥接落点-20261109.md`。本轮只落本地代码与部署资产，未在真机部署，第 12.8 节全部待确认。
+
+### 12.1 模块划分
+
+| 模块 | 路径 | 职责 |
+|---|---|---|
+| 中继桥接服务 | `scripts/bridge/relay_bridge.py` | 两条 WS 端点、内存配对、二进制原样转发；不解析业务帧、不验签、不落盘 |
+| 共用日志器 | `scripts/bridge/jsonl_logger.py` | 单行 JSON；基础字段 ts/level/logger/event/msg/run_id，异常附三字段；只写 journal 或 stderr |
+| runner 桥接客户端 | `scripts/start_web_bridge.py` | 主动出站 `/runner/<session_id>`，把字节流接到准入子进程 stdin/stdout，按阶段非零退出 |
+| 依赖锁 | `scripts/requirements-web-bridge.txt` | `websockets==10.4` |
+| 单元文件 | `deploy/actssh-web-bridge.service` | 非 root、整机只读、无写路径、`MemoryMax=128M` / `CPUQuota=50%` / `TasksMax=64` |
+| nginx 片段 | `deploy/nginx/web-bridge-location.conf` | `/ws/` 与 `/runner/`，Upgrade 头、禁缓冲、3600s 读写超时；只落仓库不自动部署 |
+| 自测 | `scripts/bridge/test_relay_bridge.py`、`scripts/test_start_web_bridge.py` | 配对、透传、拒绝、清理、1 MiB 边界、退出码与五字段 |
+
+桥接服务放在 `scripts/bridge/`：设计更正 5.2 明确指定该路径，且它与 `scripts/web_admission.py` 同属 runner/中继共用的 Python 交付面；`deploy/` 只放进程托管与反代资产，与现有 `uptermd.service`、`nginx/` 的口径一致。
+
+### 12.2 关键契约
+
+| 项目 | 契约 |
+|---|---|
+| 端点 | `GET /ws/<session_id>`（浏览器）、`GET /runner/<session_id>`（runner 反连）；路径只带 `session_id` |
+| 配对 | 内存字典 `session_id -> runner_ws`；runner 先注册，浏览器后接入；浏览器到达到无 runner 时以 `UNKNOWN_SESSION` 关闭 |
+| 转发 | 只接受二进制帧，原样双向转发；runner 的帧广播给该会话最多 2 个浏览器，浏览器的帧直发 runner |
+| 上限 | 单帧 1 MiB（超出由 WS 层以 1009 关闭）；每会话浏览器最多 2；无写入磁盘路径 |
+| 关闭令牌 | `ROUTE_CONFLICT`（重复 runner 或第三路浏览器，1008）、`ROUTE_GONE`（runner 断开，1001）、`UNKNOWN_SESSION`（会话不存在，1008）；文本帧以 1003 `PROTOCOL_TEXT_FRAME` 关闭 |
+| 会话结束 | runner 断开即删映射并关闭该会话全部浏览器；旧 `session_id` 无路由；进程重启即清空全部配对，不恢复不重放 |
+| 日志 | 只记连接元数据（`session_id`、对端地址、字节数、关闭码/令牌）；不记帧内容、不记凭据；`session_id` 属路由信息可原样记录 |
+| runner 客户端 | `start_web_bridge <session_id> <bridge_ws_base> <admission_cmd>`；stdout 恰好一行五字段 JSON；日志写 stderr；`web_admission.py` 命令行契约不变 |
+| 退出码 | 0 正常结束；1 连不上、被拒（`ROUTE_CONFLICT`/`ROUTE_GONE`/`UNKNOWN_SESSION`）；2 参数错误、准入子进程启动失败或非零退出、转发异常 |
+
+依赖锁定 `websockets==10.4`：`requires-python >=3.7`，Ubuntu 20.04 的 Python 3.8 可直接安装；纯 Python 无编译依赖；同时提供 `websockets.serve()` 与 `websockets.connect()` 两套稳定接口，满足中继与 runner 两侧，不引入更重的框架。
+
+### 12.3 部署顺序与前提
+
+前提：中继已按第 6 节部署 uptermd（SSH 入口可用）；nginx 仍是现有 `certbot-nginx` 容器；不得改 443 上其它站点，也不得改 `nginx/ssh.wuge.fun.conf`。
+
+1. 建专用用户与目录（非 root，无 home 写权限）：
+   ```bash
+   sudo useradd --system --no-create-home --shell /usr/sbin/nologin actssh-bridge
+   sudo install -d -m 0750 -o root -g actssh-bridge /opt/actssh-web-bridge
+   sudo install -m 0640 -o root -g actssh-bridge scripts/bridge/relay_bridge.py scripts/bridge/jsonl_logger.py /opt/actssh-web-bridge/
+   sudo python3 -m venv /opt/actssh-web-bridge/venv
+   sudo /opt/actssh-web-bridge/venv/bin/pip install -r scripts/requirements-web-bridge.txt
+   ```
+2. 写参数文件（唯一参数来源，单元不写死端口）：
+   ```bash
+   sudo install -d -m 0750 /etc/actssh
+   printf 'BRIDGE_LISTEN_HOST=172.17.0.1\nBRIDGE_LISTEN_PORT=8081\n' | sudo tee /etc/actssh/bridge.env
+   sudo chown root:actssh-bridge /etc/actssh/bridge.env && sudo chmod 0640 /etc/actssh/bridge.env
+   ```
+   nginx 在容器内时必须用 `172.17.0.1`（容器内 `127.0.0.1` 指容器自身）；同网络命名空间时才用 `127.0.0.1`。禁止 `0.0.0.0`，进程会拒绝启动。
+3. 安装并启动单元：
+   ```bash
+   sudo install -m 0644 deploy/actssh-web-bridge.service /etc/systemd/system/
+   sudo systemctl daemon-reload && sudo systemctl enable --now actssh-web-bridge.service
+   sudo systemctl status actssh-web-bridge.service
+   ```
+4. 只 include nginx 片段，不改主配置：
+   ```bash
+   sudo install -m 0644 deploy/nginx/web-bridge-location.conf /root/certbot-nginx/nginx/conf/conf.d/web-bridge-location.conf
+   # 在 wuge.fun 的 443 server 块内加一行：include /etc/nginx/conf.d/web-bridge-location.conf;
+   docker exec nginx nginx -t && docker exec nginx nginx -s reload
+   ```
+5. 在 runner 侧并行启动桥接客户端（不改 SSH 反连）：
+   ```bash
+   python3 scripts/start_web_bridge.py "$SESSION_ID" "wss://wuge.fun/runner" \
+     "python3 scripts/web_admission.py --session-id $SESSION_ID --tmux-session actssh --allowed-credentials <清单路径>"
+   ```
+
+部署顺序固定为「桥接进程 → nginx location → runner 客户端」：先有监听再放流量，避免 nginx 返回 502 混淆排障。
+
+### 12.4 工作流接入点与失败阶段名
+
+接入点：runner 建好 tmux 会话并打印九项路由信息之后、等待会话结束之前，把 `start_web_bridge` 作为与 SSH 反连**并行**的后台进程启动；两入口共用同一 `session_id` 与同一 tmux 会话。本轮不改 `.github/workflows/session.yml`，接入由后续 P08 落地。
+
+失败阶段名（`data.stage` 与日志 event 一致）：
+
+| stage | 触发 | 退出码 / error_code |
+|---|---|---|
+| `precheck` | 会话标识非法、基地址非 ws/wss、带凭据或查询串、准入命令为空或引号不匹配、参数缺失 | 2 / `SESSION_ID_INVALID`、`BRIDGE_URL_INVALID`、`ADMISSION_CMD_INVALID`、`ARGUMENT_INVALID` |
+| `connect` | 反连不可达、握手失败、超时 | 1 / `BRIDGE_CONNECT_FAILED` |
+| `register-rejected` | 桥接以 `ROUTE_CONFLICT` 关闭 | 1 / `ROUTE_CONFLICT` |
+| `bridge` | 会话已结束（`ROUTE_GONE`）、未知会话（`UNKNOWN_SESSION`）、连接被关闭、文本帧、转发异常 | 1 或 2 / 对应令牌或 `BRIDGE_CLOSED`、`PROTOCOL_TEXT_FRAME`、`BRIDGE_TRANSFER_FAILED` |
+| `admission-start` | 准入子进程无法启动 | 2 / `ADMISSION_SPAWN_FAILED` |
+| `admission-exit` | 准入子进程退出 | 0（正常）/ `ADMISSION_EXITED` 且退出码 2（非零） |
+
+任何失败都显式非零退出并在 stdout 的 `ok:false` 中体现，不静默降级为「仅 SSH 入口可用」而不留痕迹；调用方按非零退出记录失败，不能当作成功。
+
+### 12.5 自测命令与结果
+
+```bash
+python3 -m venv .venv-bridge
+.venv-bridge/bin/pip install -r scripts/requirements-web-bridge.txt
+.venv-bridge/bin/python scripts/bridge/test_relay_bridge.py
+.venv-bridge/bin/python scripts/test_start_web_bridge.py
+```
+
+2026-11-09 本机（Windows + Python 3.12，`websockets==10.4`）结果：
+
+- `test_relay_bridge.py`：11 项通过——未知会话、非法路径、配对双向透传、重复 runner 拒绝且首个仍有效、第三路浏览器拒绝、双浏览器广播、runner 断开清理并回 `ROUTE_GONE`、重启清空映射、1 MiB 恰好通过、1 MiB+1 以 1009 拒绝、双向文本帧以 1003 拒绝；并断言日志不含发送的负载标记。
+- `test_start_web_bridge.py`：12 项通过——地址拼接与非法基地址、会话标识校验、缺参/非法参数五字段输出与退出码 2、连接拒绝退出码 1、端到端字节回环（浏览器→桥接→客户端→假准入→回程）、`ROUTE_CONFLICT` 映射 `register-rejected`、准入启动失败与准入非零退出均退出码 2。
+
+未覆盖：真机 wss、nginx Upgrade、Actions 网络策略、真实 WebAuthn，见 12.8。
+
+### 12.6 回滚
+
+1. `sudo systemctl disable --now actssh-web-bridge.service`。
+2. 从 `wuge.fun` 的 443 server 块删除 include 行（或删除 `web-bridge-location.conf`），`docker exec nginx nginx -t && docker exec nginx nginx -s reload`。
+3. 保留 `scripts/web_admission.py` 与前端代码；桥接不落盘，无需清理用户数据。
+4. 回滚后 SSH 入口仍按第 7 节判据可用；网页入口不可用属预期，不得写成已具备。
+
+### 12.7 本机未验证事项（真机必须逐项确认）
+
+| 序号 | 待确认项 | 判定方式 |
+|---|---|---|
+| 1 | nginx（certbot 容器）能对 `/ws/` 与 `/runner/` 完成 Upgrade 并长时间保持 | 浏览器与 runner 各连一次，观察 101、空闲 30 分钟不断流 |
+| 2 | runner 出站 `wss://wuge.fun/runner/<session_id>` 可达且不被 Actions 网络策略阻断 | runner 上跑最小客户端连一次并回显 |
+| 3 | Ubuntu 20.04 的 Python 3.8 可安装 `websockets==10.4` | `pip install` 记录版本号与离线包校验 |
+| 4 | 桥接在 2 vCPU / 2 GiB 下资源可接受 | 两路终端字节流压测，记录 RSS、CPU、连接数 |
+| 5 | 会话结束后旧 `session_id` 被拒，新会话不串入旧标识 | 结束会话后重连；再起新会话用旧标识重试 |
+| 6 | 桥接重启后无配对、无文件、无审计痕迹 | 重启前后 `ss`、文件清单与 `active_routes` 对比 |
+| 7 | 同会话第二个 runner 注册被拒、不静默顶替 | 两路 runner 客户端同时注册，观察 1008 `ROUTE_CONFLICT` |
+| 8 | 单元沙箱与真机内核兼容 | 重点看 `ProtectSystem=strict`、`SystemCallFilter=@system-service`、`IPAddressDeny=any` 是否导致启动失败；docker0 网段不是 172.17.0.0/16 时须改 `IPAddressAllow` |
+| 9 | WebAuthn 的 RP ID / origin 与 `https://wuge.fun` 一致 | 真实域名下完成一次注册与一次断言 |

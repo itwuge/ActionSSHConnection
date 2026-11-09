@@ -1,0 +1,84 @@
+# =========** 文件头 =========**
+# 文件        : actssh-web-bridge.service
+# 所属目录    : deploy/
+# 文件用途    : 以 systemd 常驻方式运行网页桥接进程 relay_bridge.py, 按 session_id 配对浏览器 WS 与 runner 反连 WS
+# 架构定位    : 中继端进程托管层; 上游是 /etc/actssh/bridge.env, 下游是 /opt/actssh-web-bridge/relay_bridge.py
+# 核心功能    : 非 root 运行, 整机只读沙箱, 不落盘, 施加内存/CPU/任务数上限, 崩溃自动重启
+# 职责边界    : 不安装依赖, 不生成配置, 不改 nginx, 不做 TLS 终止, 不解析业务帧, 不持任何凭据
+# 运行环境    : Ubuntu 20.04 (systemd 245) 及以上; Python 3.8; websockets==10.4
+# 依赖关系    : 依赖 /etc/actssh/bridge.env 与 /opt/actssh-web-bridge/{relay_bridge.py,jsonl_logger.py,venv}
+#
+# 部署前提（详见 README 第 12 节）
+#   1. 专用系统用户: useradd --system --no-create-home --shell /usr/sbin/nologin actssh-bridge
+#   2. 代码与依赖: /opt/actssh-web-bridge/ 下放 relay_bridge.py 与 jsonl_logger.py,
+#      并用该目录内 venv 安装 scripts/requirements-web-bridge.txt
+#   3. 参数文件 /etc/actssh/bridge.env（本单元不写死端口, 环境文件是唯一参数来源）:
+#        BRIDGE_LISTEN_HOST=127.0.0.1     # 或 172.17.0.1, 取决于 nginx 是否在容器内
+#        BRIDGE_LISTEN_PORT=8081
+#   4. 不要把 --host 写成 0.0.0.0: 进程自身会拒绝通配地址, 只允许回环或 docker 网桥.
+#
+# 回滚
+#   systemctl disable --now actssh-web-bridge.service
+#   删除 nginx /ws/ 与 /runner/ 片段后 reload; SSH 入口不受影响.
+
+[Unit]
+Description=ActSSH web bridge (stateless WS pairing and byte forwarding)
+Documentation=file:///opt/actssh-web-bridge/README.txt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=actssh-bridge
+Group=actssh-bridge
+
+# 环境文件是唯一参数来源; 不加 "-" 前缀, 文件缺失时启动直接失败, 避免裸跑默认值.
+EnvironmentFile=/etc/actssh/bridge.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/actssh-web-bridge/venv/bin/python /opt/actssh-web-bridge/relay_bridge.py --host ${BRIDGE_LISTEN_HOST} --port ${BRIDGE_LISTEN_PORT}
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+KillSignal=SIGTERM
+
+# 资源上限按设计更正 5.2: 2 vCPU / 2 GiB 中继机上留出余量, 只做异步字节转发.
+MemoryMax=128M
+CPUQuota=50%
+TasksMax=64
+LimitNOFILE=4096
+
+# 最小权限: 整机只读, 无任何可写路径, 桥接不落盘.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+# 只允许回环与 docker 网桥通信; 若该机 docker0 不是 172.17.0.0/16
+# 或内核未启用 cgroup BPF, 单元会启动失败, 需改网段或注释下面两行.
+IPAddressDeny=any
+IPAddressAllow=localhost 172.17.0.0/16
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=actssh-web-bridge
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+# 网页桥接运行时依赖锁（中继桥接服务与 runner 侧客户端共用）
+# 目标环境：Ubuntu 20.04 / Python 3.8
+#
+# 为什么锁 websockets==10.4
+#   1. 10.4 的 requires-python 是 >=3.7，Ubuntu 20.04 自带的 Python 3.8 可直接安装；
+#      更高版本逐步提高 Python 下限并更换内部实现层，真机未验证前不做版本漂移。
+#   2. 纯 Python，无编译扩展，离线安装只需一个 wheel，不需要 gcc 与系统头文件。
+#   3. 同时提供本方案需要的两套旧式稳定接口：服务端 websockets.serve() 与客户端 websockets.connect()，
+#      并且支持 max_size / max_queue / ping_interval / open_timeout，够用且无需额外库。
+#   4. 桥接只做字节转发，不引入 aiohttp / uvicorn 等更重的框架，运行时依赖保持单包。
+websockets==10.4
