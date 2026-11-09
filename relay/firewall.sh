@@ -313,11 +313,31 @@ _ufw_cmd() {
     fi
 }
 
+_record_ufw_prev() {
+    # 用途: 首次落地 ufw 前记录其原有启用状态, 供卸载时还原
+    # 参数: 无
+    # 返回: 无; 退出码: 0
+    local marker="${STORAGE_DIR}/ufw-prev-state"
+    (( APPLY == 1 )) || return 0
+    if [[ -f "$marker" ]]; then
+        return 0
+    fi
+    mkdir -p "$STORAGE_DIR"
+    if [[ -r /etc/ufw/ufw.conf ]] && grep -qiE '^ENABLED=(yes|true|1)' /etc/ufw/ufw.conf; then
+        printf 'active\n' >"$marker"
+    elif [[ ! -r /etc/ufw/ufw.conf ]] && ufw status 2>/dev/null | grep -qiE 'Status: active|激活'; then
+        printf 'active\n' >"$marker"
+    else
+        printf 'inactive\n' >"$marker"
+    fi
+}
+
 _apply_ufw() {
     # 用途: 按顺序落 ufw 规则; 先放行管理面再启用默认拒绝
     # 参数: 无
     # 返回: 无; 退出码: 0 或 5
     local cidr rule
+    _record_ufw_prev
     _say "--- ufw 规则 (apply=${APPLY}) ---"
     _ufw_cmd default deny incoming
     _ufw_cmd default allow outgoing

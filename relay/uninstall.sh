@@ -40,10 +40,13 @@ source "${SCRIPT_DIR}/bootstrap/lib.sh"
 #   _remove_configs -> 0/6: 删除配置与程序
 #   _remove_firewall -> 0/6: 回收本方案的防火墙规则
 #   _purge_data -> 0/6: 删除数据目录与证书
+#   _remove_user -> 0: 彻底卸载时删除 upterm 系统用户与组
 #   _summary -> 0: 输出删除清单
 
 # =========** 常量与默认值 =========**
 DOMAIN="${ACTSSH_DOMAIN:-}"
+SSH_DOMAIN="${ACTSSH_SSH_DOMAIN:-}"
+NGINX_MODE="${ACTSSH_NGINX_MODE:-dedicated}"
 STATE_DIR="${ACTSSH_STATE_DIR:-/var/lib/actssh-bootstrap}"
 RELAY_PORT="${ACTSSH_RELAY_SSH_PORT:-2222}"
 ADMIN_SSH_PORT="${ACTSSH_ADMIN_SSH_PORT:-22}"
@@ -77,7 +80,12 @@ CONFIG_PATHS=(
 DATA_PATHS=(
     /var/lib/uptermd
     /etc/uptermd
-    /var/www/actssh-acme
+    /var/www/actssh/acme
+    /var/www/actssh/html
+    /var/log/actssh
+    /var/log/actssh-bootstrap
+    /var/log/uptermd-relay
+    /run/uptermd
     "${STATE_DIR}"
 )
 
@@ -97,8 +105,10 @@ show_usage() {
 
 默认演练, --apply 才实际删除.
   --domain <fqdn>      一并清理该域名的证书与续期配置
+  --ssh-domain <fqdn>  一并清理 ssh 入口域名的证书与续期配置
+  --nginx-mode <mode>  与安装时一致; host 时额外删除 /etc/nginx/conf.d 下本方案文件
   --keep-data          保留数据, 默认
-  --purge-data         删除 /var/lib/uptermd, /etc/uptermd, /var/www/actssh-acme, 状态目录
+  --purge-data         删除 /var/lib/uptermd, /etc/uptermd, /var/www/actssh/acme, /var/www/actssh/html, 状态目录
   --remove-firewall    回收本方案写入的 ufw 规则与 nftables 规则文件
   --force-firewall     连当前 SSH 连接依赖的管理面放行规则也删; 远程执行会锁死, 仅限带外控制台
   --state-dir <dir>    状态目录, 默认 /var/lib/actssh-bootstrap
@@ -115,7 +125,10 @@ show_usage() {
   始终删除: 三个 systemd 单元及其文件, /etc/actssh, /etc/uptermd/uptermd-guard.nft,
             /etc/logrotate.d/actssh, /etc/cron.d/actssh-certbot, /usr/local/bin/uptermd,
             /opt/actssh-web-bridge
-  可选删除: --purge-data 追加 /var/lib/uptermd, /etc/uptermd, /var/www/actssh-acme, 状态目录与备份
+  可选删除: --purge-data 追加 /var/lib/uptermd, /etc/uptermd, /var/www/actssh/acme,
+            /var/www/actssh/html, /var/log/actssh, /var/log/actssh-bootstrap,
+            /var/log/uptermd-relay, /run/uptermd, 状态目录与备份,
+            upterm 与 actssh-bridge 系统用户、actssh-ops 组
   从不删除: apt 软件包, 系统 sshd 配置, 发行版 nginx 站点, 非本方案创建的目录
 USAGE
 }
@@ -127,6 +140,8 @@ _parse_args() {
     while (( $# > 0 )); do
         case "$1" in
             --domain) DOMAIN="${2:?缺少 --domain 取值}"; shift 2 ;;
+            --ssh-domain) SSH_DOMAIN="${2:?缺少 --ssh-domain 取值}"; shift 2 ;;
+            --nginx-mode) NGINX_MODE="${2:?缺少 --nginx-mode 取值}"; shift 2 ;;
             --keep-data) PURGE_DATA=0; shift ;;
             --purge-data) PURGE_DATA=1; shift ;;
             --remove-firewall) REMOVE_FIREWALL=1; shift ;;
@@ -286,10 +301,19 @@ _remove_firewall() {
         while IFS= read -r line; do
             num="$(sed -n 's/^\[ *\([0-9]\+\)\].*/\1/p' <<<"$line")"
             [[ -n "$num" ]] || continue
-            if [[ "$line" == *"# uptermd admin ssh"* && -n "$ssh_port" && "$line" == *"${ssh_port}/tcp"* && "$FORCE_FIREWALL" == "0" ]]; then
-                _say "保留管理面 SSH 放行规则 (${ssh_port}/tcp), 避免删除当前连接依赖的规则"
-                kept_admin=1
-                continue
+            if [[ "$line" == *"# uptermd admin ssh"* ]]; then
+                # 硬约束: 管理面 22/22022 的放行规则永不删除, 即使显式 --remove-firewall
+                local keep_admin=0 p
+                for p in "$ssh_port" "$ADMIN_SSH_PORT" 22 22022; do
+                    if [[ -n "$p" && "$line" == *"${p}/tcp"* ]]; then
+                        keep_admin=1
+                    fi
+                done
+                if (( keep_admin == 1 )); then
+                    _say "保留管理面 SSH 放行规则: ${line#*] }"
+                    kept_admin=1
+                    continue
+                fi
             fi
             nums+=("$num")
         done < <(ufw status numbered 2>/dev/null \
@@ -301,10 +325,8 @@ _remove_firewall() {
                 ufw --force delete "$n" >/dev/null 2>&1 || true
             done
         fi
-        # 兜底: 无注释或格式变化时按规格再删一次; 当前连接端口对应的管理面规则仍跳过
-        if [[ "$FORCE_FIREWALL" == "1" || -z "$ssh_port" || "$ADMIN_SSH_PORT" != "$ssh_port" ]]; then
-            ufw --force delete allow "$ADMIN_SSH_PORT/tcp" >/dev/null 2>&1 || true
-        fi
+        # 兜底: 无注释或格式变化时按规格再删一次; 管理面 22/22022 规则一律保留
+        _say "管理面 SSH 放行规则(22/22022)按硬约束保留, 不执行兜底删除"
         ufw --force delete allow "$RELAY_PORT/tcp" >/dev/null 2>&1 || true
         ufw --force delete allow "$HTTPS_PORT/tcp" >/dev/null 2>&1 || true
         ufw --force delete allow "$HTTP_PORT/tcp" >/dev/null 2>&1 || true
@@ -320,11 +342,62 @@ _remove_firewall() {
         sed -i '/# BEGIN uptermd-guard (managed by relay\/firewall.sh)/,+1d' "$nft_conf" 2>/dev/null || true
     fi
     _remove_path "$nft_ruleset" "nftables 规则文件"
+    # 安装前 ufw 是关闭状态时还原, 避免卸载后留下 default deny 改变主机暴露面
+    local ufw_marker="/etc/uptermd/ufw-prev-state"
+    if [[ -f "$ufw_marker" ]] && [[ "$(tr -d '\r\n' <"$ufw_marker")" == "inactive" ]]; then
+        if (( APPLY == 1 )) && command -v ufw >/dev/null 2>&1; then
+            ufw --force disable >/dev/null 2>&1 && _say "已还原: ufw 回到安装前的 inactive 状态"
+        else
+            _say "演练: 将执行 ufw --force disable (还原安装前状态)"
+        fi
+    fi
     if (( kept_admin == 1 )); then
         _say "已回收防火墙规则; 当前连接所用端口的放行规则按安全策略保留 (带外执行或 --force-firewall 可一并删除)"
     else
         _say "已回收防火墙规则"
     fi
+}
+
+_remove_user() {
+    # 用途: 彻底卸载时删除安装器创建的系统用户与组, 仍有进程占用时保留并告警
+    # 参数: 无
+    # 返回: 无; 退出码: 0
+    local user group
+    for user in upterm actssh-bridge; do
+        if ! getent passwd "$user" >/dev/null 2>&1; then
+            continue
+        fi
+        if (( APPLY == 0 )); then
+            _say "演练: 将删除系统用户与组 ${user}"
+            continue
+        fi
+        if pgrep -u "$user" >/dev/null 2>&1; then
+            _say "[WARN] 用户 ${user} 仍有进程在运行, 保留不删"
+            _log WARNING "uninstall.user.busy" "运行身份仍有进程" \
+                "{\"user\":$(jq -Rn --arg v "$user" '$v')}"
+            continue
+        fi
+        if userdel "$user" >/dev/null 2>&1; then
+            _say "已删除: 系统用户 ${user}"
+        else
+            _say "[WARN] 删除用户 ${user} 失败, 请人工检查"
+        fi
+        if getent group "$user" >/dev/null 2>&1; then
+            groupdel "$user" >/dev/null 2>&1 || true
+        fi
+    done
+    # actssh-ops 只读组由安装器创建, 无成员时一并回收
+    for group in actssh-ops; do
+        if ! getent group "$group" >/dev/null 2>&1; then
+            continue
+        fi
+        if (( APPLY == 0 )); then
+            _say "演练: 将删除系统组 ${group}"
+            continue
+        fi
+        groupdel "$group" >/dev/null 2>&1 && _say "已删除: 系统组 ${group}" \
+            || _say "[WARN] 删除组 ${group} 失败(可能仍有成员), 请人工检查"
+    done
 }
 
 _purge_data() {
@@ -351,7 +424,37 @@ _purge_data() {
     else
         _say "提示: 未给 --domain, 保留 /etc/letsencrypt 下证书; 需要时加 --domain 重跑"
     fi
+    if [[ -n "$SSH_DOMAIN" ]]; then
+        _remove_path "/etc/letsencrypt/live/${SSH_DOMAIN}" "证书"
+        _remove_path "/etc/letsencrypt/archive/${SSH_DOMAIN}" "证书归档"
+        _remove_path "/etc/letsencrypt/renewal/${SSH_DOMAIN}.conf" "续期配置"
+    fi
     _remove_path /etc/letsencrypt/renewal-hooks/deploy/actssh-nginx-reload "续期钩子"
+    # 父目录在子目录删除后若为空则回收, 非空说明有非本方案写入的内容, 保留
+    if (( APPLY == 1 )) && [[ -d /var/www/actssh ]]; then
+        rmdir /var/www/actssh >/dev/null 2>&1 && _say "已删除: /var/www/actssh (空目录)" || true
+    fi
+    _remove_user
+    if [[ "$NGINX_MODE" == "host" ]]; then
+        # host 接管: 只删本方案管理的 conf.d 文件, 不动宿主 nginx.conf 与其它站点
+        for path in /etc/nginx/conf.d/default.conf \
+                    /etc/nginx/conf.d/web-bridge-location.inc \
+                    /etc/nginx/conf.d/actssh-web-static.inc \
+                    /etc/nginx/conf.d/ssl.conf \
+                    /etc/nginx/conf.d/www.conf; do
+            _remove_path "$path" "宿主 nginx 站点配置"
+        done
+        if [[ -n "$SSH_DOMAIN" ]]; then
+            _remove_path "/etc/nginx/conf.d/${SSH_DOMAIN}.conf" "宿主 nginx 站点配置"
+        fi
+        if (( APPLY == 1 )) && command -v nginx >/dev/null 2>&1; then
+            if nginx -t >/dev/null 2>&1; then
+                systemctl reload nginx.service >/dev/null 2>&1 || true
+            else
+                _say "警告: 删除 conf.d 后宿主 nginx 配置校验未通过, 未自动重载; 请人工检查"
+            fi
+        fi
+    fi
 }
 
 _summary() {
