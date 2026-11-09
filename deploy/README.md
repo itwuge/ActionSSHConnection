@@ -64,7 +64,8 @@
 - 中转机可出网访问 GitHub Releases。
 - 中继监听端口空闲。默认设计是 relay 占用 22、系统 sshd 迁到 22022（见 6.1）；若不允许动 22（例如既有生产机），改用 `--ssh-addr 0.0.0.0:2222`，此时 2222 必须空闲且云安全组放行（见 6.1.1）。
 - 云安全组先放行管理面来源，再改主机防火墙；主机防火墙只做兜底。
-- WS 入口需要 TLS 终止层：`uptermd` 只监听环回 `127.0.0.1:8443` 的明文 WS，公网 `wss://` 由反向代理终止 TLS 后转发到该端口。反向代理选型与证书管理不在本目录脚本内，属真机实施项。
+- WS 入口需要 TLS 终止层：`uptermd` 只监听明文 WS（默认环回 `127.0.0.1:8443`），公网 `wss://` 由反向代理终止 TLS 后转发到该端口。反向代理选型与证书管理不在本目录脚本内，属真机实施项。
+- 反向代理若在容器内（例如本项目的 `certbot-nginx` 容器），容器无法访问宿主回环，`127.0.0.1:8443` 与 `172.17.0.1:8443` 都不通；此时必须让 uptermd 直接监听 docker0 网关，安装时用 `--ws-addr 172.17.0.1:8443`（2026-11-09 生产机实测：未改绑时 nginx 报 `connect() failed (111: Connection refused)` 并返回 502，改绑后 400 由 uptermd 应答）。该地址只在 docker 网桥内可达，不新增公网端口。
 
 ## 6. 部署步骤
 
@@ -143,7 +144,7 @@ stdout 恰好一行 JSON，字段为 `ok`、`message`、`error_code`、`data`、
 部署完成后按以下顺序验证：
 
 1. `systemctl is-active uptermd.service` 为 `active`。
-2. `ss -Hltn` 能看到配置的 SSH 监听端口（默认 22，例如 `2222`）、127.0.0.1:8443、127.0.0.1:9100。
+2. `ss -Hltn` 能看到配置的 SSH 监听端口（默认 22，例如 `2222`）、配置的 WS 监听地址（默认 `127.0.0.1:8443`；容器化反代场景为 `172.17.0.1:8443`）、127.0.0.1:9100。
 3. `curl -fsS http://127.0.0.1:9100/metrics` 可读，活动会话数为 0。v0.41.1 实际指标名是 `upterm_uptermd_sessions_active_count`（带 `upterm_uptermd_` 前缀），脚本按候选名依次识别。
 4. `systemctl show -p MemoryMax -p CPUQuotaPerSecUSec -p TasksMax uptermd.service` 与 `1G`、`150%`、`512` 对应。
 5. `/run/uptermd` 为空；`/var/lib/uptermd` 只有主机密钥与轮换归档。
@@ -169,7 +170,8 @@ sudo deploy/rotate-relay-key.sh --apply
 | 现象 | 排查 | 处置 |
 |---|---|---|
 | 22 端口冲突 | `ss -Hltn 'sport = :22'` | 先迁走系统 sshd，或改 `--ssh-addr`；不要两个进程抢同一端口 |
-| WS 入口不可用 | 查 8443 是否监听、TLS 终止层是否转发到 127.0.0.1:8443 | 修反向代理或证书；uptermd 本身不终止 TLS |
+| WS 入口不可用 | 查 8443 是否监听、TLS 终止层是否转发到配置的 WS 地址 | 修反向代理或证书；uptermd 本身不终止 TLS |
+| 反代返回 502 且 error.log 为 `connect() failed (111: Connection refused)` | 容器内访问宿主回环不可达 | 用 `--ws-addr 172.17.0.1:8443` 让 uptermd 监听 docker0 网关并重启 |
 | 健康检查报活动路由非 0 | 是否有真实会话未结束 | 等会话结束或重启服务；重启后映射必须为空 |
 | 健康检查报会话文件 | `find /run/uptermd /var/lib/uptermd` | 说明进程发生了预期外写盘，按退出码 10 处理并检查版本与单元沙箱 |
 | 指标不可达 | 查 9100 是否只绑环回、服务是否 active | 不要为了排障把 9100 暴露到公网 |
@@ -194,7 +196,7 @@ sudo deploy/rotate-relay-key.sh --apply
 1. ~~`User=upterm` 加 `AmbientCapabilities=CAP_NET_BIND_SERVICE` 能否在 Ubuntu 20.04 上稳定绑定 22。~~ 2026-11-09 在 Ubuntu 22.04.5（systemd 249）实测通过：服务以 `upterm` 身份监听 `0.0.0.0:22`；20.04 仍未验证。
 2. ~~`ProtectSystem=strict`、`ReadOnlyPaths`、`WorkingDirectory=/run/uptermd` 与 uptermd 实际写路径是否冲突；若冲突，禁落盘判据需调整。~~ 2026-11-09 实测未冲突：服务正常运行，`/var/lib/uptermd` 与 `/etc/uptermd` 无新增写入，`/run/uptermd` 保持为空。
 3. ~~不设置 `UPTERMD_AUTHORIZED_KEYS` 时，runner 反连注册是否确实无需服务器侧公钥登记；~~ 2026-11-09 实测通过：未设置时临时密钥可注册；设置单钥白名单后清单内注册成功、清单外失败（exit 1，`Permission denied`）。设置空文件时是否拒绝所有宿主注册仍未验证。
-4. WS 监听 8443 加 TLS 终止层的组合能否完成浏览器 `wss://` 连接；反向代理选型与证书轮换方式未定。
+4. ~~WS 监听 8443 加 TLS 终止层的组合能否完成浏览器 `wss://` 连接；反向代理选型与证书轮换方式未定。~~ 2026-11-09 生产机实测：`ssh.wuge.fun` 片段已部署，`https://ssh.wuge.fun` 证书链正常（Let's Encrypt YR2，SAN 仅 `ssh.wuge.fun`，到期 2027-02-07），非 WS 请求由 uptermd 返回 400；带 `Upterm-Client-Version` 与 Basic 认证头时 `wss://ssh.wuge.fun/ws/<session_id>` 与 `/` 均升级为 Open（约 0.2s），缺头返回 400。浏览器页面本身未验证。
 5. ~~指标名 `routing_active_connections_count` 在 v0.41.1 的实际输出格式与标签情况。~~ 2026-11-09 实测：v0.41.1 不存在该名字，实际为 `upterm_uptermd_sessions_active_count` 与 `upterm_uptermd_routing_authenticated_connections_count{kind=...}`；脚本已改为按候选名识别。
 6. ~~重启后 `/run/uptermd` 确实为空、`/var/lib/uptermd` 无新增会话文件。~~ 2026-11-09 实测通过：重启后 `/run/uptermd` 为空，`/var/lib/uptermd` 仅有 `server_key` 与 `server_key.pub`。
 7. ~~`systemctl show` 返回的 `MemoryMax`、`CPUQuotaPerSecUSec`、`TasksMax` 字面值与本脚本判定一致。~~ 2026-11-09 实测：实际字面值为 `1073741824`、`1.500000s`、`512`；脚本原判定只认 `1500000`/`1.5s`，已改为统一换算微秒后比较。
