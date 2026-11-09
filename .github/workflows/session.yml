@@ -338,6 +338,114 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: 启动网页桥接
+        id: bridge
+        timeout-minutes: 6
+        env:
+          SESSION_ID: ${{ steps.start.outputs.session_id }}
+          BRIDGE_BASE: ${{ vars.WEB_BRIDGE_BASE_URL }}
+          ALLOWED_JSON: ${{ vars.WEBAUTHN_ALLOWED_CREDENTIALS }}
+          CREDENTIAL_ID: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
+        run: |
+          set -euo pipefail
+
+          # 网页通道与 SSH 反连并行：桥接起不来时只记录失败并标注，不中断本步骤，SSH 通道保持可用。
+          # 失败阶段名固定三档：bridge-connect / bridge-register / bridge-admission。
+          unavailable() {
+            echo "失败[阶段 $1]：$2；网页通道不可用，SSH 通道不受影响" >&2
+            echo "::warning::网页通道不可用（$1）：$2；SSH 通道不受影响"
+            exit 0
+          }
+
+          [ -n "${SESSION_ID:-}" ] || unavailable bridge-connect "未取得会话标识"
+
+          # 基地址缺省 wss://wuge.fun；只接受站点根或已带 /runner 的终点，路径规则与中继 /runner/<id> 一致
+          base="${BRIDGE_BASE:-wss://wuge.fun}"
+          base="${base%/}"
+          case "$base" in
+            ws://*/*|wss://*/*)
+              case "$base" in
+                */runner) bridge_base="$base" ;;
+                *) unavailable bridge-connect "WEB_BRIDGE_BASE_URL 只允许 /runner 路径" ;;
+              esac
+              ;;
+            ws://?*|wss://?*) bridge_base="${base}/runner" ;;
+            *) unavailable bridge-connect "WEB_BRIDGE_BASE_URL 只接受 ws:// 或 wss:// 地址" ;;
+          esac
+
+          # 准入允许清单：只放公开的凭据标识与公钥，作业内生成、随作业销毁
+          [ -n "${ALLOWED_JSON:-}" ] || unavailable bridge-admission "未配置 WEBAUTHN_ALLOWED_CREDENTIALS，准入无允许清单可用"
+          printf '%s' "$ALLOWED_JSON" > "$WORKDIR/webauthn-allowed.json"
+          if ! python3 - "$WORKDIR/webauthn-allowed.json" <<'PY'
+          import json, sys
+          raw = json.load(open(sys.argv[1], encoding="utf-8"))
+          if not isinstance(raw, list) or not raw:
+              raise SystemExit("允许清单必须是非空数组")
+          for item in raw:
+              if not isinstance(item, dict) or not item.get("credential_id") or not item.get("public_key"):
+                  raise SystemExit("允许清单条目缺少 credential_id 或 public_key")
+          print(f"允许清单条目数 {len(raw)}")
+          PY
+          then
+            unavailable bridge-admission "WEBAUTHN_ALLOWED_CREDENTIALS 不是合法非空 JSON 数组"
+          fi
+
+          # 依赖装在 RUNNER_TEMP 虚拟环境里，避免宿主 Python 的 externally-managed 限制，也不占用制品目录
+          venv="${RUNNER_TEMP}/actssh-web-bridge-venv"
+          rm -rf "$venv"
+          if ! python3 -m venv "$venv" >/dev/null 2>&1; then
+            unavailable bridge-connect "无法创建 Python 虚拟环境"
+          fi
+          if ! "$venv/bin/pip" install --quiet --disable-pip-version-check -r scripts/requirements-web-bridge.txt; then
+            unavailable bridge-connect "网页桥接依赖安装失败（websockets==10.4）"
+          fi
+
+          # 准入命令走同一虚拟环境；凭据标识为空时开放注册引导，由浏览器首次注册生成
+          admission="$venv/bin/python scripts/web_admission.py --session-id $SESSION_ID --tmux-session $SESSION_NAME --allowed-credentials $WORKDIR/webauthn-allowed.json"
+          if [ -z "${CREDENTIAL_ID:-}" ]; then
+            admission="$admission --allow-registration"
+          fi
+
+          # 后台反连，不阻塞随后的会话等待；标准输出与 JSONL 日志只落文件
+          nohup "$venv/bin/python" scripts/start_web_bridge.py \
+            "$SESSION_ID" "$bridge_base" "$admission" \
+            --run-id "${GITHUB_RUN_ID:-}" \
+            > "$WORKDIR/bridge.out" 2> "$WORKDIR/bridge.err" &
+          bridge_pid=$!
+          echo "$bridge_pid" > "$WORKDIR/bridge.pid"
+
+          bridge_host="${bridge_base#*://}"
+          bridge_host="${bridge_host%%/*}"
+          for _ in $(seq 1 20); do
+            if ! kill -0 "$bridge_pid" 2>/dev/null; then
+              set +e
+              wait "$bridge_pid"
+              rc=$?
+              set -e
+              stage="$(jq -r '.data.stage // empty' "$WORKDIR/bridge.out" 2>/dev/null || true)"
+              error_code="$(jq -r '.error_code // empty' "$WORKDIR/bridge.out" 2>/dev/null || true)"
+              message="$(jq -r '.message // empty' "$WORKDIR/bridge.out" 2>/dev/null || true)"
+              if [ "$rc" -eq 0 ]; then
+                echo "网页通道已结束（桥接进程正常退出，阶段 ${stage:-unknown}）"
+                exit 0
+              fi
+              case "${stage:-}" in
+                register-rejected) stage_name=bridge-register ;;
+                admission-start|admission-exit) stage_name=bridge-admission ;;
+                *) stage_name=bridge-connect ;;
+              esac
+              unavailable "$stage_name" "桥接进程退出码 ${rc}，阶段 ${stage:-unknown}，error_code ${error_code:-none}，${message:-无输出}"
+            fi
+            if grep -q '"event":"bridge.connected"' "$WORKDIR/bridge.err" 2>/dev/null &&
+               grep -q '"event":"admission.started"' "$WORKDIR/bridge.err" 2>/dev/null; then
+              echo "网页通道已就绪：runner 已反连 ${bridge_host}/runner/${SESSION_ID}，等待浏览器注册与准入"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::warning::网页通道状态待确认：20 秒内未观测到 connected/admission.started 事件"
+          echo "网页通道已启动但未确认：桥接进程 ${bridge_pid} 仍在运行"
+
       - name: 等待会话结束
         timeout-minutes: 35
         run: |
@@ -380,6 +488,13 @@ jobs:
           # session stop 在会话已结束时不算错误（源码：已结束会报出结局并以 0 退出），无此会话为 4
           upterm session stop "$SESSION_NAME" >/dev/null 2>&1 || true
           pkill -f "upterm host" >/dev/null 2>&1 || true
+          # 网页桥接与准入子进程一并清理，不遗留反连
+          if [ -n "${WORKDIR:-}" ] && [ -f "$WORKDIR/bridge.pid" ]; then
+            kill "$(cat "$WORKDIR/bridge.pid")" >/dev/null 2>&1 || true
+          fi
+          pkill -f "scripts/start_web_bridge.py" >/dev/null 2>&1 || true
+          pkill -f "scripts/web_admission.py" >/dev/null 2>&1 || true
+          rm -rf "${RUNNER_TEMP:-/tmp}/actssh-web-bridge-venv"
           tmux kill-session -t actssh >/dev/null 2>&1 || true
           rm -rf "$WORKDIR"
-          echo "会话进程与临时文件已清理"
+          echo "会话进程、网页桥接与临时文件已清理"
