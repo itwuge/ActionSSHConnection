@@ -18,7 +18,7 @@ jobs:
         with:
           ssh: true
           direct-mode: tailscale
-          tailscale-auth-key: "tskey-auth-kInvalidKeyForFallbackTest-0000000000000000"
+          tailscale-auth-key: ${{ secrets.TMP_TS_INVALID }}
           direct-ssh-port: "2222"
           session-minutes: "5"
           idle-minutes: "1"
