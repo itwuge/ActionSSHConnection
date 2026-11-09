@@ -1,228 +1,189 @@
-# 中转端部署与运维手册
+# 自托管中转部署（v3）
 
-本目录只放中转端的部署资产, 不改动 `.github/workflows/ssh-debug.yml`。
+本目录是中转机的部署资产。v3 将中转定位为**无状态字节转发器**：只按 `session_id` 转发 SSH 或 WS 字节流，不做访客认证、不做访问判定、不落盘会话状态。访客认证完全在 runner 侧完成。
 
-一期链路是 runner 用 `action-upterm` 反连到自托管 `uptermd`, 访客凭 GitHub 账号 `itwuge` 的公钥进入 runner 的会话。中转机只做路由, 不持有访客凭据, 也不保存会话内容。
+## 1. 准入核实结论
 
-## 一、文件清单
+结论：`uptermd` **不强制**宿主在服务器 `authorized_keys` 白名单注册后才能建立会话。
+
+依据（上游仓库 `owenthereal/upterm`，标签 `v0.41.1`，核实日期 2026-11-09）：
+
+- `cmd/uptermd/command/root.go`：`--authorized-keys` 的帮助文本是 “authorized_keys file(s) controlling which public keys may register as hosts; may be repeated”，即该参数只限制**宿主注册**，且是可选参数。
+- `server/sshproxy.go`：`loadAuthorizedKeys` 在未提供任何文件时返回 `nil`，注释明确写着 “signaling that the gate is disabled”；`checkAuthorizedKeys` 在门禁为 `nil` 时直接放行。
+- `server/sshproxy.go` 的门禁只作用于 `HostSSHClientVersion` 连接；访客/客户端连接不经过该校验，由 runner 侧内嵌 sshd 完成认证。
+- `server/sshd.go` 的字段注释也写明：`HostGateEnabled` 设置时才只允许 `--authorized-keys` 中的宿主公钥，“Without the gate any key gets in”。
+
+因此：
+
+1. 默认部署**不设置** `UPTERMD_AUTHORIZED_KEYS`，宿主注册门禁关闭，中转不做任何准入判定。
+2. 若显式设置该变量，其语义也仅是「准入仅限宿主注册」；访客认证仍完全在 runner 侧，中转从不校验访客公钥。
+3. 本目录脚本与文档统一使用「宿主注册」这一命名，不再沿用旧的准入叫法；中转不承担任何访客判定。
+
+注意：这是对源码的核对结论，不是真机握手实测；真机验证项见第 11 节。
+
+## 2. 文件清单
 
 | 文件 | 用途 |
 |---|---|
-| `install-uptermd.sh` | 幂等安装或升级 uptermd, 建用户与目录, 生成主机密钥, 写白名单占位, 环境文件, systemd 单元, journald 上限 |
-| `uptermd.service` | systemd 单元模板, 参数全部来自 `/etc/uptermd/uptermd.env` |
-| `firewall.sh` | ufw 或 nftables 规则, 默认演练, `--apply` 才落盘 |
-| `rotate-relay-key.sh` | 轮换服务身份密钥, 产出 `UPTERM_RELAY_KNOWN_HOST` 变量内容, 支持回滚 |
+| `install-uptermd.sh` | 幂等安装/升级 uptermd，写环境文件与 systemd 单元，执行监听、资源上限、空路由与禁落盘自检 |
+| `uptermd.service` | systemd 单元：只读系统与密钥、仅 `/run` 可写、资源上限、低端口能力 |
+| `firewall.sh` | ufw / nftables 双后端：SSH 与 WS 入口限速、管理面来源限制、指标端口仅环回 |
+| `rotate-relay-key.sh` | 反连注册标识轮换（服务身份密钥），输出 known_hosts 公钥行，支持回滚 |
+| `check-relay-health.sh` | 只读健康检查，输出单行 JSON，判据为监听齐备、路由为空、无会话文件、资源与日志上限生效 |
+| `README.md` | 本文件 |
 
-## 二、前置条件
+## 3. 中转与打洞的关系
 
-1. 服务器为 Ubuntu 20.04 及以上, 具备 root 权限, 可出网访问 GitHub Releases。
-2. 云安全组放行 `22/tcp` 入站; 管理面端口只对运维固定来源放行。
-3. 域名 `relay.wuge.fun` 的 A 记录指向该机公网地址。
-4. 本机已装 `curl jq openssh-client`。
-5. 明确 `authorized_keys` 白名单里要放哪把宿主公钥。**私钥只进 GitHub Secrets, 公钥才进白名单**。
+会话建立分两阶段，**先打洞、失败回落中继**：
 
-## 三、部署步骤
+- 阶段一：两端尝试直连。整体超时上限候选 5 秒，具体值待实测；超时即判失败，不反复重试。
+- 阶段二：打洞失败后立即切到中继转发。`session_id` 不重建，用户侧入口地址不变。
+- 日志用 `path_mode` 标记实际路径：`direct` 或 `relay`。
+- 打洞成功时，中继不参与数据面，只保留会话登记与到期管理；打洞失败时，中继负责双向转发字节流。
+- 网页通道一期固定走中继，不实现浏览器打洞。
 
-### 3.1 先处理 22 端口归属
+限制：GitHub **托管** runner 没有入站端口，纯 P2P 直连通常不成立。托管 runner 上的预期结果就是走中继；`path_mode=direct` 只作为优化项，不作为能力承诺。
 
-uptermd 要占 `22`, 系统 sshd 默认也在 `22`, 两者不能共存。二选一:
+中继不解析协议、不识别终端内容、不保存会话。进程重启即清空全部内存映射，重启期间会话断开属预期行为。
 
-方案甲, 系统 sshd 迁到 `22022`:
+## 4. 连接顺序
 
-```bash
-# 先确认能通过云控制台 VNC 登录, 避免断线后无法回退
-sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
-sudo sed -i 's/^#\?Port .*/Port 22022/' /etc/ssh/sshd_config
-sudo sshd -t
-sudo systemctl restart ssh
-ss -Hltn 'sport = :22022'
-```
+1. 显式触发工作流后，runner 侧进程按「先打洞、后中继」建立会话。
+2. 打洞在超时内未完成，立即回落到中继；中继记录 `session_id → runner 反向连接` 的内存映射。
+3. 运行日志输出九项可读路由信息：中转地址、端口、会话标识、SSH 用户名、公钥指纹、到期时间、网页地址、公钥凭据标识、当前路径。
+4. 需求方从 SSH 入口或网页入口进入同一个 runner 终端。
+5. 会话结束、runner 进程退出或中继重启后，两个入口同时失效，原信息重连被拒。
 
-在新端口验证可登录后, 再让 uptermd 使用 `22`。云安全组同步放行 `22022`, 并只对运维来源放开。
+日志只允许出现上述路由信息。私钥、口令、一次性 token、GitHub token 不产生、不打印、不写入制品或仓库。不要对路由信息调用 GitHub 的掩码标记，否则整行会被替换成不可读的占位符；正确做法是从源头不产生凭据，而不是事后掩码。
 
-方案乙, 系统 sshd 留在 `22`, uptermd 换到 `2222`:
+## 5. 前置条件
 
-```bash
-sudo ./install-uptermd.sh --ssh-addr 0.0.0.0:2222
-```
+- Ubuntu 20.04 及以上，systemd 245 及以上，bash 5.x，root 执行。
+- 中转机可出网访问 GitHub Releases。
+- 22 端口空闲；系统 sshd 已迁到 22022，或另有可用的管理面入口。
+- 云安全组先放行管理面来源，再改主机防火墙；主机防火墙只做兜底。
+- WS 入口需要 TLS 终止层：`uptermd` 只监听环回 `127.0.0.1:8443` 的明文 WS，公网 `wss://` 由反向代理终止 TLS 后转发到该端口。反向代理选型与证书管理不在本目录脚本内，属真机实施项。
 
-此时 workflow 的 `upterm-server` 必须改成 `ssh://relay.wuge.fun:2222`。云安全组与 DNS 不变, 改动面最小, 但对外端口不是 22。
+## 6. 部署步骤
 
-### 3.2 安装
+### 6.1 迁移系统 sshd 到 22022
 
-```bash
-# 取发布包哈希, 建议从官方 release 页面手工核对后填入
-curl -fsSL https://github.com/owenthereal/upterm/releases/download/v0.41.1/checksums.txt | grep uptermd_linux_amd64
+1. 修改 `/etc/ssh/sshd_config` 的 `Port`，保留或新增管理面端口。
+2. 执行 `sshd -t` 校验配置，再重启 sshd。
+3. 用新端口另开一个连接确认可登录，确认后再关闭旧连接。
+4. 云安全组只对管理来源放行新端口。
 
-sudo ./install-uptermd.sh \
-  --version v0.41.1 \
-  --sha256 '<上一步得到的 sha256>' \
-  --ssh-addr 0.0.0.0:22
-```
+不要在未确认新端口可登录前关闭当前连接，避免锁死。
 
-不加 `--sha256` 时脚本会回落到同版本 `checksums.txt`, 并在日志里记 WARNING 说明这只能发现传输损坏, 不构成真实性证明。
-
-重复执行是安全的: 用户已存在、目录已存在、密钥已存在、文件内容一致时均跳过, 服务只在内容真的变化时重启。
-
-### 3.3 填宿主公钥白名单
+### 6.2 安装或升级 uptermd
 
 ```bash
-sudo tee -a /etc/uptermd/authorized_keys >/dev/null <<'EOF'
-ssh-ed25519 AAAA...占位... actions-host@github
-EOF
-sudo systemctl restart uptermd.service
+sudo deploy/install-uptermd.sh --dry-run
+sudo deploy/install-uptermd.sh --version v0.41.1
 ```
 
-白名单为空时, 任何宿主都无法注册会话, 这是刻意的默认拒绝。
-
-### 3.4 防火墙
+建议同时提供发布包哈希，避免依赖远端 `checksums.txt` 的可用性：
 
 ```bash
-# 演练, 只打印规则
-sudo ./firewall.sh --backend ufw --admin-cidr 203.0.113.0/24
-
-# 确认后应用
-sudo ./firewall.sh --backend ufw --admin-cidr 203.0.113.0/24 --apply
+sudo deploy/install-uptermd.sh --version v0.41.1 --sha256 <发布包 SHA256>
 ```
 
-- 未提供 `--admin-cidr` 且未加 `--allow-admin-anywhere` 时脚本拒绝执行, 防止把自己锁在门外。
-- `--rate-limit-ssh` 会把 relay 端口改成 `ufw limit`, 对扫描有抑制作用。
-- 指标端口只绑 `127.0.0.1:9100`, 规则里再显式 drop 一次作为纵深防御。
-- 使用 nftables 后端时, 若 ufw 处于 active 状态会直接报错, 两者不可并存。
+脚本会：
 
-## 四、验证
+- 创建 `upterm` 系统用户与目录，生成或保留主机密钥；
+- 下载发布包并校验哈希，原子替换二进制；
+- 写 `/etc/uptermd/uptermd.env`，**不写** `UPTERMD_AUTHORIZED_KEYS`，**不创建** `authorized_keys`；
+- 安装 `uptermd.service`，设置开机自启；
+- 重启后核对 22 与 8443 监听、`MemoryMax`/`CPUQuota`/`TasksMax`、活动路由为 0、运行期目录无会话文件。
+
+退出码 10 表示空路由或禁落盘自检未通过，退出码 11 表示资源上限未生效。
+
+### 6.3 应用防火墙
+
+先演练，确认管理面来源无误后再应用：
 
 ```bash
-# 1 服务与监听
-systemctl status uptermd.service --no-pager
-ss -Hltnp 'sport = :22'
-
-# 2 环境文件与权限
-sudo stat -c '%a %U:%G %n' /etc/uptermd/uptermd.env /etc/uptermd/authorized_keys /var/lib/uptermd/server_key
-# 期望 640 root:upterm, 640 root:upterm, 600 upterm:upterm
-
-# 3 指标
-curl -fsS http://127.0.0.1:9100/metrics | head -n 40
-
-# 4 日志里不该出现密钥材料
-sudo journalctl -u uptermd.service --since '10 min ago' | grep -Ei 'private key|BEGIN OPENSSH|password' || echo 'no secret pattern'
-
-# 5 主机密钥指纹
-ssh-keygen -lf /var/lib/uptermd/server_key.pub
+sudo deploy/firewall.sh --admin-cidr <管理来源网段> --dry-run
+sudo deploy/firewall.sh --admin-cidr <管理来源网段> --apply
 ```
 
-端到端验证需要触发一次 workflow, 并在日志里拿到 `ssh -p 22 <会话标识>@relay.wuge.fun` 形态的连接串。
+默认放行 SSH 22 与 WS 443，管理面 22022 只允许 `--admin-cidr` 来源，指标 9100 显式阻断。nftables 后端对 22 与 443 的新连接施加全局速率上限，阈值由 `FW_RELAY_RATE`、`FW_RELAY_BURST`、`FW_WS_RATE`、`FW_WS_BURST` 调整，默认值需按真机流量标定。
 
-## 五、主机密钥轮换
+### 6.4 健康检查
 
 ```bash
-# 演练, 不改动服务
-sudo ./rotate-relay-key.sh --host relay.wuge.fun --port 22
-
-# 执行
-sudo ./rotate-relay-key.sh --host relay.wuge.fun --port 22 --apply
+sudo deploy/check-relay-health.sh <中转地址> 22
 ```
 
-脚本行为:
+标准输出恰好一行 JSON，字段为 `ok`、`message`、`error_code`、`data`、`confirm`；`data` 至少包含：
 
-1. 读 `routing_active_connections_count`, 有活动会话就拒绝, `--force` 可越过。
-2. 指标不可用同样拒绝, 因为无法确认是否有人在会话里。
-3. 旧密钥归档到 `/var/lib/uptermd/archive/`, 私钥 `0600` 仅 root 可读。
-4. 新密钥就位后重启服务, 未就绪则自动回滚并返回 6。
-5. 输出形如下面的行, 复制进仓库变量 `UPTERM_RELAY_KNOWN_HOST`:
+- `listen_state`：SSH、WS、环回 WS 三类监听；
+- `route_table_empty`：`routing_active_connections_count` 是否为 0；
+- `session_files_found`：运行目录条目与状态目录中的预期外文件；
+- `journal_cap`：journald 上限配置与实际占用。
 
-```text
-@cert-authority [relay.wuge.fun]:22 ssh-ed25519 AAAA...占位...
-```
+退出码：0 全部通过；1 判据未通过或状态取不到；2 参数或依赖错误。
 
-轮换后必须同步更新 runner 侧 `known-hosts` 输入所引用的变量, 否则下一次作业会因主机密钥不匹配而失败。
+## 7. 验证判据
 
-回滚:
+部署完成后按以下顺序验证：
+
+1. `systemctl is-active uptermd.service` 为 `active`。
+2. `ss -Hltn` 能看到 22、127.0.0.1:8443、127.0.0.1:9100。
+3. `curl -fsS http://127.0.0.1:9100/metrics` 可读，`routing_active_connections_count` 为 0。
+4. `systemctl show -p MemoryMax -p CPUQuotaPerSecUSec -p TasksMax uptermd.service` 与 `1G`、`150%`、`512` 对应。
+5. `/run/uptermd` 为空；`/var/lib/uptermd` 只有主机密钥与轮换归档。
+6. 重启一次服务后立即复查第 3、5 项，作为「重启后映射为空、无会话文件」的证据。
+7. journald 实际占用不超过 200M，且 `90-uptermd-limits.conf` 中 `SystemMaxUse=200M`。
+
+## 8. 反连注册标识轮换
+
+轮换对象是中转服务身份密钥，用途是 known_hosts 防中间人，不是准入凭据。中转不校验访客公钥，门禁默认关闭，因此轮换不会改变任何准入范围。
 
 ```bash
-sudo ./rotate-relay-key.sh --rollback /var/lib/uptermd/archive/server_key.20260101T000000Z --apply
+sudo deploy/rotate-relay-key.sh --dry-run
+sudo deploy/rotate-relay-key.sh --apply
 ```
 
-## 六、常见故障
+- 存在活动会话或指标不可达时默认拒绝轮换；确认无影响才加 `--force`。
+- 成功后按脚本输出更新仓库变量 `UPTERM_RELAY_KNOWN_HOST`，并同步本机与各 runner 的 `known_hosts`。
+- 旧密钥归档在 `/var/lib/uptermd/archive/`，可用 `--rollback <归档基础路径>` 恢复。
+- 脚本只在运行时打印公钥行与指纹；公钥与指纹属可公开元数据，不是凭据。
 
-### 6.1 端口冲突
+## 9. 常见故障
 
-现象: `install-uptermd.sh` 返回 9, 或 `systemctl status` 显示 `Address already in use`。
+| 现象 | 排查 | 处置 |
+|---|---|---|
+| 22 端口冲突 | `ss -Hltn 'sport = :22'` | 先迁走系统 sshd，或改 `--ssh-addr`；不要两个进程抢同一端口 |
+| WS 入口不可用 | 查 8443 是否监听、TLS 终止层是否转发到 127.0.0.1:8443 | 修反向代理或证书；uptermd 本身不终止 TLS |
+| 健康检查报活动路由非 0 | 是否有真实会话未结束 | 等会话结束或重启服务；重启后映射必须为空 |
+| 健康检查报会话文件 | `find /run/uptermd /var/lib/uptermd` | 说明进程发生了预期外写盘，按退出码 10 处理并检查版本与单元沙箱 |
+| 指标不可达 | 查 9100 是否只绑环回、服务是否 active | 不要为了排障把 9100 暴露到公网 |
+| 服务起不来且日志提示只读文件系统 | 查是否往 `/var/lib/uptermd`、`/etc/uptermd` 或 home 写文件 | 这是沙箱预期行为；确认版本是否支持只读运行，必要时调整 `ReadOnlyPaths` 并记录 |
+| 绑定 22 报权限不足 | 查单元是否授予 `CAP_NET_BIND_SERVICE` | 保留 `AmbientCapabilities`，不要改成 root 运行 |
+| journal 占用超限 | `journalctl --disk-usage` | 检查 `90-uptermd-limits.conf` 是否生效并执行 vacuum |
 
-```bash
-ss -Hltnp 'sport = :22'
-systemctl status ssh --no-pager
-```
+## 10. 回滚
 
-处置: 按 3.1 迁移系统 sshd, 或改用 `--ssh-addr 0.0.0.0:2222` 并同步改 workflow。不要在 uptermd 运行中改 sshd 端口后直接重启 ssh, 那样会短暂同时占用或同时释放, 先停服务再改。
+1. `systemctl disable --now uptermd.service`。
+2. 恢复旧版二进制或旧单元文件，执行 `systemctl daemon-reload`。
+3. 如刚轮换过密钥，用 `rotate-relay-key.sh --rollback <归档基础路径>` 恢复，并同步撤回仓库变量。
+4. 恢复防火墙规则到变更前版本，确认管理面仍可登录。
+5. 重启服务后执行健康检查，确认监听、空路由、无会话文件与资源上限。
 
-### 6.2 僵尸路由
+不要删除主机密钥来「重置」服务；删除会改变 known_hosts 指纹，需同步更新仓库变量与客户端。
 
-现象: 作业已结束或 runner 被杀, 指标里活动连接数迟迟不归零, 旧会话标识仍显示存在。
+## 11. 必须在真机确认
 
-```bash
-curl -fsS http://127.0.0.1:9100/metrics | grep '^routing_'
-```
+以下项目未取得实测证据，不得写成已实现或已验证：
 
-处置顺序:
-
-1. 先等一个 `ClientAlive` 级别的周期, 观察是否自然回收。
-2. 确认没有真实用户在线后, 才滚动重启: `systemctl restart uptermd.service`。有活动会话时重启会打断所有人。
-3. 若指标长期不归零且无真实会话, 记为缺陷, 附时间点与指标快照。
-
-回收时限目前没有实测数据, 见第八节。
-
-### 6.3 主机密钥或证书失效
-
-现象: runner 日志报 `Host key verification failed` 或 `REMOTE HOST IDENTIFICATION HAS CHANGED`。
-
-原因只有两种: 轮换后 runner 侧变量未更新, 或中转机密钥被替换。
-
-```bash
-ssh-keygen -lf /var/lib/uptermd/server_key.pub
-```
-
-处置: 比对变量里的公钥与当前指纹是否一致; 一致则清 runner 侧陈旧 known_hosts, 不一致则确认是否有人轮换过密钥, 再决定改变量还是回滚密钥。**不要用 `StrictHostKeyChecking=no` 绕过**。
-
-### 6.4 服务起不来
-
-```bash
-systemctl status uptermd.service --no-pager
-journalctl -u uptermd.service -n 100 --no-pager
-```
-
-按报错分三类: 环境文件缺失或格式错, 密钥文件权限不对, 监听地址被占。环境文件必须是 `root:upterm 0640`, 密钥必须是 `upterm:upterm 0600`。
-
-### 6.5 日志或磁盘增长
-
-```bash
-journalctl --disk-usage
-du -sh /var/log/uptermd-deploy
-```
-
-journald 已在安装时写入 `SystemMaxUse=200M` 的 drop-in。部署脚本每次运行生成一个 JSON Lines 文件, 位于 `/var/log/uptermd-deploy/logs/`, 按需保留。
-
-## 七、回滚
-
-| 场景 | 操作 |
-|---|---|
-| 升级后服务异常 | 用上一版本重新执行 `install-uptermd.sh --version <旧版本> --sha256 <旧哈希>` |
-| 密钥需退回 | `rotate-relay-key.sh --rollback <归档路径> --apply` |
-| 防火墙规则需撤销 | ufw: `ufw disable` 或 `ufw delete <规则>`; nftables: `nft delete table inet uptermd_guard` 并从 `/etc/nftables.conf` 删掉 include 行 |
-| sshd 端口需退回 | 恢复 `/etc/ssh/sshd_config.bak` 后重启 ssh, 先停 uptermd 让出 22 |
-| 完全卸载 | 停用并禁用 unit, 删 `/etc/systemd/system/uptermd.service`, 删 `/usr/local/bin/uptermd`, 删 `/etc/uptermd` 与 `/var/lib/uptermd`, 删 journald drop-in 后重启 journald |
-
-## 八、必须在真机确认的点
-
-以下内容未经实机验证, 部署时逐条确认并记录结果:
-
-1. `uptermd` 的版本探测入口是 `--version` 还是 `version` 子命令; 脚本对两者都做了尝试, 需确认实际命中哪个。
-2. `UPTERMD_PRIVATE_KEY` 指向的确实是 relay 对外出示的服务身份密钥, 且公钥行应写成 `@cert-authority` 形式。
-3. `UPTERMD_SSH_NETWORK=tcp4` 在目标机是否只绑定 IPv4; 若需 IPv6 需改 `tcp`。
-4. `--handshake-timeout` 在 60s 下, 成都中转与 GitHub runner 之间是否够用。
-5. 作业被取消或 runner 被强杀后, 指标归零的实际耗时, 以及是否需要人工重启清理。
-6. 会话期间 `/var/lib/uptermd` 与 `/tmp` 是否新增文件。
-7. 原始运行日志与 job summary 中的连接串未被 `***` 掩码, 且不含任何密钥片段。
-8. 3 Mbps 下 `make menuconfig` 的实际流畅度, 记录两段 RTT 与会话期间吞吐。
-9. ufw 与云安全组规则叠加后, 管理面仍可从白名单来源登录。
-10. journald drop-in 生效后, `journalctl --disk-usage` 稳定在 200M 以内。
+1. `User=upterm` 加 `AmbientCapabilities=CAP_NET_BIND_SERVICE` 能否在 Ubuntu 20.04 上稳定绑定 22。
+2. `ProtectSystem=strict`、`ReadOnlyPaths`、`WorkingDirectory=/run/uptermd` 与 uptermd 实际写路径是否冲突；若冲突，禁落盘判据需调整。
+3. 不设置 `UPTERMD_AUTHORIZED_KEYS` 时，runner 反连注册是否确实无需服务器侧公钥登记；以及设置空文件时是否拒绝所有宿主注册。
+4. WS 监听 8443 加 TLS 终止层的组合能否完成浏览器 `wss://` 连接；反向代理选型与证书轮换方式未定。
+5. 指标名 `routing_active_connections_count` 在 v0.41.1 的实际输出格式与标签情况。
+6. 重启后 `/run/uptermd` 确实为空、`/var/lib/uptermd` 无新增会话文件。
+7. `systemctl show` 返回的 `MemoryMax`、`CPUQuotaPerSecUSec`、`TasksMax` 字面值与本脚本判定一致。
+8. nftables 速率规则的默认阈值在真实流量下是否合适，是否误伤正常重连。
+9. 打洞优先策略在自建 runner 或同 NAT 环境下是否可成功；托管 runner 只验中继分支。
+10. 两个入口同时进入同一会话时，TUI 的实际可用性。
