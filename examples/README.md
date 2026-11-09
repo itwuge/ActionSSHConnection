@@ -35,4 +35,4 @@
 ## 变量与凭据
 
 - 网页准入允许清单用 `allowed-credentials` 传（单行 JSON）。`[]` 表示开放一次自举注册，任何人都能成为第一个注册者，生产环境建议预置条目。
-- 已预置凭据时，Composite 调用会读取**调用方仓库**的 `WEBAUTHN_CREDENTIAL_ID` 变量；未设置即按自举注册处理。
+- 已预置凭据时，用 `credential-id` 传入标识（例如 `credential-id: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}`）；留空即按自举注册处理。

@@ -62,6 +62,11 @@ on:
         type: string
         required: false
         default: "[]"
+      credential-id:
+        description: "已注册的 WebAuthn 凭据标识；留空走自举注册"
+        type: string
+        required: false
+        default: ""
       upterm-version:
         description: "upterm 客户端版本"
         type: string
@@ -148,6 +153,7 @@ jobs:
           ssh-user: ${{ inputs.ssh-user }}
           session-minutes: ${{ inputs.session-minutes }}
           allowed-credentials: ${{ inputs.allowed-credentials }}
+          credential-id: ${{ inputs.credential-id }}
           upterm-version: ${{ inputs.upterm-version }}
           action-upterm-ref: ${{ inputs.action-upterm-ref }}
           direct-endpoint: ${{ inputs.direct-endpoint }}

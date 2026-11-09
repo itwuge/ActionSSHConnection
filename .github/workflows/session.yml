@@ -61,6 +61,7 @@ jobs:
           bridge-base-url: ${{ vars.WEB_BRIDGE_BASE_URL }}
           known-hosts: ${{ vars.UPTERM_RELAY_KNOWN_HOST }}
           allowed-credentials: ${{ vars.WEBAUTHN_ALLOWED_CREDENTIALS }}
+          credential-id: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
           upterm-version: v0.41.1
           direct-endpoint: ${{ vars.UPTERM_DIRECT_ENDPOINT }}
           # 沿用原工作流：会话期间把 9 行路由字段另存为 route-fields 制品

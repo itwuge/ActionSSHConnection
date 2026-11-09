@@ -50,6 +50,10 @@ inputs:
     description: '网页准入允许清单（单行 JSON 数组）；空数组 [] 表示开放一次自举注册'
     required: false
     default: '[]'
+  credential-id:
+    description: '已注册的 WebAuthn 凭据标识；留空即输出 unset 并按自举注册运行'
+    required: false
+    default: ''
   upterm-version:
     description: 'upterm 客户端版本（GitHub Release tag），默认已核实的 v0.41.1'
     required: false
@@ -152,7 +156,7 @@ runs:
         ACTSSH_RELAY_HOST: ${{ inputs.relay-host }}
         ACTSSH_RELAY_PORT: ${{ inputs.relay-port }}
         ACTSSH_WEB_BASE_URL: ${{ inputs.web-base-url }}
-        ACTSSH_CREDENTIAL_ID: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
+        ACTSSH_CREDENTIAL_ID: ${{ inputs.credential-id }}
         ACTSSH_SESSION_ID: ${{ steps.start.outputs.session_id }}
         ACTSSH_SSH_LOGIN_USER: ${{ steps.start.outputs.ssh_user }}
         ACTSSH_FINGERPRINTS: ${{ steps.precheck.outputs.fingerprints }}
@@ -179,7 +183,7 @@ runs:
         ACTSSH_SESSION_ID: ${{ steps.start.outputs.session_id }}
         ACTSSH_BRIDGE_BASE: ${{ inputs.bridge-base-url }}
         ACTSSH_ALLOWED_JSON: ${{ inputs.allowed-credentials }}
-        ACTSSH_CREDENTIAL_ID: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
+        ACTSSH_CREDENTIAL_ID: ${{ inputs.credential-id }}
 
     - name: 等待会话结束
       if: steps.precheck.outputs.enabled == 'true'
