@@ -49,7 +49,9 @@ env:
   UPTERM_VERSION: v0.41.1
   UPTERM_ASSET: upterm_linux_amd64.tar.gz
   UPTERM_SHA256: 3007d4ce09e9f70a390e1b52e5a0b591fc9fa473196ca76d8f72b5f1cd723b31
-  WORKDIR: ${{ runner.temp }}/actssh
+  # 工作流级 env 不允许引用 runner 上下文（校验报 Unrecognized named-value: 'runner'），
+  # 用 github.workspace 的上级目录，落在仓库目录之外，收尾整目录删除
+  WORKDIR: ${{ github.workspace }}/../actssh-tmp
   WEB_TERMINAL_BASE_URL: ${{ vars.WEB_TERMINAL_BASE_URL }}
   WEBAUTHN_CREDENTIAL_ID: ${{ vars.WEBAUTHN_CREDENTIAL_ID }}
   UPTERM_DIRECT_ENDPOINT: ${{ vars.UPTERM_DIRECT_ENDPOINT }}
