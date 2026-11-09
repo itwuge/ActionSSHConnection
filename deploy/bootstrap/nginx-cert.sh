@@ -11,7 +11,7 @@
 #
 # 输入        : 命令行参数优先, 未给出时读取同名环境变量
 #               --domain <fqdn>       证书域名, 必填
-#               --cert-mode <acme|self-signed> 默认 acme; self-signed 仅用于无公网 DNS 的实验环境
+#               --cert-mode <acme|standalone|self-signed> 默认 acme(webroot, 别名 webroot); standalone 临时停 80 后签发; self-signed 仅用于无公网 DNS 的实验环境
 #               --acme-email <mail>   注册邮箱, 可省略; 省略时使用无邮箱注册
 #               --staging             使用 ACME 预发布目录, 避免调试时消耗正式配额
 #               --http-port <port>    默认 80
@@ -90,7 +90,10 @@ show_usage() {
 
 选项:
   --domain <fqdn>          证书域名, 必填
-  --cert-mode <mode>       acme 或 self-signed, 默认 acme
+  --cert-mode <mode>       acme(webroot) | standalone | self-signed, 默认 acme
+                           acme: 宿主 certbot webroot, 不停服
+                           standalone: 签发时临时停本方案 nginx 以独占 80
+                           self-signed: 自签, 仅无公网环境使用
   --acme-email <mail>      ACME 注册邮箱, 可省略
   --staging                使用 ACME 预发布目录
   --http-port <port>       HTTP 端口, 默认 80
@@ -176,10 +179,17 @@ _validate() {
     if [[ ! "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
         _die 2 "nginx.args.domain_invalid" "域名格式非法: ${DOMAIN}"
     fi
+    # webroot 是 acme 的同义写法, 统一归一化后再走后续分支
+    if [[ "$CERT_MODE" == "webroot" ]]; then
+        CERT_MODE="acme"
+    fi
     case "$CERT_MODE" in
-        acme|self-signed) ;;
-        *) _die 2 "nginx.args.cert_mode" "cert-mode 仅支持 acme 或 self-signed: ${CERT_MODE}" ;;
+        acme|standalone|self-signed) ;;
+        *) _die 2 "nginx.args.cert_mode" "cert-mode 仅支持 acme(webroot) / standalone / self-signed: ${CERT_MODE}" ;;
     esac
+    if [[ "$CERT_MODE" != "self-signed" && "$HTTP_PORT" != "80" ]]; then
+        _die 2 "nginx.args.http_port" "HTTP-01 校验固定访问 80 端口, ${CERT_MODE} 模式下 --http-port 必须为 80"
+    fi
     bs_require_port "http-port" "$HTTP_PORT"
     bs_require_port "https-port" "$HTTPS_PORT"
     bs_require_port "bridge-port" "$BRIDGE_PORT"
@@ -470,7 +480,7 @@ _cert_paths() {
     # 用途: 按证书模式输出证书与私钥路径
     # 参数: 无
     # 返回: 无; 副作用: 设置 CERT_FILE 与 KEY_FILE
-    if [[ "$CERT_MODE" == "acme" ]]; then
+    if [[ "$CERT_MODE" != "self-signed" ]]; then
         CERT_FILE="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
         KEY_FILE="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
     else
@@ -504,7 +514,7 @@ _issue_self_signed() {
 }
 
 _issue_acme() {
-    # 用途: 用 certbot webroot 模式签发证书, 已有证书未到期时跳过
+    # 用途: 用 certbot 签发证书; acme 走 webroot 不停服, standalone 临时停本方案 nginx 独占 80; 已有证书未到期时跳过
     # 参数: 无
     # 返回: 无; 退出码: 0 或 8
     local -a args
@@ -513,10 +523,28 @@ _issue_acme() {
         return 0
     fi
     if (( APPLY == 0 )); then
-        _say "演练: 将执行 certbot certonly --webroot -w ${ACME_ROOT} -d ${DOMAIN}"
+        if [[ "$CERT_MODE" == "standalone" ]]; then
+            _say "演练: 将临时停止 actssh-nginx.service, 执行 certbot certonly --standalone -d ${DOMAIN}, 再启动 nginx"
+        else
+            _say "演练: 将执行 certbot certonly --webroot -w ${ACME_ROOT} -d ${DOMAIN}"
+        fi
         return 0
     fi
-    args=(certonly --webroot -w "$ACME_ROOT" -d "$DOMAIN" --non-interactive --agree-tos --keep-until-expiring)
+    if [[ "$CERT_MODE" == "standalone" ]]; then
+        # 先让出 80 端口, 校验期间由 certbot 自己监听
+        if ! systemctl stop actssh-nginx.service; then
+            _die 8 "nginx.cert.stop_failed" "standalone 签发前无法停止 actssh-nginx.service"
+        fi
+        if ss -Hltn 'sport = :80' 2>/dev/null | grep -q .; then
+            systemctl start actssh-nginx.service >/dev/null 2>&1 || true
+            _die 8 "nginx.cert.port_busy" "停止本方案 nginx 后 80 端口仍被占用, 无法使用 standalone"
+        fi
+        args=(certonly --standalone -d "$DOMAIN" --non-interactive --agree-tos --keep-until-expiring
+            --pre-hook "systemctl stop actssh-nginx.service || true"
+            --post-hook "systemctl start actssh-nginx.service || true")
+    else
+        args=(certonly --webroot -w "$ACME_ROOT" -d "$DOMAIN" --non-interactive --agree-tos --keep-until-expiring)
+    fi
     if (( ACME_STAGING == 1 )); then
         args+=(--staging)
     fi
@@ -525,10 +553,17 @@ _issue_acme() {
     else
         args+=(--register-unsafely-without-email)
     fi
-    _say "申请证书: ${DOMAIN} (mode=acme staging=${ACME_STAGING})"
+    _say "申请证书: ${DOMAIN} (mode=${CERT_MODE} staging=${ACME_STAGING})"
     if ! "$CERTBOT_BIN" "${args[@]}"; then
+        # standalone 失败时也要把 nginx 拉起来, 否则站点整体不可用
+        if [[ "$CERT_MODE" == "standalone" ]]; then
+            systemctl start actssh-nginx.service >/dev/null 2>&1 || true
+        fi
         _die 8 "nginx.cert.acme_failed" \
             "certbot 签发失败; 检查 DNS 是否指向本机, 80 端口是否公网可达, 以及 ACME 配额"
+    fi
+    if [[ "$CERT_MODE" == "standalone" ]]; then
+        systemctl start actssh-nginx.service || _die 8 "nginx.cert.start_failed" "签发后无法启动 actssh-nginx.service"
     fi
     if [[ ! -f "$CERT_FILE" ]]; then
         _die 8 "nginx.cert.missing_after_issue" "certbot 返回成功但证书不存在: ${CERT_FILE}"
@@ -543,7 +578,7 @@ _install_renewal() {
     local hook="${hook_dir}/actssh-nginx-reload"
     local cron_file="/etc/cron.d/actssh-certbot"
     local tmp
-    if [[ "$CERT_MODE" != "acme" ]]; then
+    if [[ "$CERT_MODE" == "self-signed" ]]; then
         _say "自签模式不安装续期定时器"
         return 0
     fi
@@ -607,7 +642,7 @@ _validate
 bs_init_logging "$LOGGER" "$LOG_ROOT" "$RUN_ID"
 bs_require_root
 bs_require_cmds install systemctl ss openssl awk sed grep
-if [[ "$CERT_MODE" == "acme" ]]; then
+if [[ "$CERT_MODE" != "self-signed" ]]; then
     bs_require_cmds "$CERTBOT_BIN"
 else
     bs_require_cmds openssl
@@ -635,7 +670,7 @@ else
     _render_conf "${TMP_DIR}/nginx.http.conf" 0
     _apply_conf "${TMP_DIR}/nginx.http.conf"
     _reload_unit "$HTTP_PORT"
-    if [[ "$CERT_MODE" == "acme" ]]; then
+    if [[ "$CERT_MODE" != "self-signed" ]]; then
         _issue_acme
     else
         _issue_self_signed
@@ -648,7 +683,7 @@ _apply_conf "${TMP_DIR}/nginx.full.conf"
 _reload_unit "$HTTPS_PORT"
 
 # 证书临近到期时在完整配置已生效的前提下补一次续期
-if [[ "$CERT_MODE" == "acme" ]]; then
+if [[ "$CERT_MODE" != "self-signed" ]]; then
     days="$(bs_cert_days_left "$CERT_FILE" || echo 0)"
     if (( days < 30 )); then
         _issue_acme

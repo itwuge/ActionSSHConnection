@@ -13,7 +13,7 @@
 #               --domain <fqdn>       证书域名, 必填; 回滚与 relay-only 时不需要
 #               --acme-email <mail>   ACME 注册邮箱, 可省略; --email 为别名
 #               --acme-staging        使用 ACME 预发布目录
-#               --cert-mode <mode>    acme 或 self-signed; self-signed 仅用于无公网 DNS 的实验环境
+#               --cert-mode <mode>    acme(webroot, 默认) / standalone / self-signed; self-signed 仅用于无公网 DNS 的实验环境
 #               --web-root <dir>      可选网页终端静态目录; 缺省时根路径返回 404
 #               --admin-cidr <cidr>   允许访问管理面 SSH 的来源, 可重复; 防火墙落地时必填
 #               --allow-admin-anywhere 管理面不限来源, 仅限临时排障
@@ -175,7 +175,10 @@ show_usage() {
   --domain <fqdn>          证书域名, full 形态必填
   --acme-email <mail>      ACME 注册邮箱, 可省略; 别名 --email
   --acme-staging           使用 ACME 预发布目录
-  --cert-mode <mode>       acme 或 self-signed, 默认 acme
+  --cert-mode <mode>       acme(webroot) | standalone | self-signed, 默认 acme
+                           acme: 宿主 certbot webroot, 不停服
+                           standalone: 签发时临时停 actssh-nginx 以独占 80
+                           self-signed: 自签, 仅无公网环境使用
   --web-root <dir>         可选静态站点目录
   --relay-only             只装中继: 不装 nginx, 证书, 网页桥接
   --with-direct            中继 SSH 直连对外, 默认
@@ -278,13 +281,17 @@ _validate_args() {
         _die 2 "bootstrap.args.domain_invalid" "域名格式非法: ${DOMAIN}"
     fi
     if [[ "$DEPLOY_MODE" == "full" ]]; then
+        # webroot 与 acme 同义, 统一归一化后再校验, 避免两处判定分叉
+        if [[ "$CERT_MODE" == "webroot" ]]; then
+            CERT_MODE="acme"
+        fi
         case "$CERT_MODE" in
-            acme|self-signed) ;;
-            *) _die 2 "bootstrap.args.cert_mode" "cert-mode 仅支持 acme 或 self-signed: ${CERT_MODE}" ;;
+            acme|standalone|self-signed) ;;
+            *) _die 2 "bootstrap.args.cert_mode" "cert-mode 仅支持 acme(webroot) / standalone / self-signed: ${CERT_MODE}" ;;
         esac
-        if [[ "$CERT_MODE" == "acme" && "$HTTP_PORT" != "80" ]]; then
+        if [[ "$CERT_MODE" != "self-signed" && "$HTTP_PORT" != "80" ]]; then
             _die 2 "bootstrap.args.http_port_acme" \
-                "HTTP-01 校验固定访问 80 端口, acme 模式下 --http-port 必须为 80; 无 80 端口请改用 --cert-mode self-signed"
+                "HTTP-01 校验固定访问 80 端口, ${CERT_MODE} 模式下 --http-port 必须为 80; 无 80 端口请改用 --cert-mode self-signed"
         fi
         if [[ -n "$WEB_ROOT" && ! -d "$WEB_ROOT" ]]; then
             _die 2 "bootstrap.args.web_root" "静态站点目录不存在: ${WEB_ROOT}"
@@ -456,6 +463,10 @@ _check_port_owner() {
         unit="$(bs_pid_unit "$pid" || true)"
         owner+="${unit:-pid:${pid}} "
     done
+    if [[ "$owner" == *"docker.service"* ]]; then
+        _die 8 "bootstrap.port.occupied_docker" \
+            "端口 ${port} (${label}) 被 docker 容器的端口映射占用; 本方案只使用宿主 nginx, 不接管容器, 请先人工释放端口 (见 README 第 17 节)"
+    fi
     _die 8 "bootstrap.port.occupied" \
         "端口 ${port} (${label}) 已被 ${owner:-未知进程} 占用; 脚本不自动迁移, 请先停止占用或改用参数指定其他端口"
 }

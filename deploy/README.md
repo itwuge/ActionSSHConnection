@@ -69,7 +69,7 @@
 - 中继监听端口空闲。默认设计是 relay 占用 22、系统 sshd 迁到 22022（见 6.1）；若不允许动 22（例如既有生产机），改用 `--ssh-addr 0.0.0.0:2222`，此时 2222 必须空闲且云安全组放行（见 6.1.1）。
 - 云安全组先放行管理面来源，再改主机防火墙；主机防火墙只做兜底。
 - WS 入口需要 TLS 终止层：`uptermd` 只监听明文 WS（默认环回 `127.0.0.1:8443`），公网 `wss://` 由反向代理终止 TLS 后转发到该端口。反向代理选型与证书管理不在本目录脚本内，属真机实施项。
-- 反向代理若在容器内（例如本项目的 `certbot-nginx` 容器），容器无法访问宿主回环，`127.0.0.1:8443` 与 `172.17.0.1:8443` 都不通；此时必须让 uptermd 直接监听 docker0 网关，安装时用 `--ws-addr 172.17.0.1:8443`（2026-11-09 生产机实测：未改绑时 nginx 报 `connect() failed (111: Connection refused)` 并返回 502，改绑后 400 由 uptermd 应答）。该地址只在 docker 网桥内可达，不新增公网端口。
+- 反向代理与 uptermd 同机部署时，WS 上游固定监听 `127.0.0.1:8443`，不对外暴露。本方案的 nginx 由脚本安装在宿主上（独立实例、独立 conf 与 pid），不使用容器；若机器上已有容器占用 80/443，预检直接报端口冲突，不做接管。
 
 ## 6. 部署步骤
 
@@ -149,7 +149,7 @@ stdout 恰好一行 JSON，字段为 `ok`、`message`、`error_code`、`data`、
 部署完成后按以下顺序验证：
 
 1. `systemctl is-active uptermd.service` 为 `active`。
-2. `ss -Hltn` 能看到配置的 SSH 监听端口（默认 22，例如 `2222`）、配置的 WS 监听地址（默认 `127.0.0.1:8443`；容器化反代场景为 `172.17.0.1:8443`）、127.0.0.1:9100。
+2. `ss -Hltn` 能看到配置的 SSH 监听端口（默认 22，例如 `2222`）、配置的 WS 监听地址（固定 `127.0.0.1:8443`）、`127.0.0.1:9100`。
 3. `curl -fsS http://127.0.0.1:9100/metrics` 可读，活动会话数为 0。v0.41.1 实际指标名是 `upterm_uptermd_sessions_active_count`（带 `upterm_uptermd_` 前缀），脚本按候选名依次识别。
 4. `systemctl show -p MemoryMax -p CPUQuotaPerSecUSec -p TasksMax uptermd.service` 与 `1G`、`150%`、`512` 对应。
 5. `/run/uptermd` 为空；`/var/lib/uptermd` 只有主机密钥与轮换归档。
@@ -176,7 +176,7 @@ sudo deploy/rotate-relay-key.sh --apply
 |---|---|---|
 | 22 端口冲突 | `ss -Hltn 'sport = :22'` | 先迁走系统 sshd，或改 `--ssh-addr`；不要两个进程抢同一端口 |
 | WS 入口不可用 | 查 8443 是否监听、TLS 终止层是否转发到配置的 WS 地址 | 修反向代理或证书；uptermd 本身不终止 TLS |
-| 反代返回 502 且 error.log 为 `connect() failed (111: Connection refused)` | 容器内访问宿主回环不可达 | 用 `--ws-addr 172.17.0.1:8443` 让 uptermd 监听 docker0 网关并重启 |
+| 反代返回 502 且 error.log 为 `connect() failed (111: Connection refused)` | nginx 与 uptermd 不在同一网络命名空间，或 uptermd 未监听 8443 | 确认 `ss -Hltn 'sport = :8443'` 有 `127.0.0.1:8443` 监听；本方案 nginx 与中继同机，不得改用其它地址 |
 | 健康检查报活动路由非 0 | 是否有真实会话未结束 | 等会话结束或重启服务；重启后映射必须为空 |
 | 健康检查报会话文件 | `find /run/uptermd /var/lib/uptermd` | 说明进程发生了预期外写盘，按退出码 10 处理并检查版本与单元沙箱 |
 | 指标不可达 | 查 9100 是否只绑环回、服务是否 active | 不要为了排障把 9100 暴露到公网 |
@@ -250,7 +250,7 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
 
 ### 12.3 部署顺序与前提
 
-前提：中继已按第 6 节部署 uptermd（SSH 入口可用）；nginx 仍是现有 `certbot-nginx` 容器；不得改 443 上其它站点，也不得改 `nginx/ssh.wuge.fun.conf`。
+前提：中继已部署 uptermd（SSH 入口可用）；反向代理为宿主 nginx（第 13 节 `bootstrap.sh` 已一并安装桥接，通常不需要手工执行本节）。本节是手工等价步骤，只面向宿主 nginx；不使用容器。
 
 1. 建专用用户与目录（非 root，无 home 写权限）：
    ```bash
@@ -263,10 +263,10 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
 2. 写参数文件（唯一参数来源，单元不写死端口）：
    ```bash
    sudo install -d -m 0750 /etc/actssh
-   printf 'BRIDGE_LISTEN_HOST=172.17.0.1\nBRIDGE_LISTEN_PORT=8081\n' | sudo tee /etc/actssh/bridge.env
+   printf 'BRIDGE_LISTEN_HOST=127.0.0.1\nBRIDGE_LISTEN_PORT=8081\n' | sudo tee /etc/actssh/bridge.env
    sudo chown root:actssh-bridge /etc/actssh/bridge.env && sudo chmod 0640 /etc/actssh/bridge.env
    ```
-   nginx 在容器内时必须用 `172.17.0.1`（容器内 `127.0.0.1` 指容器自身）；同网络命名空间时才用 `127.0.0.1`。禁止 `0.0.0.0`，进程会拒绝启动。
+   nginx 与桥接同机部署，固定用 `127.0.0.1`。禁止 `0.0.0.0`，进程会拒绝启动。
 3. 安装并启动单元：
    ```bash
    sudo install -m 0644 deploy/actssh-web-bridge.service /etc/systemd/system/
@@ -275,9 +275,9 @@ journald 策略修正（2026-11-09 生产机）：该 ECS 同时承载 nginx、N
    ```
 4. 只 include nginx 片段，不改主配置：
    ```bash
-   sudo install -m 0644 deploy/nginx/web-bridge-location.conf /root/certbot-nginx/nginx/conf/conf.d/web-bridge-location.conf
-   # 在 wuge.fun 的 443 server 块内加一行：include /etc/nginx/conf.d/web-bridge-location.conf;
-   docker exec nginx nginx -t && docker exec nginx nginx -s reload
+   sudo install -m 0644 deploy/nginx/web-bridge-location.conf /etc/actssh/nginx/conf.d/web-bridge-location.conf
+   # 在 443 server 块内加一行：include /etc/actssh/nginx/conf.d/web-bridge-location.conf;
+   sudo nginx -t -c /etc/actssh/nginx/nginx.conf && sudo systemctl reload actssh-nginx.service
    ```
 5. 在 runner 侧并行启动桥接客户端（不改 SSH 反连）：
    ```bash
@@ -323,7 +323,7 @@ python3 -m venv .venv-bridge
 ### 12.6 回滚
 
 1. `sudo systemctl disable --now actssh-web-bridge.service`。
-2. 从 `wuge.fun` 的 443 server 块删除 include 行（或删除 `web-bridge-location.conf`），`docker exec nginx nginx -t && docker exec nginx nginx -s reload`。
+2. 从 443 server 块删除 include 行（或删除 `web-bridge-location.conf`），`sudo nginx -t -c /etc/actssh/nginx/nginx.conf && sudo systemctl reload actssh-nginx.service`。
 3. 保留 `scripts/web_admission.py` 与前端代码；桥接不落盘，无需清理用户数据。
 4. 回滚后 SSH 入口仍按第 7 节判据可用；网页入口不可用属预期，不得写成已具备。
 
@@ -331,14 +331,14 @@ python3 -m venv .venv-bridge
 
 | 序号 | 待确认项 | 判定方式 |
 |---|---|---|
-| 1 | nginx（certbot 容器）能对 `/ws/` 与 `/runner/` 完成 Upgrade 并长时间保持 | 浏览器与 runner 各连一次，观察 101、空闲 30 分钟不断流 |
+| 1 | 宿主 nginx 实例能对 `/ws/` 与 `/runner/` 完成 Upgrade 并长时间保持 | 浏览器与 runner 各连一次，观察 101、空闲 30 分钟不断流 |
 | 2 | runner 出站 `wss://wuge.fun/runner/<session_id>` 可达且不被 Actions 网络策略阻断 | runner 上跑最小客户端连一次并回显 |
 | 3 | Ubuntu 20.04 的 Python 3.8 可安装 `websockets==10.4` | `pip install` 记录版本号与离线包校验 |
 | 4 | 桥接在 2 vCPU / 2 GiB 下资源可接受 | 两路终端字节流压测，记录 RSS、CPU、连接数 |
 | 5 | 会话结束后旧 `session_id` 被拒，新会话不串入旧标识 | 结束会话后重连；再起新会话用旧标识重试 |
 | 6 | 桥接重启后无配对、无文件、无审计痕迹 | 重启前后 `ss`、文件清单与 `active_routes` 对比 |
 | 7 | 同会话第二个 runner 注册被拒、不静默顶替 | 两路 runner 客户端同时注册，观察 1008 `ROUTE_CONFLICT` |
-| 8 | 单元沙箱与真机内核兼容 | 重点看 `ProtectSystem=strict`、`SystemCallFilter=@system-service`、`IPAddressDeny=any` 是否导致启动失败；docker0 网段不是 172.17.0.0/16 时须改 `IPAddressAllow` |
+| 8 | 单元沙箱与真机内核兼容 | 重点看 `ProtectSystem=strict`、`SystemCallFilter=@system-service`、`IPAddressDeny=any` 是否导致启动失败；桥接只连环回时 `IPAddressAllow=localhost` 足够 |
 | 9 | WebAuthn 的 RP ID / origin 与 `https://wuge.fun` 一致 | 真实域名下完成一次注册与一次断言 |
 
 ### 12.8 空清单自举注册（已知残余风险）
@@ -385,7 +385,7 @@ deploy/
 | `--domain <fqdn>` | 无 | `full` 形态必填；`relay-only` 可省略 |
 | `--acme-email <mail>` / `--email` | 空 | ACME 注册邮箱，可省略 |
 | `--acme-staging` | 关 | 使用 ACME 预发布目录，避免打爆正式配额 |
-| `--cert-mode acme\|self-signed` | `acme` | `self-signed` 只用于无公网 DNS 的实验环境 |
+| `--cert-mode acme\|standalone\|self-signed` | `acme` | `acme`(别名 `webroot`) 用宿主 certbot webroot 签发，不停服；`standalone` 签发时临时停 `actssh-nginx` 独占 80；`self-signed` 仅无公网 DNS 的实验环境 |
 | `--web-root <dir>` | 空 | 网页终端静态目录；缺省时根路径 404 |
 | `--relay-only` | 关 | 只装中继，不装 nginx / 证书 / 桥接 |
 | `--with-direct` / `--no-direct` | `with-direct` | 中继 SSH 是否对外直连；关闭时只监听 `127.0.0.1` |
@@ -445,10 +445,18 @@ deploy/
 - 属于其它进程（`docker-proxy`、`apache2`、其它 nginx）→ **直接退出码 8，不自动迁移端口**，输出占用者的 systemd 单元或 pid；
 - `/etc/nginx/sites-enabled` 下存在非 `default` 站点 → 退出码 9，指向第 17 节迁移流程。
 
-80 端口被占用时的处置，脚本不做自动切换，因为 `HTTP-01` 校验固定访问 80：
+证书三条路径（`--cert-mode`）：
+
+| 模式 | 校验方式 | 是否停服 | 适用 |
+|---|---|---|---|
+| `acme`（默认，别名 `webroot`） | 宿主 certbot `--webroot -w /var/www/actssh-acme`，HTTP-01 | 不停服 | 有公网 DNS 与 80 入站，推荐 |
+| `standalone` | 宿主 certbot `--standalone`，签发时停 `actssh-nginx` 独占 80，结束后自动拉起；续期沿用同一 pre/post hook | 签发与续期瞬间停服 | 80 端口能腾出但 webroot 不便暴露 |
+| `self-signed` | 本地 openssl 自签 | 不停服 | 无公网 DNS 的实验环境，不访问 ACME |
+
+80 端口被占用时的处置，脚本不做自动切换，因为 HTTP-01 校验固定访问 80：
 
 1. 停掉占用进程后再跑；
-2. 容器占 80：把容器端口映射改到别的宿主端口，或按第 17 节先迁移；
+2. 容器占 80/443：预检直接退出码 8；需人工释放端口，步骤见第 17 节，脚本不会停容器；
 3. 机器无公网 DNS、只是实验：用 `--cert-mode self-signed`，此时不访问 ACME，也不需要 80。
 
 ### 13.6 退出码
@@ -542,8 +550,8 @@ sudo ./deploy/uninstall.sh --apply --purge-data --domain ssh.example.com
 
 | 开关 | 行为 |
 |---|---|
-| 默认（`--keep-data`） | 停用并删除三个单元、`/etc/actssh`、`/etc/uptermd` 下的规则文件、logrotate、cron、`/usr/local/bin/uptermd`、`/opt/actssh-web-bridge`；保留 `/var/lib/uptermd`、`/etc/uptermd`、`/var/www/actssh-acme`、状态与备份 |
-| `--purge-data` | 追加删除 `/var/lib/uptermd`、`/etc/uptermd`、`/var/www/actssh-acme`、`/var/lib/actssh-bootstrap`；给出 `--domain` 时一并删除该域名的证书、归档与续期配置 |
+| 默认（`--keep-data`） | 停用并删除三个单元、`/etc/actssh`（含独立 nginx 实例与其 pid 目录）、`/etc/uptermd` 下的规则文件、logrotate、`/etc/cron.d/actssh-certbot`、`/etc/letsencrypt/renewal-hooks/deploy/actssh-nginx-reload`、`/usr/local/bin/uptermd`、`/opt/actssh-web-bridge`；保留 `/var/lib/uptermd`、`/etc/uptermd`、`/var/www/actssh-acme`、ACME 证书谱系、状态与备份 |
+| `--purge-data` | 追加删除 `/var/lib/uptermd`、`/etc/uptermd`、`/var/www/actssh-acme`（webroot）、`/var/lib/actssh-bootstrap`；给出 `--domain` 时一并删除该域名的证书谱系：`/etc/letsencrypt/live|archive|renewal/<域名>` |
 | `--remove-firewall` | 回收本方案写入的 ufw 放行规则与 `uptermd_guard` nftables 表 |
 
 从不删除：apt 软件包、系统 sshd 配置、发行版 nginx 站点、非本方案创建的目录。
@@ -643,74 +651,53 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://ssh.example.com/
 
 ## 17. 已有服务的机器怎么办（迁移特例）
 
-> **这一节是迁移特例，不是新标准的依据。** 第 13 节才是空机器标准；这里描述的是当前生产机 `47.109.32.249` 的既有状态：`certbot-nginx` 容器占用 443，ZeroTier 在跑。新机器不要照抄本节。
+> **这一节是迁移特例，不是新标准的依据。** 第 13 节才是空机器标准。本方案全部跑在宿主上（宿主 nginx 独立实例 + 宿主 certbot），**不使用任何容器**；机器上已有容器占用 80/443 时按端口冲突处理，不共存、不接管、不提供容器内操作步骤。
 
-### 17.1 现状与冲突点
+### 17.1 检测与处置
 
-| 现状 | 与空机器标准的冲突 |
-|---|---|
-| docker `certbot-nginx` 容器绑定 443（可能还有 80） | `bootstrap.sh` 预检会判定 80/443 被 `docker-proxy` 占用并退出码 8 |
-| 容器内 nginx 无法访问宿主回环 | uptermd 的 `127.0.0.1:8443` 在容器内不可达 |
-| ZeroTier 虚拟网卡与路由 | 不影响端口，但 `ss` 结果会多出 `zt*` 地址，来源限制要按真实管理网段写 |
-| 已有站点配置 | 不接管、不覆盖 |
+- `bootstrap.sh` 预检用 `ss -Hltnp` 取监听进程，再按 `/proc/<pid>/cgroup` 反查单元；`docker-proxy` 归属 `docker.service`，不在允许清单内，直接 **退出码 8**；
+- 报错信息会给出占用端口、pid 与所属单元，需人工决定：停掉占用方把业务迁到本方案，或换一台机器；
+- 脚本不会改容器端口映射、不会停容器、不会写 docker 配置。
 
-### 17.2 共存方案（不动既有容器）
+### 17.2 从容器迁移到宿主 nginx（人工执行，可回滚）
 
-1. **保留容器与既有站点**，网页入口继续由容器 nginx 终止 TLS。
-2. 中继与桥接按本仓库部署，但：
-   - `--relay-only` 不装独立 nginx 与证书；
-   - 或 `full` 形态但把 `--http-port/--https-port` 指到空闲端口用于实验，对外仍走容器。
-3. 容器需要访问宿主上的桥接与 WS 上游时：
-   - 桥接 `bridge.env` 用 `172.17.0.1`（docker0 网关）而不是 `127.0.0.1`；
-   - uptermd 用 `--ws-addr 172.17.0.1:8443`。
-   - 这两个地址只在 docker 网桥内可达，不新增公网端口。
-4. 容器 nginx 只 `include` 现有的 `nginx/web-bridge-location.conf`，不改既有 server 块。
-5. 防火墙只放行容器已占用的 80/443 与中继 2222；指标 9100 保持环回。
-
-### 17.3 完整迁移步骤（切换到本方案自管）
-
-以下每一步都可回滚，按顺序执行：
-
-1. **记录基线**（不修改）：`docker ps --format '{{.Names}} {{.Ports}}'`、`ss -Hltnp`、`ufw status verbose`、`nft list ruleset`、`systemctl list-units --type=service --state=running`，保存到 `/root/migration-baseline-<日期>.txt`。
-2. **部署中继与桥接但不碰 80/443**：
+1. **记录基线**（只读）：`docker ps --format '{{.Names}} {{.Ports}}'`、`ss -Hltnp`、`ufw status verbose`、`nft list ruleset`、`systemctl list-units --type=service --state=running`，存到 `/root/migration-baseline-<日期>.txt`。
+2. **先部署不碰 80/443 的部分**：
    ```bash
-   sudo ./deploy/bootstrap.sh --relay-only \
-     --admin-cidr <管理网段> --apply
+   sudo ./deploy/bootstrap.sh --relay-only --admin-cidr <管理网段> --apply
+   ./deploy/check-relay-health.sh 127.0.0.1 2222     # 期望 ok:true
    ```
-   此时容器与既有站点完全不变，仅新增 2222 与环回 8081/8443/9100。
-3. **验证中继**：`deploy/check-relay-health.sh 127.0.0.1 2222` 返回 `ok:true`。
-4. **准备自管反代**：把 `--http-port` / `--https-port` 先指向 `8080` / `8443` 以外的空闲端口做演练（例如 `18080` / `18443`），确认 `nginx -t` 与证书流程可用。
-5. **停容器并释放 80/443**：
+3. **由人工停容器释放 80/443**（脚本不做）：
    ```bash
-   docker stop certbot-nginx
+   docker stop <容器名>          # 记录容器名与端口映射，作为回滚依据
+   ss -Hltn 'sport = :80 or sport = :443'   # 期望为空
    ```
-   记录容器名与端口映射，作为回滚依据。
-6. **正式落地 full 形态**：
+4. **落地宿主 nginx 与证书**：
    ```bash
    sudo ./deploy/bootstrap.sh --domain <域名> --email <邮箱> \
-     --admin-cidr <管理网段> --apply
+     --cert-mode acme --admin-cidr <管理网段> --apply
    ```
-   自检通过即完成切换。
-7. **观察 24 小时**后，再决定是否 `docker rm` 旧容器；在此之前保留容器与镜像。
+   自检通过即完成切换；证书由宿主 certbot 用 webroot 签发，不需要停服。
+5. **观察 24 小时**后再决定是否删除旧容器与镜像；在此之前保留它们。
 
-### 17.4 回滚
+### 17.3 回滚
 
 1. 停本方案：`sudo ./deploy/uninstall.sh --apply`（默认保留数据）。
-2. 恢复容器：`docker start certbot-nginx`，确认 80/443 监听恢复。
-3. 若第 6 步已改过防火墙：`sudo ./deploy/uninstall.sh --apply --remove-firewall`，再按第 1 步的基线文件恢复 `ufw` / `nft`。
-4. 若第 6 步已改过 sshd 或云安全组：按基线文件逐项还原，先确认管理面可登录再关闭旧连接。
-5. 复查：`ss -Hltnp`、`docker ps`、`curl -I https://<域名>` 与基线一致。
+2. 恢复旧容器：`docker start <容器名>`，确认 80/443 监听恢复。
+3. 若已改防火墙：`sudo ./deploy/uninstall.sh --apply --remove-firewall`，再按 17.2 第 1 步的基线恢复 `ufw` / `nft`。
+4. 复查：`ss -Hltnp`、`docker ps`、`curl -I https://<域名>` 与基线一致。
 
-### 17.5 不要做的事
+### 17.4 不要做的事
 
-- 不要在容器运行时直接跑 `full --apply` 抢 80/443；
-- 不要删容器镜像作为「回滚准备」；
-- 不要在本节流程里顺手改 ZeroTier 配置；
-- 不要把本节的 `172.17.0.1` / 容器共存写法带到新机器。
+- 不要在容器仍占用 80/443 时直接跑 `full --apply`（会被预检拦下，退出码 8）；
+- 不要删容器镜像或数据卷作为「回滚准备」；
+- 不要在本方案里复刻容器时代的 `172.17.0.1` 写法：宿主部署一律 `127.0.0.1`。
 
 ## 18. 验证记录与待实现
 
 ### 18.1 公网 ACME 真机签发（HTTP-01 链路已验证，2026-11-09）
+
+> 本节是**历史验证记录**，记录当时在既有生产机容器上做的一次性验证；第 13 节起的部署流程已完全不使用容器（宿主 nginx + 宿主 certbot），不要把本节的容器命令当作操作步骤。
 
 **已验证**：真实域名 + 公网 HTTP-01 + 正式 Let's Encrypt 签发 + 续期演练，全链路在真机跑通。验证在既有生产机 `47.109.32.249` 的 `certbot-nginx` 容器内进行，只做证书这一节，未安装 bootstrap、未改既有站点与证书谱系。
 
@@ -739,8 +726,8 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://ssh.example.com/
 
 两条环境注记（复现时会遇到）：
 
-1. `certbot-nginx` 容器内没有系统 CA 包，`openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt` 会报文件不存在；链校验需把 `cert.pem`/`chain.pem` 取到宿主后用宿主的 CA 包做，或直接用 `openssl crl2pkcs7 | openssl pkcs7 -print_certs` 核对链结构；
-2. `docker cp` 读取 `live/` 下的符号链接会报 `invalid symlink`，用 `docker exec <容器> cat <路径>` 重定向到宿主文件更稳妥。
+1. 精简镜像内可能没有系统 CA 包，`openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt` 会报文件不存在；链校验应把 `cert.pem`/`chain.pem` 取到有完整 CA 包的主机再做，或用 `openssl crl2pkcs7 | openssl pkcs7 -print_certs` 核对链结构；
+2. 直接复制 `live/` 下的符号链接会得到 `invalid symlink`，应按链接目标读取内容再落盘。
 
 **仍未验证的部分（不要扩大结论）**：本节验证的是 certbot + 公网 HTTP-01 的签发与续期链路，跑在既有容器布局上；`bootstrap.sh` 自带的 `nginx-cert.sh` 在**干净机**上用公网域名完成正式签发这一步仍未实跑（干净机实测走的是 `--cert-mode self-signed`）。要补齐时，在一台有公网 IPv4、80 端口可入站、且有 A 记录指向它的干净 Ubuntu 22.04 上执行：
 

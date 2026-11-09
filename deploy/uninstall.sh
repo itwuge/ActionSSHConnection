@@ -67,6 +67,7 @@ CONFIG_PATHS=(
     /etc/uptermd/uptermd-guard.nft
     /etc/logrotate.d/actssh
     /etc/cron.d/actssh-certbot
+    /etc/letsencrypt/renewal-hooks/deploy/actssh-nginx-reload
     /usr/local/bin/uptermd
     /opt/actssh-web-bridge
 )
@@ -269,7 +270,18 @@ _remove_firewall() {
         _say "演练: 将删除 ufw 规则 ${RELAY_PORT}/tcp ${HTTPS_PORT}/tcp ${HTTP_PORT}/tcp, 并移除 ${nft_ruleset}"
         return 0
     fi
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    # 不依赖状态行文本: ufw 在部分环境忽略 LC_ALL, 状态行可能是“激活”, 按其判定会整块跳过
+    if command -v ufw >/dev/null 2>&1; then
+        # 规则带 comment, 按规格删除匹配不上; 先按编号从大到小删带本方案注释的规则
+        local -a nums=()
+        local n
+        mapfile -t nums < <(ufw status numbered 2>/dev/null \
+            | grep -E '# (uptermd admin ssh|uptermd ssh entry|uptermd ws entry|actssh http acme/redirect|uptermd metrics loopback only)' \
+            | sed -n 's/^\[ *\([0-9]\+\)\].*/\1/p' | sort -rn)
+        for n in "${nums[@]}"; do
+            ufw --force delete "$n" >/dev/null 2>&1 || true
+        done
+        # 兜底: 无注释或格式变化时按规格再删一次
         ufw --force delete allow "$RELAY_PORT/tcp" >/dev/null 2>&1 || true
         ufw --force delete allow "$HTTPS_PORT/tcp" >/dev/null 2>&1 || true
         ufw --force delete allow "$HTTP_PORT/tcp" >/dev/null 2>&1 || true
@@ -285,7 +297,7 @@ _remove_firewall() {
         sed -i '/# BEGIN uptermd-guard (managed by deploy\/firewall.sh)/,+1d' "$nft_conf" 2>/dev/null || true
     fi
     _remove_path "$nft_ruleset" "nftables 规则文件"
-    _say "已回收防火墙规则; 管理面与系统 sshd 的规则未改动"
+    _say "已回收防火墙规则 (含本方案写入的管理面来源限制)"
 }
 
 _purge_data() {
@@ -299,6 +311,10 @@ _purge_data() {
         return 0
     fi
     for path in "${DATA_PATHS[@]}"; do
+        # 状态目录内含日志文件, 删除前先停写日志, 否则 _remove_path 的收尾日志会报路径不存在
+        if [[ "$path" == "$STATE_DIR" && -n "$BS_LOG_FILE" && "$BS_LOG_FILE" == "${STATE_DIR}/"* ]]; then
+            BS_LOG_FILE=""
+        fi
         _remove_path "$path" "运行数据"
     done
     if [[ -n "$DOMAIN" ]]; then
@@ -319,7 +335,11 @@ _summary() {
     _say "处理路径数: ${REMOVED}"
     _say "数据: $([[ "$PURGE_DATA" == "1" ]] && echo 已删除 || echo 已保留)"
     _say "说明: apt 软件包保留; 如需彻底清理可执行 apt-get remove nginx certbot uptermd 相关包"
-    _say "日志: ${LOG_ROOT}/${RUN_ID}.jsonl"
+    if [[ -n "$BS_LOG_FILE" ]]; then
+        _say "日志: ${BS_LOG_FILE}"
+    else
+        _say "日志: 已随状态目录删除"
+    fi
     if (( APPLY == 0 )); then
         _say "当前为演练模式; 确认后追加 --apply 执行"
     fi
