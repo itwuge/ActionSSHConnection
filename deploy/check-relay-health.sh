@@ -20,6 +20,8 @@
 #               CH_JOURNAL_DROPIN  journald 上限片段, 默认 /etc/systemd/journald.conf.d/90-uptermd-limits.conf
 #               CH_JOURNAL_MAX     journald 占用提示阈值, 默认 200M; 只告警, 不影响 ok 判定
 #               CH_LOG_DIR         检查日志根目录, 默认 /var/log/uptermd-deploy/logs
+#               CH_BRIDGE_UNIT     网页桥接单元名, 默认 actssh-web-bridge.service; 未安装则该项跳过
+#               CH_BRIDGE_PORT     网页桥接监听端口, 默认 8081
 # 退出码      : 0 全部判据通过; 1 判据未通过或状态取不到; 2 参数或依赖错误; 130/143 中断
 # 输出        : 标准输出恰好一行 JSON: {ok, message, error_code, data, confirm}
 #               人读进度与告警一律写 stderr, 避免污染调用方的 JSON 解析
@@ -42,6 +44,7 @@ set -Eeuo pipefail
 #   _session_files -> 0: 输出 JSON 数组
 #   _resource_limits -> 0/1: 输出资源上限 JSON 与是否达标
 #   _journal_cap -> 0: 输出 journald 容量 JSON, 仅提示不判定
+#   _bridge_state -> 0: 输出网页桥接 JSON(单元 active/端口监听/配对残留), 未安装则标记跳过
 #   _emit <ok> <message> <error_code> <data_json> <confirm> -> 不返回
 #   _cleanup -> 0: 删除临时文件
 
@@ -56,6 +59,8 @@ UNIT_NAME="${CH_UNIT:-uptermd.service}"
 JOURNAL_DROPIN="${CH_JOURNAL_DROPIN:-/etc/systemd/journald.conf.d/90-uptermd-limits.conf}"
 JOURNAL_MAX="${CH_JOURNAL_MAX:-200M}"
 LOG_DIR="${CH_LOG_DIR:-/var/log/uptermd-deploy/logs}"
+BRIDGE_UNIT="${CH_BRIDGE_UNIT:-actssh-web-bridge.service}"
+BRIDGE_PORT="${CH_BRIDGE_PORT:-8081}"
 
 LOGGER="deploy.check_relay_health"
 RUN_ID="$(date -u '+%Y%m%d_%H%M%S')_$$"
@@ -341,6 +346,51 @@ _journal_cap() {
     return 0
 }
 
+_bridge_state() {
+    # 用途: 检查网页桥接单元, 输出进程状态/端口监听/配对残留
+    # 参数: 无; 读取 CH_BRIDGE_UNIT 与 CH_BRIDGE_PORT
+    # 返回: 标准输出 JSON; 退出码: 0 未安装(跳过) 或状态已输出
+    local installed=false unit_active=false listen_ok=false
+    local active_routes=null restart_clean=null since raw last_start ok=false
+    if ! systemctl cat "$BRIDGE_UNIT" >/dev/null 2>&1; then
+        jq -nc '{installed:false,unit_active:false,listen_ok:false,active_routes:null,restart_clean:null,ok:true,advisory:true}'
+        return 0
+    fi
+    installed=true
+    if systemctl is-active --quiet "$BRIDGE_UNIT"; then
+        unit_active=true
+    fi
+    if _listen_ok "$BRIDGE_PORT"; then
+        listen_ok=true
+    fi
+    since="$(systemctl show -p ActiveEnterTimestamp --value "$BRIDGE_UNIT" 2>/dev/null | awk '{ print $2" "$3 }')"
+    if [[ -n "$since" ]]; then
+        raw="$(journalctl -u "$BRIDGE_UNIT" -o cat --since "$since" --no-pager 2>/dev/null || true)"
+        last_start="$(printf '%s\n' "$raw" | jq -Rr 'fromjson? | select(.event=="bridge.started") | (.active_routes // 0)' 2>/dev/null | tail -n 1)"
+        if [[ -n "$last_start" ]]; then
+            if [[ "$last_start" == "0" ]]; then
+                restart_clean=true
+            else
+                restart_clean=false
+            fi
+        fi
+        active_routes="$(printf '%s\n' "$raw" | jq -Rr 'fromjson? | select(.event=="bridge.started" or .event=="bridge.runner.connected" or .event=="bridge.runner.closed") | (.active_routes // 0)' 2>/dev/null | tail -n 1)"
+        if [[ -z "$active_routes" ]]; then
+            active_routes="${last_start:-0}"
+        fi
+    fi
+    if [[ "$unit_active" == "true" && "$listen_ok" == "true" ]]; then
+        ok=true
+    fi
+    jq -nc \
+        --argjson installed "$installed" --argjson unit_active "$unit_active" \
+        --argjson listen_ok "$listen_ok" --argjson active_routes "${active_routes:-null}" \
+        --argjson restart_clean "${restart_clean:-null}" --argjson ok "$ok" \
+        --arg port "$BRIDGE_PORT" --arg unit "$BRIDGE_UNIT" \
+        '{installed:$installed,unit:$unit,port:$port,unit_active:$unit_active,listen_ok:$listen_ok,active_routes:$active_routes,restart_clean:$restart_clean,ok:$ok,advisory:false}'
+    return 0
+}
+
 # =========** 清理 =========**
 _cleanup() {
     # 用途: 单次运行无临时文件, 保留幂等占位以统一钩子形态
@@ -390,7 +440,7 @@ fi
 listen_state="$(jq -nc \
     --arg ssh "${HOST}:${SSH_PORT}" --argjson ssh_ok "$listen_ssh" \
     --arg ws "${HOST}:${WS_PORT}" --argjson ws_ok "$listen_ws" \
-    --arg ws_backend "127.0.0.1:${WS_BACKEND_PORT}" --argjson ws_backend_ok "$listen_ws_backend" \
+    --arg ws_backend "port:${WS_BACKEND_PORT}" --argjson ws_backend_ok "$listen_ws_backend" \
     '{ssh:$ssh,ssh_ok:$ssh_ok,ws:$ws,ws_ok:$ws_ok,ws_backend:$ws_backend,ws_backend_ok:$ws_backend_ok}')"
 
 metrics_body=""
@@ -429,6 +479,13 @@ if [[ -z "$journal_json" ]]; then
 fi
 journal_within_cap="$(printf '%s' "$journal_json" | jq -r '.within_cap // false')"
 
+bridge_json="$(_bridge_state)"
+if [[ -z "$bridge_json" ]]; then
+    bridge_json='{}'
+fi
+bridge_installed="$(printf '%s' "$bridge_json" | jq -r '.installed // false')"
+bridge_ok="$(printf '%s' "$bridge_json" | jq -r '.ok // true')"
+
 listen_ok=false
 if [[ "$listen_ssh" == "true" && ( "$listen_ws" == "true" || "$listen_ws_backend" == "true" ) ]]; then
     listen_ok=true
@@ -444,7 +501,8 @@ data="$(jq -nc \
     --argjson resource_limits "$limits_json" \
     --argjson unit_active "$unit_active" \
     --argjson active_routes "${active_value:-null}" \
-    '{listen_state:$listen_state,route_table_empty:$route_table_empty,session_files_found:$session_files_found,journal_cap:$journal_cap,resource_limits:$resource_limits,unit_active:$unit_active,active_routes:$active_routes}')"
+    --argjson bridge "$bridge_json" \
+    '{listen_state:$listen_state,route_table_empty:$route_table_empty,session_files_found:$session_files_found,journal_cap:$journal_cap,resource_limits:$resource_limits,unit_active:$unit_active,active_routes:$active_routes,bridge:$bridge}')"
 
 confirm="本检查判定「重启后映射为空」的方式是活动路由为 0 且无会话文件; 若刚发生重启, 该状态可直接作为空路由证据, 否则请先重启再复查."
 
@@ -472,6 +530,10 @@ if [[ "$limits_ok" != "true" ]]; then
     _log ERROR "health.limits.invalid" "资源上限与设计不符" "{}"
     _emit false "资源上限与设计不符, 需核对单元文件与 systemd 版本" "RELAY_LIMITS_INVALID" "$data" "$confirm"
 fi
+if [[ "$bridge_installed" == "true" && "$bridge_ok" != "true" ]]; then
+    _log ERROR "health.bridge.unhealthy" "网页桥接单元或监听异常" "{\"unit\":$(jq -Rn --arg v "$BRIDGE_UNIT" '$v'),\"port\":${BRIDGE_PORT}}"
+    _emit false "网页桥接异常: unit=${BRIDGE_UNIT} active=$(printf '%s' "$bridge_json" | jq -r '.unit_active') listen=$(printf '%s' "$bridge_json" | jq -r '.listen_ok')" "BRIDGE_UNHEALTHY" "$data" "$confirm"
+fi
 if [[ "$journal_within_cap" != "true" ]]; then
     # 中继可能与非中继服务共用一台机, 全局封顶会影响别人, 这里只提示不拦截
     _say "[WARN] journald 容量仅作提示, 不影响判定: max=${JOURNAL_MAX} usage=$(printf '%s' "$journal_json" | jq -r '.usage // "unknown"')"
@@ -479,4 +541,8 @@ if [[ "$journal_within_cap" != "true" ]]; then
 fi
 
 _log INFO "health.run.finished" "全部判据通过" "{\"active_routes\":0}"
-_emit true "中转运行正常: 监听齐备, 路由为空, 无会话文件, 资源上限生效" "" "$data" "$confirm"
+bridge_note=""
+if [[ "$bridge_installed" == "true" ]]; then
+    bridge_note=", 网页桥接正常(配对残留=$(printf '%s' "$bridge_json" | jq -r '.active_routes'))"
+fi
+_emit true "中转运行正常: 监听齐备, 路由为空, 无会话文件, 资源上限生效${bridge_note}" "" "$data" "$confirm"

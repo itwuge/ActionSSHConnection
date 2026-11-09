@@ -140,6 +140,7 @@ stdout 恰好一行 JSON，字段为 `ok`、`message`、`error_code`、`data`、
 - `route_table_empty`：`routing_active_connections_count` 是否为 0；
 - `session_files_found`：运行目录条目与状态目录中的预期外文件；
 - `journal_cap`：journald 上限配置与实际占用，`advisory:true` 表示仅提示，不参与 `ok` 判定。
+- `bridge`：网页桥接一项，字段 `installed`、`unit_active`、`listen_ok`、`active_routes`、`restart_clean`、`ok`。未安装 `actssh-web-bridge.service` 时 `installed:false` 并跳过（`advisory:true`）；已安装时单元未 active 或 8081 未监听会使整体判定失败。`active_routes` 取自 `bridge.started`/`bridge.runner.connected`/`bridge.runner.closed` 事件里最近一次的 `active_routes`；`restart_clean` 为 true 表示最近一次启动事件记录到 0 个配对，即重启后无残留。可用 `CH_BRIDGE_UNIT`、`CH_BRIDGE_PORT` 覆盖默认值。
 
 退出码：0 全部通过；1 判据未通过或状态取不到；2 参数或依赖错误。`journal_cap` 不达标只向 stderr 打一条 `[WARN]`，不改变退出码。
 
